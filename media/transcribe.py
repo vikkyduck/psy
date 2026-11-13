@@ -1,5 +1,6 @@
 """Sequential local Whisper transcription with durable, resumable private output."""
 import argparse
+from contextlib import contextmanager
 import fcntl
 import hashlib
 from itertools import groupby
@@ -11,7 +12,6 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import time
 
 standalone = os.environ.get('PSY_ASR_STANDALONE') == '1'
 home = Path(os.environ.get('HERMES_HOME', str(Path.home() / '.hermes')))
@@ -65,18 +65,136 @@ def find_program(name):
     raise RuntimeError(name + ' is not installed')
 
 
-def atomic_text(path, text):
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def create_journal_directory(path):
+    # Persist each new directory entry, including the job folder itself, before
+    # acknowledging any segment. The parent may already exist after a retry.
+    if not path.is_dir():
+        create_journal_directory(path.parent)
+        path.mkdir(mode=0o700, exist_ok=True)
+        sync_directory(path.parent)
+
+
+@contextmanager
+def atomic_output(path):
     path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     fd, name = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as out:
-            out.write(text)
+        with os.fdopen(fd, 'wb') as out:
+            yield out
             out.flush()
             os.fsync(out.fileno())
-        os.chmod(name, 0o600)
         os.replace(name, path)
+        sync_directory(path.parent)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+def atomic_text(path, text):
+    with atomic_output(path) as out:
+        out.write(text.encode('utf-8'))
+
+
+def write_record(out, record):
+    data = json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(',', ':'))
+    out.write((data + '\n').encode('utf-8'))
+
+
+def valid_position(value):
+    return type(value) in (float, int) and math.isfinite(value)
+
+
+def validate_segment(segment, cursor, duration):
+    start, end = segment['start'], segment['end']
+    if not (valid_position(start) and start == cursor and valid_position(end) and start < end <= duration):
+        raise ValueError('Invalid segment positions')
+    lines, tail = segment['lines'], segment['word_tail']
+    if not isinstance(lines, list) or not all(isinstance(line, str) for line in lines):
+        raise ValueError('Invalid segment text')
+    if not isinstance(tail, list) or len(tail) > 12 or not all(
+            isinstance(word, list) and len(word) == 3 and isinstance(word[0], str)
+            and valid_position(word[1]) and valid_position(word[2]) for word in tail):
+        raise ValueError('Invalid decoder overlap')
+
+
+def prepare_journal(path, checkpoint, src, fingerprint):
+    """Publish a complete journal before retiring the previous checkpoint format."""
+    if path.exists():
+        return
+    legacy = json.loads(checkpoint.read_bytes()) if checkpoint.exists() else None
+    if legacy is not None and legacy['source'] != fingerprint:
+        raise ValueError('Checkpoint belongs to a different recording')
+    duration = legacy['duration'] if legacy is not None else audio_duration(src)
+    if not valid_position(duration) or not 0 < duration <= MAX_SECONDS:
+        raise ValueError('Invalid or unsupported recording duration')
+
+    with atomic_output(path) as out:
+        write_record(out, {'version': 1, 'source': fingerprint, 'duration': duration})
+        if legacy is not None:
+            cursor = 0
+            chunks = legacy['chunks']
+            for i, chunk in enumerate(chunks):
+                last = i + 1 == len(chunks)
+                end = legacy['next_start'] if last else chunks[i + 1]['start']
+                segment = {'start': chunk['start'], 'end': end, 'lines': chunk['lines'],
+                           'word_tail': legacy.get('word_tail', []) if last else []}
+                validate_segment(segment, cursor, duration)
+                write_record(out, segment)
+                cursor = end
+            if cursor != legacy['next_start'] or (cursor == duration) != legacy['complete']:
+                raise ValueError('Inconsistent legacy checkpoint')
+
+
+def resume_journal(journal, fingerprint):
+    header = json.loads(journal.readline())
+    if header.get('version') != 1 or header.get('source') != fingerprint:
+        raise ValueError('Unexpected segment journal')
+    duration = header['duration']
+    if not valid_position(duration) or not 0 < duration <= MAX_SECONDS:
+        raise ValueError('Invalid journal duration')
+    cursor, tail, count = 0, [], 0
+    while True:
+        offset = journal.tell()
+        raw = journal.readline()
+        if not raw:
+            break
+        if not raw.endswith(b'\n'):
+            # A crash can leave only a prefix of the last append, including half a UTF-8 character.
+            journal.seek(offset)
+            journal.truncate()
+            journal.flush()
+            os.fsync(journal.fileno())
+            break
+        segment = json.loads(raw)
+        validate_segment(segment, cursor, duration)
+        cursor, tail = segment['end'], segment['word_tail']
+        count += 1
+    return duration, cursor, tail, count
+
+
+def export_journal(journal, transcript, requested):
+    """Build the final timestamped TXT one segment at a time, including after a crash."""
+    journal.seek(0)
+    journal.readline()
+    speech = False
+    with atomic_output(transcript) as out:
+        for raw in journal:
+            for line in json.loads(raw)['lines']:
+                out.write((line + '\n').encode('utf-8'))
+                speech = True
+        if not speech:
+            out.write('[Разборчивая речь в записи не обнаружена.]\n'.encode('utf-8'))
+    if requested != transcript:
+        with transcript.open('rb') as source, atomic_output(requested) as target:
+            shutil.copyfileobj(source, target)
+    return speech
 
 
 def read_window(src, begin, end):
@@ -210,49 +328,50 @@ def main():
     fingerprint = [str(src), src.stat().st_size, src.stat().st_mtime_ns, language, str(model_path), DECODER_VERSION]
     job_id = hashlib.sha256(json.dumps(fingerprint).encode()).hexdigest()[:24]
     folder = home / 'media-vault' / 'transcripts' / job_id
-    folder.mkdir(parents=True, mode=0o700, exist_ok=True)
-    checkpoint, transcript = folder / 'checkpoint.json', folder / 'transcript.txt'
+    create_journal_directory(folder)
+    checkpoint = folder / 'checkpoint.json'
+    journal_path = folder / 'segments.jsonl'
+    transcript = folder / 'transcript.txt'
     lockdir = home / 'cache' / 'scratch'
     lockdir.mkdir(parents=True, mode=0o700, exist_ok=True)
-    # Wait in a queue, instead of losing the next recording when a worker is busy.
-    with (lockdir / 'audio-transcription.lock').open('a') as lock:
+    lock_path = lockdir / 'audio-transcription.lock'
+    progress = os.environ.get('PSY_ASR_PROGRESS_FILE') if standalone else None
+    if requested in (checkpoint, journal_path, lock_path) or (progress and requested == Path(progress).resolve()):
+        raise ValueError('Output conflicts with internal decoder state')
+
+    def report_progress(cursor, duration):
+        if progress:
+            atomic_text(Path(progress), json.dumps({'processed_seconds': cursor, 'total_seconds': duration}))
+
+    # Serialize retries so that a single writer owns the append and its cursor.
+    with lock_path.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        state = json.loads(checkpoint.read_text()) if checkpoint.exists() else None
-        if state is None:
-            duration = audio_duration(src)
-            if duration > MAX_SECONDS:
-                raise ValueError('Recording exceeds the 24-hour processing limit')
-            state = {'source': fingerprint, 'duration': duration, 'next_start': 0, 'complete': False, 'chunks': []}
-        if state['source'] != fingerprint:
-            raise ValueError('Checkpoint belongs to a different recording')
-        duration = state['duration']
-        if not state.get('complete'):
-            from faster_whisper import WhisperModel
-            model = WhisperModel(str(model_path), device='cpu', compute_type='int8', cpu_threads=1, num_workers=1, local_files_only=True)
-            start = state['next_start']
-            while start < duration:
-                end, lines, tail = transcribe_window(
-                    model, src, start, duration, language, state.get('word_tail', []))
-                state['chunks'].append({'start': start, 'lines': lines})
-                start = end
-                state.update(next_start=start, word_tail=tail, complete=start >= duration, updated_at=time.time())
-                text = '\n'.join(line for chunk in state['chunks'] for line in chunk['lines'])
-                if state['complete'] and not text.strip():
-                    text = '[Разборчивая речь в записи не обнаружена.]'
-                atomic_text(transcript, text + '\n')
-                atomic_text(checkpoint, json.dumps(state, ensure_ascii=False))
-                progress_file = os.environ.get('PSY_ASR_PROGRESS_FILE') if standalone else None
-                if progress_file:
-                    atomic_text(Path(progress_file), json.dumps({'processed_seconds': start, 'total_seconds': duration}))
-        # Rebuild from checkpoint if interrupted between the durable checkpoint and export.
-        if not transcript.exists():
-            text = '\n'.join(line for chunk in state['chunks'] for line in chunk['lines'])
-            atomic_text(transcript, (text or '[Разборчивая речь в записи не обнаружена.]') + '\n')
-        if requested != transcript:
-            atomic_text(requested, transcript.read_text())
-        print(json.dumps({'complete': True, 'speech_detected':any(chunk['lines'] for chunk in state['chunks']),
-            'path': str(requested), 'saved_transcript': str(transcript),
-            'duration': duration, 'source_bytes': src.stat().st_size, 'chunks': len(state['chunks'])}, ensure_ascii=False))
+        prepare_journal(journal_path, checkpoint, src, fingerprint)
+        with journal_path.open('r+b') as journal:
+            duration, start, tail, count = resume_journal(journal, fingerprint)
+            if checkpoint.exists():
+                checkpoint.unlink()
+                sync_directory(folder)
+            if start:
+                report_progress(start, duration)
+            if start < duration:
+                from faster_whisper import WhisperModel
+                model = WhisperModel(str(model_path), device='cpu', compute_type='int8',
+                                     cpu_threads=1, num_workers=1, local_files_only=True)
+                while start < duration:
+                    end, lines, tail = transcribe_window(model, src, start, duration, language, tail)
+                    segment = {'start': start, 'end': end, 'lines': lines, 'word_tail': tail}
+                    validate_segment(segment, start, duration)
+                    write_record(journal, segment)
+                    journal.flush()
+                    os.fsync(journal.fileno())
+                    start = end
+                    count += 1
+                    report_progress(start, duration)
+            speech = export_journal(journal, transcript, requested)
+        print(json.dumps({'complete': True, 'speech_detected': speech, 'path': str(requested),
+                          'saved_transcript': str(transcript), 'duration': duration,
+                          'source_bytes': src.stat().st_size, 'chunks': count}, ensure_ascii=False))
 
 
 if __name__ == '__main__':
