@@ -18,6 +18,11 @@ else:
 
 
 class Depth(unittest.TestCase):
+    @staticmethod
+    def source_card(url="https://example.org/original"):
+        return dict(author="А.", work="Опыты", date="1920", location="раздел IV", support="A produces B",
+                    claim="A порождает B при заданном условии.", url=url, access="full_text")
+
     def setUp(self):
         httpx = types.ModuleType("httpx")
         httpx.RequestError = type("RequestError", (Exception,), {})
@@ -53,14 +58,74 @@ class Depth(unittest.TestCase):
                 self.assertEqual(messages, [m._user(q)])
                 return m.Result('{"topic":"Freud Repression 1915"}', [], 0)
             if web:
-                self.assertEqual(messages, [m._user("Freud Repression 1915")])
-                return m.Result("Source https://example.org", [], 1)
+                self.assertEqual(messages[0], m._user("Freud Repression 1915"))
+                self.assertNotIn("secret-", str(messages))
+                if instructions == m.WEB_SYSTEM:
+                    return m.Result("Public notes", [], 1)
+                card = self.source_card()
+                return m.Result(json.dumps({"claims":[card], "gaps":[]}), [], 1, source_urls=(card["url"],))
+            if instructions == m.REVIEW:
+                self.assertIn("Готово", str(messages))
+                return m.Result('{"edits":[]}', [], 0)
             self.assertIn("secret-transcript", str(messages))
             self.assertIn("https://example.org", str(messages))
             return m.Result("Готово", [], 0)
         with patch.object(m, "_stream", side_effect=run):
             result = m._compose(None, {}, turns, False, "fake", q)
-        self.assertEqual(result.searches, 1)
+        self.assertEqual(result.searches, 2)
+
+    def test_untraceable_sources_are_not_released_as_confirmed(self):
+        fake = self.source_card("https://unknown.invalid/archive")
+        public = m.Result(json.dumps({"claims":[fake],"gaps":[]}), [], 1,
+                          source_urls=("https://example.org",))
+        call = Mock(side_effect=[m.Result("search", [], 1), public, public])
+        r = m._primary_sources(call, "Academic topic")
+        self.assertFalse(r.complete)
+        self.assertNotIn(fake["url"], r.text)
+        self.assertTrue(all(c.kwargs.get("web") for c in call.call_args_list))
+
+    def test_source_gaps_trigger_second_lookup_without_losing_verified_claims(self):
+        a = self.source_card()
+        b = self.source_card("https://archive.example/later")
+        b["date"] = "1940"
+        def metadata(card, gaps):
+            return m.Result(json.dumps({"claims":[card], "gaps":gaps}) + "\n" + card["url"], [], 1,
+                            source_urls=(card["url"],))
+        call = Mock(side_effect=[m.Result("search", [], 1), metadata(a, ["Позиция в 1940"]),
+                                 metadata(b, [])])
+        r = m._primary_sources(call, "Academic topic")
+        self.assertEqual(json.loads(r.text)["claims"], [a,b])
+        self.assertIn("Позиция в 1940", call.call_args.args[0][-1]["content"])
+
+    def test_corrects_original_claim_and_its_recap_in_place(self):
+        text = "Первая часть. A порождает C.\n\nИтог второй части: A порождает C."
+        verdict = {"edits":[
+            {"before":"Первая часть. A порождает C.", "after":"Первая часть. A порождает B."},
+            {"before":"Итог второй части: A порождает C.", "after":"Итог второй части: A порождает B."}]}
+        call = Mock(return_value=m.Result(json.dumps(verdict), [], 0))
+        r = m._verify_draft(call, m.Result(text,[],0), json.dumps(self.source_card()))
+        self.assertIn(text, call.call_args.args[0][-1]["content"])
+        self.assertNotIn("C",r.text)
+        self.assertEqual(r.text.count("порождает B"),2)
+
+    def test_bad_replacement_does_not_pass_as_validated(self):
+        response = m.Result('{"edits":[{"before":"ambiguous","after":"altered"}]}', [], 0)
+        with self.assertRaises(m.ModelIssue):
+            m._verify_draft(Mock(return_value=response), m.Result("ambiguous ambiguous", [], 0), "source")
+
+    def test_full_review_failure_recovers_verified_sections_and_marks_only_failed_section(self):
+        doc = "Title\n\n1. A (0-15 мин по плану)\n\nПроверенный раздел.\n\n2. B (15-30 мин по плану)\n\nUNSUPPORTED"
+        def check(turns, instructions):
+            if "UNSUPPORTED" in str(turns):
+                raise m.ModelIssue("unavailable", "section")
+            return m.Result('{"edits":[]}', [], 0)
+        r = m._recover_verified(check, m.Result(doc, [], 0),
+                                m.Result(json.dumps({"claims":[self.source_card()]}), [], 2),
+                                m.ModelIssue("context","whole"))
+        self.assertIn("Проверенный раздел",r.text)
+        self.assertIn("Сверку этого раздела",r.text)
+        self.assertNotIn("UNSUPPORTED",r.text)
+        self.assertFalse(r.complete)
 
     def stream(self, events, research=False):
         response = Mock(status_code=200)
@@ -103,6 +168,7 @@ class Depth(unittest.TestCase):
         output.append({"type":"web_search_call","status":"completed"})
         result=self.stream([evt],True)
         self.assertEqual((result.text,result.searches),("A\nhttps://example.org",1))
+        self.assertEqual(result.source_urls, ("https://example.org",))
 
     def test_resume_waits_for_terminal_event_and_preserves_earlier_text(self):
         parts = [m.Result("first", [], 0, False),m.Result("last", [], 0, True)]
