@@ -1,0 +1,26 @@
+#!/bin/sh
+# All write targets (including the compatibility link) live below root-owned /etc.
+set -eu
+umask 077
+base=/etc/psy-upload/tls
+source=/etc/letsencrypt/live/psy-upload
+install -d -o root -g root -m 0755 /etc/psy-upload "$base"
+exec 9>"$base/.deploy.lock"
+flock -x 9
+release=$(mktemp -d "$base/release.XXXXXXXX")
+trap 'test -z "$release" || rm -rf -- "$release"' EXIT
+install -m 0644 "$source/fullchain.pem" "$release/fullchain.pem"
+install -o root -g psy-upload -m 0640 "$source/privkey.pem" "$release/privkey.pem"
+python3 -I -c 'import ssl,sys; ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(sys.argv[1],sys.argv[2])' "$release/fullchain.pem" "$release/privkey.pem"
+chown root:psy-upload "$release"
+chmod 0750 "$release"
+previous=$(readlink "$base/current" || true)
+ln -s "${release##*/}" "$release/current.next"
+mv -Tf "$release/current.next" "$base/current"
+release=''
+if [ "${1:-}" != "--stage" ] && systemctl is-active --quiet psy-upload; then systemctl reload psy-upload; fi
+case "$previous" in
+  release.*) case "$previous" in */*) exit 1 ;; esac
+             rm -f -- "$base/$previous/fullchain.pem" "$base/$previous/privkey.pem"
+             rmdir -- "$base/$previous" ;;
+esac

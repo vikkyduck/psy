@@ -1,0 +1,24 @@
+[Unit]
+Description=Validate a PSY Mini App launch or check fixed group membership
+[Service]
+EnvironmentFile=/etc/psy/instance.env
+Type=exec
+User=psy-access
+Group=psy-access
+LoadCredential=telegram:/etc/psy-upload/telegram
+ExecStart=/opt/psy-upload-venv/bin/python -I /opt/psy-upload/access_broker.py
+StandardInput=socket
+StandardOutput=null
+ProtectHome=yes
+ProtectProc=invisible
+ProtectSystem=strict
+InaccessiblePaths=/etc/psy-upload /var/lib/psy-asr
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=56M
+TasksMax=8
+RuntimeMaxSec=20
+UMask=0077

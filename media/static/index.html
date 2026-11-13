@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>PSY · Записи</title><link rel="stylesheet" href="/assets/style.css"><script src="https://telegram.org/js/telegram-web-app.js"></script><script defer src="/assets/app.js?v=20261113-storage"></script></head>
+<body><main>
+<header><span class="mark">PSY</span><span class="tag">Личная загрузка</span></header>
+<h1>Большая запись.<br>Весь разговор в тексте.</h1>
+<p class="intro">Аудио или видео до 1 ГБ. Распознавание и хранение - на Вашем сервере.</p>
+<div id="notice" role="status">Проверяем вход через Telegram…</div>
+<section id="upload" hidden>
+<p class="audience">Результат получит: <strong id="destination"></strong></p>
+<p class="hint" id="capacity" role="status"></p>
+<label class="filebox" for="file"><span class="plus">＋</span><strong id="filename">Выберите запись</strong><span>MP3, M4A, WAV, OGG, MP4 и другие форматы</span><input id="file" type="file" accept="audio/*,video/*,.mkv,.opus,.flac,.caf"></label>
+<label class="language">Язык записи <select id="language"><option value="ru">Русский</option><option value="auto">Определить автоматически</option><option value="en">Английский</option></select></label>
+<button id="send" disabled>Загрузить и расшифровать</button>
+<div id="progressbox" hidden><progress id="progress" max="100" value="0"></progress><p id="progresslabel"></p><button class="secondary" id="pause">Приостановить загрузку</button></div>
+<p class="hint">Максимальная длительность записи - 24 часа. Держите окно открытым до окончания загрузки. При временном сбое она продолжится автоматически. Незавершенные загрузки хранятся 7 дней.</p>
+</section>
+<section id="history" hidden><h2>Ваши записи</h2><div id="jobs"></div></section>
+<footer>Файлы доступны только авторизованному отправителю. Расшифровка отправляется в указанный выше чат.</footer>
+</main></body></html>

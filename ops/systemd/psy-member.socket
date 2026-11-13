@@ -1,0 +1,10 @@
+[Unit]
+Description=Restricted membership and Mini App authentication for PSY
+[Socket]
+ListenStream=/run/psy-member.sock
+SocketUser=psy-upload
+SocketMode=0600
+Accept=yes
+MaxConnections=24
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=Hermes Agent Telegram gateway for PSY
+After=network-online.target psy-group-upload.socket
+Wants=network-online.target psy-group-upload.socket
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes/.hermes
+Environment=HOME=/home/hermes USER=hermes LOGNAME=hermes
+Environment=HERMES_HOME=/home/hermes/.hermes HERMES_SUPERVISED_CHILD=1
+Environment="PATH=/home/hermes/.hermes/tools/node-26.7.0-linux-x64/bin:/home/hermes/.hermes/tools/npm-12.0.2-linux-x64/bin:/home/hermes/.hermes/hermes-agent/node_modules/.bin:/home/hermes/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=/etc/psy/instance.env
+ExecStart=/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes gateway run
+ExecReload=/bin/kill -USR1 $MAINPID
+ExecStop=-/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes --run-module gateway.systemd_stop_mark
+ExecStopPost=-/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes --run-module gateway.cgroup_cleanup
+Restart=always
+RestartSec=5
+RestartForceExitStatus=75
+SuccessExitStatus=75
+RestartPreventExitStatus=78
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=70
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

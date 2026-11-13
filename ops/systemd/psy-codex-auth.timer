@@ -1,0 +1,11 @@
+[Unit]
+Description=Check PSY Codex authorization every hour and after downtime
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=90
+Unit=psy-codex-auth.service
+
+[Install]
+WantedBy=timers.target

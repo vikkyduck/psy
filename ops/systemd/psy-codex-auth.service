@@ -1,0 +1,23 @@
+[Unit]
+Description=Check and renew the preferred PSY ChatGPT subscription login
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=hermes
+Group=hermes
+Environment=HOME=/home/hermes HERMES_HOME=/home/hermes/.hermes PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/home/hermes/.hermes
+ExecStart=/usr/bin/python3 /usr/local/libexec/psy-codex-auth.py
+TimeoutStartSec=105
+StateDirectory=psy-codex-auth
+StateDirectoryMode=0700
+UMask=0077
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes
+ReadOnlyPaths=/home/hermes/.hermes/hermes-agent /home/hermes/.hermes/tools
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

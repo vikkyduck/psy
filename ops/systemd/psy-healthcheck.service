@@ -1,0 +1,18 @@
+[Unit]
+Description=PSY gateway receive-path health check and recovery
+After=network-online.target hermes-gateway.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/psy-healthcheck.py
+TimeoutStartSec=150
+StateDirectory=psy-healthcheck
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/psy-healthcheck
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+

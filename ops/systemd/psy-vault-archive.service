@@ -1,0 +1,16 @@
+[Unit]
+Description=Archive PSY generated results to its private local vault
+
+[Service]
+Type=oneshot
+User=hermes
+Group=hermes
+ExecStart=/usr/bin/python3 /usr/local/libexec/psy-vault-archive.py
+UMask=0077
+PrivateNetwork=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.hermes/vault
+NoNewPrivileges=true
+TimeoutStartSec=90

@@ -1,0 +1,9 @@
+[Unit]
+Description=Check PSY recording priority every 15 seconds
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=15
+AccuracySec=1
+Unit=psy-audio-priority.service
+[Install]
+WantedBy=timers.target

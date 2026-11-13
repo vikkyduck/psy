@@ -1,0 +1,15 @@
+[Unit]
+Description=Prioritize PSY recordings over the optional Telegram build
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/psy-audio-priority.py
+StateDirectory=psy-audio-priority
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+MemoryMax=80M
+TimeoutStartSec=25

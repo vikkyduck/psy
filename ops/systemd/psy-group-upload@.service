@@ -1,0 +1,24 @@
+[Unit]
+Description=Issue one group recording ticket to the gateway
+[Service]
+EnvironmentFile=/etc/psy/instance.env
+ExecStart=/usr/bin/python3 -I /usr/local/lib/psy-group/upload_broker.py
+StandardInput=socket
+StandardOutput=null
+User=psy-upload
+Group=psy-upload
+UMask=0077
+ProtectHome=yes
+ProtectSystem=strict
+BindPaths=/home/hermes/.hermes/vault/uploads:/srv/psy-queue
+ReadWritePaths=/srv/psy-queue
+InaccessiblePaths=/etc/psy-upload /var/lib/psy-asr
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+PrivateDevices=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectProc=invisible
+CapabilityBoundingSet=
+MemoryMax=64M
+RuntimeMaxSec=15

@@ -1,0 +1,10 @@
+[Unit]
+Description=Gateway-only upload ticket for a small PSY group recording
+[Socket]
+ListenStream=/run/psy-group-upload.sock
+SocketMode=0600
+SocketUser=hermes
+Accept=yes
+MaxConnections=8
+[Install]
+WantedBy=sockets.target

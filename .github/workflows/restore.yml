@@ -1,0 +1,63 @@
+name: Restore checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  restore:
+    name: Rebuild gateway and test recordings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify source and Python syntax
+        run: |
+          python3 tools/verify_source.py
+          python3 -m unittest discover -s tools -p test_telegram_entry.py
+      - name: Reconstruct a clean official Hermes checkout
+        run: |
+          target="$RUNNER_TEMP/hermes"
+          revision=71d34bad1045610252eda02ee79549436896e784
+          git init -q "$target"
+          git -C "$target" remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C "$target" fetch --depth=1 --no-tags origin "$revision"
+          git -C "$target" checkout -q --detach FETCH_HEAD
+          python3 gateway/apply.py apply "$target"
+          python3 gateway/apply.py verify "$target"
+          python3 gateway/test_gateway.py "$target"
+          python3 gateway/apply.py apply "$target"
+      - name: Exercise the Mini App with synthetic recordings over loopback
+        run: |
+          python3 -m venv "$RUNNER_TEMP/psy-venv"
+          "$RUNNER_TEMP/psy-venv/bin/pip" install -r media/requirements.lock.txt
+          "$RUNNER_TEMP/psy-venv/bin/python" media/tests/run.py
+      - name: Unit tests for credentials and service recovery
+        run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=ops/libexec python3 -m unittest discover -s ops/tests -v
+      - name: Provision isolated system accounts and check access on the runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends acl ffmpeg python3-venv
+          sudo bash ops/prepare-host
+          sudo bash ops/install-runtime
+          sudo bash ops/test-host
+  recognition:
+    name: Verify pinned Whisper and Linux isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install checked dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg python3-venv
+          python3 -m venv "$RUNNER_TEMP/asr"
+          "$RUNNER_TEMP/asr/bin/pip" install -r media/asr-requirements.lock.txt
+      - name: Verify the public model before running it on generated audio
+        run: |
+          revision=ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66
+          model="$RUNNER_TEMP/whisper-base"
+          mkdir -p "$model"
+          for file in config.json model.bin tokenizer.json vocabulary.txt; do
+            curl --fail --location --retry 3 "https://huggingface.co/Systran/faster-whisper-base/resolve/$revision/$file" -o "$model/$file"
+          done
+          (cd "$model" && sha256sum --check "$GITHUB_WORKSPACE/media/model.sha256")
+          "$RUNNER_TEMP/asr/bin/python" media/tests/offline_smoke.py --model "$model"

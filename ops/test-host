@@ -1,0 +1,51 @@
+#!/bin/bash
+# Offline acceptance of an idle staging host. Synthetic files are removed by their creator.
+set -euo pipefail
+[[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
+case "${1:-}" in ""|--units) ;; *) exit 2 ;; esac
+cd /
+h=/home/hermes/.hermes
+p=$h/media-vault/uploads
+q=$h/vault/uploads
+tag=".psy-test-$(cat /proc/sys/kernel/random/uuid)"
+db=/srv/psy-queue/state.sqlite3
+media=/srv/psy-media/$tag
+as_user() {
+    local uid=$1 primary=$2 mounts=$3
+    shift 3
+    systemd-run --quiet --wait --pipe --collect -p "User=$uid" -p "Group=$primary" \
+        -p ProtectHome=yes -p ProtectSystem=strict -p NoNewPrivileges=yes -p PrivateNetwork=yes \
+        -p "$mounts" -- "$@"
+}
+cleanup() {
+    as_user psy-upload psy-upload "BindPaths=$p:/srv/psy-media" /usr/bin/rm -f -- "$media" || true
+    as_user psy-deliver psy-deliver "BindPaths=$p:/srv/psy-media" /usr/bin/rm -f -- "$media.txt" || true
+}
+trap cleanup EXIT
+for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
+    psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
+    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer; do
+    [[ $(systemctl show "$unit" -p LoadState --value) == loaded ]]
+    [[ $(systemctl show "$unit" -p ActiveState --value) == inactive ]]
+    ! systemctl is-enabled --quiet "$unit" || { echo "$unit unexpectedly enabled" >&2; exit 1; }
+done
+as_user psy-upload psy-upload "BindPaths=$p:/srv/psy-media" /bin/sh -ec \
+    'umask 077; set -C; echo synthetic-test-recording > "$1"; test ! -r /home/hermes/.hermes' sh "$media"
+as_user psy-deliver psy-deliver "BindPaths=$p:/srv/psy-media" /bin/sh -ec \
+    'test -r "$1"; umask 077; set -C; echo synthetic-result > "$1.txt"; chmod 0640 "$1.txt"' sh "$media"
+as_user psy-asr psy-deliver "BindReadOnlyPaths=$p:/srv/psy-media" /bin/sh -ec \
+    'test -r "$1"; test ! -w "$1"; test ! -r /home/hermes/.hermes' sh "$media"
+as_user psy-upload psy-upload "BindPaths=$p:/srv/psy-media" /usr/bin/test -r "$media.txt"
+runuser -u hermes -- test -r "$p/$tag.txt"
+for account in psy-upload psy-deliver; do
+    as_user "$account" "$account" "BindPaths=$q:/srv/psy-queue" /bin/sh -ec \
+        'test -w "$1"; test ! -r /home/hermes/.hermes' sh "$db"
+done
+as_user psy-upload psy-upload 'BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress' /usr/bin/test -r /srv/psy-progress
+if [[ -x /home/hermes/.hermes/hermes-agent/.hermes/bin/hermes && -x /opt/psy-upload-venv/bin/certbot && -x /opt/psy-asr-venv/bin/python ]] || [[ ${1:-} == --units ]]; then
+    units=(/etc/systemd/system/{hermes-gateway.service,psy-*.timer,psy-*.service,psy-*.socket})
+    systemd-analyze verify "${units[@]}"
+else
+    echo "Full executable check deferred until the Hermes launcher and both Python environments are installed. Re-run with --units."
+fi
+echo "PASS: staged units, disabled timers, media and queue ACLs, restricted home and read-only ASR mounts"

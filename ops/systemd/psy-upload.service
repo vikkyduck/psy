@@ -1,0 +1,36 @@
+[Unit]
+Description=PSY private large recording uploader
+Wants=network-online.target
+After=network-online.target psy-member.socket
+Requires=psy-member.socket
+[Service]
+EnvironmentFile=/etc/psy/instance.env
+Type=simple
+User=psy-upload
+Group=psy-upload
+Environment=HOME=/nonexistent HERMES_HOME=/nonexistent PSY_UPLOAD_ROOT=/srv/psy-queue PSY_UPLOAD_FILES=/srv/psy-media PSY_ASR_PROGRESS=/srv/psy-progress PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/psy-upload
+ExecStart=/opt/psy-upload-venv/bin/python /opt/psy-upload/server.py
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+TimeoutStopSec=50
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+Environment=PSY_ACCESS_SOCKET=/run/psy-member.sock
+InaccessiblePaths=/etc/psy-upload/telegram
+BindPaths=/home/hermes/.hermes/vault/uploads:/srv/psy-queue /home/hermes/.hermes/media-vault/uploads:/srv/psy-media
+BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress
+ReadWritePaths=/srv/psy-queue /srv/psy-media
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryMax=180M
+TasksMax=64
+[Install]
+WantedBy=multi-user.target

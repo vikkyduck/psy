@@ -1,0 +1,45 @@
+#!/bin/bash
+# Stage the service accounts and shared directories on the destination, with no service starts.
+set -euo pipefail
+[[ $EUID == 0 && $(uname -s) == Linux ]] || { echo "Use root on Linux" >&2; exit 1; }
+command -v setfacl >/dev/null
+command -v systemctl >/dev/null
+for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
+    psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
+    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer; do
+    if systemctl is-active --quiet "$unit"; then
+        echo "$unit active. Use an idle recovery host." >&2; exit 1
+    fi
+done
+base=$(cd -- "$(dirname -- "$0")" && pwd)
+umask 077
+cd /
+if ! id -u hermes >/dev/null 2>&1; then
+    useradd --system --create-home --home-dir /home/hermes --user-group --shell /bin/bash hermes
+fi
+[[ $(id -gn hermes) == hermes && $(getent passwd hermes | cut -d: -f6) == /home/hermes ]]
+[[ $(stat -c %U /home/hermes) == hermes && ! -L /home/hermes ]]
+runuser -u hermes -- chmod 0700 /home/hermes
+for account in psy-asr psy-access psy-upload psy-deliver; do
+    if ! id -u "$account" >/dev/null 2>&1; then
+        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$account"
+    fi
+    [[ $(id -gn "$account") == "$account" && $(getent passwd "$account" | cut -d: -f6) == /nonexistent ]]
+    [[ $(id -G "$account" | wc -w) -eq 1 ]] || { echo "Unexpected supplementary group for $account" >&2; exit 1; }
+done
+h=/home/hermes/.hermes
+runuser -u hermes -- mkdir -p -m 0700 "$h" "$h/tools" "$h/vault" "$h/media-vault" "$h/media-vault/uploads" \
+    "$h/vault/uploads" "$h/vault/materials" "$h/vault/projects" "$h/vault/generated" "$h/vault/conversations"
+runuser -u hermes -- setfacl -m u:psy-upload:rwx,u:psy-deliver:rwx,d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rwx,d:g::---,d:o::--- "$h/vault/uploads"
+# Precreate the shared SQLite inode before the app opens it. Existing content is preserved.
+runuser -u hermes -- sh -ec 'test -e "$1" || (set -C; : > "$1")' sh "$h/vault/uploads/state.sqlite3"
+runuser -u hermes -- setfacl -m u:psy-upload:rw,u:psy-deliver:rw "$h/vault/uploads/state.sqlite3"
+runuser -u hermes -- setfacl -m u:psy-upload:rwx,u:psy-deliver:rwx,u:psy-asr:--x,d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rx,d:u:psy-asr:rx,d:g::---,d:o::--- "$h/media-vault/uploads"
+install -d -m 0755 /etc/psy /etc/psy-upload /srv/psy-media /srv/psy-queue /srv/psy-progress
+if [[ ! -e /etc/psy/instance.env ]]; then
+    install -m 0640 -o root -g hermes "$base/instance.env.example" /etc/psy/instance.env
+fi
+install -d -m 0700 -o psy-asr -g psy-deliver /var/lib/psy-asr
+install -d -m 0750 -o psy-asr -g psy-deliver /var/lib/psy-asr/progress
+setfacl -m u:psy-upload:rx,d:u:psy-upload:rx,d:g::rx,d:o::--- /var/lib/psy-asr/progress
+echo "Accounts, ACLs and instance template staged"

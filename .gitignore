@@ -1,0 +1,43 @@
+# Private state and local credentials
+.env
+.env.*
+!.env.example
+instance.env
+auth.json
+*.key
+*.pem
+*.p12
+*.pfx
+*.session
+*token.pending
+.hermes/
+vault/
+media-vault/
+credentials/
+backups/
+# On-host content, progress and test output
+*.sqlite*
+*.db
+*.log
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.mp4
+*.webm
+*.zip
+*.tgz
+*.tar
+*.tar.gz
+outputs/
+recordings/
+uploads/
+transcripts/
+# Dependencies, build output and editor files
+node_modules/
+__pycache__/
+*.py[co]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
