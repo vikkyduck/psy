@@ -39,12 +39,13 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
         clock = NS(time=lambda: self.now)
         self.enterContext(patch.object(queue, "time", clock))
         self.enterContext(patch.object(store, "time", clock))
-        self.message = NS(message_id=100, chat=NS(id=-202), from_user=NS(id=7),
+        self.message = NS(message_id=100, chat=NS(id=-202, type="supergroup"), from_user=NS(id=7, is_bot=False),
+                          sender_chat=None, business_connection_id=None,
                           is_topic_message=True, message_thread_id=444,
                           reply_document=AsyncMock(), reply_text=AsyncMock())
-        self.enterContext(patch.object(queue.Update, "de_json", return_value=NS(message=self.message)))
+        self.enterContext(patch.object(queue.Update, "de_json", return_value=NS(message=self.message, update_id=31)))
         self.enterContext(patch.object(queue, "typing", AsyncMock()))
-        self.app = NS(running=True, bot=Mock())
+        self.app = NS(running=True, bot=NS(id=route.BOT))
         self.ident = 31
         self.body = '{"message":{"message_id":100}}'
         self.assertEqual(store.pending(7, self.ident, self.body), "queued")
@@ -53,8 +54,8 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
         stored = asyncio.Event()
         loop = asyncio.get_running_loop()
         defer = store.retry_delivery
-        def saved(*args):
-            defer(*args)
+        def saved(*args, **kwargs):
+            defer(*args, **kwargs)
             loop.call_soon_threadsafe(stored.set)
         accepted_ids = []
         bytes_on_wire = []

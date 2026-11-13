@@ -58,6 +58,7 @@ class Outbound:
     def __init__(self, msg, ident, wake=None):
         self.msg, self.ident = msg, ident
         self.checkpoints = store.Checkpoints(ident) if wake is None else _ScheduledCheckpoints(ident, wake)
+        self.scheduled = wake is not None
         self.part = 0
         self._model = False
 
@@ -72,6 +73,21 @@ class Outbound:
         if self.part:
             raise DeliveryUncertain()
         self._model = False
+
+    async def defer_model(self, issue):
+        if self.part:
+            raise DeliveryUncertain()
+        notify = await committed_call(store.wait_for_model, self.ident, issue.kind, issue.reset)
+        if notify:
+            # A notice is informational. Reserve it in the same transaction as the
+            # retry and attempt it at most once, even if Telegram loses its receipt.
+            text = ("Запрос сохранен. PSY продолжит его автоматически после восстановления доступа к Codex."
+                    if issue.kind in ("signin", "quota", "access_wait") else
+                    "Запрос сохранен. PSY автоматически повторит обращение к модели.")
+            try:
+                await self.msg.reply_text(text)
+            except Exception as exc:
+                log.info("group retry notice unavailable: %s", type(exc).__name__)
 
     def _destination(self):
         return [self.msg.chat.id, self.msg.from_user.id,
@@ -139,12 +155,17 @@ class Outbound:
                     delay = retry_seconds(exc)
                     if delay is None:
                         raise DeliveryUncertain() from None
+                    if self.scheduled:
+                        await committed_call(store.retry_delivery, self.ident, part, time.time() + delay, park=True)
+                        raise store.GroupJobParked()
                     await committed_call(store.retry_delivery, self.ident, part, time.time() + delay)
                     continue
                 if type(sent.message_id) is not int or sent.message_id <= 0:
                     raise DeliveryUncertain()
                 await committed_call(store.confirm_delivery, self.ident, part, sent.message_id)
                 return sent
+        except store.GroupJobParked:
+            raise
         except Exception:
             # A receipt write can fail after Telegram accepted an answer. The route must
             # never answer that failure with another message or retry an ambiguous send.
@@ -172,6 +193,7 @@ async def drain(app, wake):
         lease = store.lease()  # LOCK_NB on a local file, acquired and closed by this task.
         if lease is not None:
             try:
+                await ensure_vault(app.bot)
                 await committed_call(store.recover)
                 await work(app, wake)
             finally:
@@ -180,10 +202,29 @@ async def drain(app, wake):
         await asyncio.sleep(1)
 
 
+def group_sender(msg):
+    from .psy_group_route import GROUP
+    return (msg is not None and msg.chat.id == GROUP and msg.chat.type in ("group", "supergroup")
+            and msg.from_user is not None and not msg.from_user.is_bot
+            and msg.sender_chat is None and msg.business_connection_id is None)
+
+
+async def ensure_vault(bot):
+    from .psy_group_route import BOT, GROUP
+    if bot.id != BOT:
+        raise RuntimeError("Connected bot identity mismatch")
+    await committed_call(store.bind_instance, BOT, GROUP)
+
+
 async def run_job(app, wake, ident, body):
     from .psy_group_route import process_group
     try:
         update = Update.de_json(json.loads(body), app.bot)
+        from .psy_group_route import BOT
+        if app.bot.id != BOT or not group_sender(update.message) or update.update_id != ident:
+            raise ValueError("Stored group update is outside the configured scope")
+        if not await asyncio.to_thread(store.owns_running_job, ident, update.message.from_user.id):
+            raise ValueError("Stored group sender mismatch")
         finished = asyncio.Event()
         hint = asyncio.create_task(typing(app.bot, update.message, finished), name="psy-group-typing")
         try:
@@ -267,8 +308,9 @@ async def start(app):
 
 async def accept(app,update):
     msg=update.message
-    if not msg.from_user or msg.from_user.is_bot or msg.sender_chat or msg.business_connection_id:
+    if not group_sender(msg):
         return
+    await ensure_vault(app.bot)
     # Serialize only Telegram data delivered to the named group. Exclude unused forwarded
     # origin, external quotes, animations, service events and other unrelated metadata.
     raw=json.loads(update.to_json())["message"]

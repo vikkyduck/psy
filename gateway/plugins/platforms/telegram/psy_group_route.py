@@ -336,18 +336,26 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
         return {"request_key": (msg.ident, part)} if checkpoints is not None else {}
 
     turn_id = await asyncio.to_thread(store.remember, uid, topic, question, text, source_id=doc_id, message_id=mid, **receipt("turn"))
+    async def archive_answer(name, kind, data, key):
+        try:
+            await asyncio.to_thread(store.archive, uid, topic, name, kind, data, **receipt(key))
+        except store.ArchiveFull:
+            # The durable answer and per-part receipts still carry the exact payload.
+            # The archive quota must not discard work that already finished.
+            log.info("group answer archive quota reached")
+
     if text:
         if len(text) <= 4000:
             sent = await msg.reply_text(text, disable_web_page_preview=True)
         else:
             name = "Ответ PSY.txt"
             data = text.encode()
-            await asyncio.to_thread(store.archive, uid, topic, name, "text", data, **receipt("text"))
+            await archive_answer(name, "text", data, "text")
             sent = await deliver(msg, name, data)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
     for index, img in enumerate(images):
         name = "Изображение PSY.png"
-        await asyncio.to_thread(store.archive, uid, topic, name, "png", img, **receipt(f"image:{index}"))
+        await archive_answer(name, "png", img, f"image:{index}")
         sent = await deliver(msg, name, img)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
 
@@ -385,6 +393,10 @@ async def process_group(msg):
         raise
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
+        recovery = getattr(msg, "defer_model", None)
+        if exc.retryable and recovery is not None:
+            await recovery(exc)
+            raise store.GroupJobParked()
         await error_reply(msg, exc.public())
     except Exception as exc:
         # A timed-out Telegram send may already have reached the group.
@@ -397,7 +409,7 @@ async def process_group(msg):
         fn = tb.tb_frame.f_code.co_name if tb else "unknown"
         log.warning("group request failed class=%s function=%s line=%d elapsed=%.1fs",
                     type(exc).__name__, fn, tb.tb_lineno if tb else 0, time.monotonic() - start)
-        safe = str(exc) if type(exc) is ValueError and str(exc) in SAFE_ERRORS else None
+        safe = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else None
         await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
 
 

@@ -25,8 +25,9 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
         pending = iter([(7, "{}")])
         processing = asyncio.Event()
         finish = asyncio.Event()
-        message = SimpleNamespace(is_topic_message=False, chat=SimpleNamespace(id=-202),
-                                  from_user=SimpleNamespace(id=101), message_id=11,
+        message = SimpleNamespace(is_topic_message=False, chat=SimpleNamespace(id=-202, type="supergroup"),
+                                  sender_chat=None, business_connection_id=None,
+                                  from_user=SimpleNamespace(id=101, is_bot=False), message_id=11,
                                   reply_document=AsyncMock(return_value=SimpleNamespace(message_id=12)),
                                   reply_text=AsyncMock())
 
@@ -38,18 +39,18 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(loop, "slow_callback_duration", float("inf")),
             patch.object(loop, "time", lambda: real_time() + offset),
-            patch.object(queue.Update, "de_json", return_value=SimpleNamespace(message=message)),
+            patch.object(queue.Update, "de_json", return_value=SimpleNamespace(message=message, update_id=7)),
             patch.object(queue.store, "claim_next", side_effect=lambda **_: next(pending, None)),
             patch.object(queue.store, "next_retry_delay", return_value=None),
             patch.object(queue.store.Checkpoints, "get", return_value=None),
             patch.object(queue.store, "begin_delivery", return_value=("send", None)) as begin_send,
             patch.object(queue.store, "confirm_delivery") as confirm,
             patch.object(queue.store, "settle") as settle,
-            patch.object(queue.store, "state", return_value="running"),
+            patch.object(queue.store, "owns_running_job", return_value=True),
             patch.object(queue, "typing", AsyncMock()),
             patch.object(route, "process_group", write_lecture),
         ):
-            app = SimpleNamespace(running=True, bot=Mock())
+            app = SimpleNamespace(running=True, bot=SimpleNamespace(id=route.BOT))
             worker = asyncio.create_task(queue.work(app, asyncio.Event()))
             try:
                 await processing.wait()
@@ -79,7 +80,8 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
                 finished.set()
 
         bot = SimpleNamespace(send_chat_action=action)
-        message = SimpleNamespace(chat=SimpleNamespace(id=-202), is_topic_message=False)
+        message = SimpleNamespace(chat=SimpleNamespace(id=-202, type="supergroup"),
+                                  sender_chat=None, business_connection_id=None, is_topic_message=False)
         with patch.object(asyncio, "sleep", AsyncMock()):
             await queue.typing(bot, message, finished)
         self.assertEqual(count, 465)

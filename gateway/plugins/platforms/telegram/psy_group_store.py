@@ -23,6 +23,11 @@ def database(root=ROOT):
     try:
         con.execute("PRAGMA foreign_keys = ON")
         con.executescript("""
+            CREATE TABLE IF NOT EXISTS instance_binding (
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1), bot INTEGER NOT NULL, chat INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS model_retries (
+              request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+              attempts INTEGER NOT NULL, retry_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL,
               body TEXT NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule (
@@ -71,6 +76,29 @@ def database(root=ROOT):
         con.commit()
     finally:
         con.close()
+
+
+def bind_instance(bot, chat, *, root=ROOT, adopt_legacy=False):
+    """An operator must identify the owner of a populated vault created before binding."""
+    if type(bot) is not int or bot <= 0 or type(chat) is not int or chat >= 0:
+        raise ValueError("Invalid group vault identity")
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        bound = con.execute("SELECT bot,chat FROM instance_binding WHERE singleton=1").fetchone()
+        if bound == (bot, chat):
+            return
+        if bound is not None:
+            raise RuntimeError("Group vault identity mismatch")
+        if not adopt_legacy:
+            tables = ("documents","turns","requests","completed_updates","source_events","turn_sources",
+                      "message_sources","current_sources")
+            if any(con.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() for table in tables):
+                raise RuntimeError("Existing group vault requires explicit identity binding")
+        con.execute("INSERT INTO instance_binding VALUES(1,?,?)", (bot, chat))
+
+
+class ArchiveFull(ValueError):
+    pass
 
 
 def _bind(con, uid, topic, message_id, doc_id, turn_id):
@@ -134,7 +162,7 @@ def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT, request
         member, total = con.execute("""SELECT coalesce(sum(CASE WHEN uid=? THEN length(data)
                       ELSE 0 END),0), coalesce(sum(length(data)),0) FROM documents""", (uid,)).fetchone()
         if member + len(data) > MEMBER_LIMIT or total + len(data) > TOTAL_LIMIT:
-            raise ValueError("В хранилище недостаточно места для нового файла.")
+            raise ArchiveFull("В хранилище недостаточно места для нового файла.")
         cursor = con.execute("INSERT INTO documents(uid,topic,name,kind,data) VALUES (?,?,?,?,?)",
                              (uid, topic, name[:140], kind, data))
         doc_id = cursor.lastrowid
@@ -343,12 +371,14 @@ def claim_next(*, root=ROOT, now=None):
                                           ON s.request_id=r.id WHERE s.request_id IS NULL AND
                                           r.state IN ('queued','running','sending')""").fetchall():
             _schedule_request(con, ident, body)
+        now = time.time() if now is None else now
         record = con.execute(f"""SELECT r.id,r.body FROM requests r JOIN schedule s ON s.request_id=r.id
               WHERE r.state='queued' AND {_CLAIMABLE}
                 AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
                                 AND p.state='retry' AND p.retry_at>?)
+                AND NOT EXISTS (SELECT 1 FROM model_retries m WHERE m.request_id=r.id AND m.retry_at>?)
               ORDER BY (SELECT count(*) FROM requests a WHERE a.uid=r.uid AND a.state IN ('running','sending')),
-                       r.rowid LIMIT 1""", (MAX_LONG_JOBS, time.time() if now is None else now)).fetchone()
+                       r.rowid LIMIT 1""", (MAX_LONG_JOBS, now, now)).fetchone()
         if record:
             con.execute("UPDATE requests SET state='running' WHERE id=?", (record[0],))
         return record
@@ -376,10 +406,38 @@ def admit_long(ident, *, root=ROOT):
 def next_retry_delay(*, root=ROOT, now=None):
     now = time.time() if now is None else now
     with database(root) as con:
-        due = con.execute(f"""SELECT min(p.retry_at) FROM delivery_parts p JOIN requests r ON r.id=p.request_id
-                    JOIN schedule s ON s.request_id=r.id WHERE r.state='queued' AND p.state='retry'
-                    AND {_CLAIMABLE}""", (MAX_LONG_JOBS,)).fetchone()[0]
+        due = con.execute(f"""WITH timers AS (
+                   SELECT request_id,retry_at FROM delivery_parts WHERE state='retry'
+                   UNION ALL SELECT request_id,retry_at FROM model_retries),
+                 ready AS (SELECT request_id,max(retry_at) due FROM timers GROUP BY request_id)
+                 SELECT min(t.due) FROM ready t JOIN requests r ON r.id=t.request_id
+                 JOIN schedule s ON s.request_id=r.id WHERE r.state='queued'
+                 AND {_CLAIMABLE}""", (MAX_LONG_JOBS,)).fetchone()[0]
     return None if due is None else max(0, due - now)
+
+
+def owns_running_job(ident, uid, *, root=ROOT):
+    with database(root) as con:
+        return con.execute("SELECT 1 FROM requests WHERE id=? AND uid=? AND state='running'",
+                           (ident, uid)).fetchone() is not None
+
+
+def wait_for_model(ident, kind, reset=None, *, root=ROOT, now=None):
+    """Commit retry before any best-effort notice. A restart cannot lose chapters or repeat the notice."""
+    now = time.time() if now is None else now
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        if not con.execute("SELECT 1 FROM requests WHERE id=? AND state='running'", (ident,)).fetchone():
+            raise RuntimeError("Group request is not running")
+        row = con.execute("SELECT attempts FROM model_retries WHERE request_id=?", (ident,)).fetchone()
+        attempts = (row[0] if row else 0) + 1
+        delay = min(1800, (300 if kind in ("signin","quota") else 60) * 2 ** min(attempts-1, 5))
+        due = now + delay
+        if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
+            due = max(due, reset)
+        con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
+        con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+        return row is None
 
 
 def begin_delivery(ident, part, fingerprint, *, root=ROOT, now=None):
@@ -410,7 +468,7 @@ def begin_delivery(ident, part, fingerprint, *, root=ROOT, now=None):
         return "send", None
 
 
-def _finish_attempt(con, ident, part, state, message_id, due):
+def _finish_attempt(con, ident, part, state, message_id, due, *, park=False):
     con.execute("BEGIN IMMEDIATE")
     request = con.execute("SELECT state FROM requests WHERE id=?", (ident,)).fetchone()
     if request != ("sending",):
@@ -420,7 +478,7 @@ def _finish_attempt(con, ident, part, state, message_id, due):
                         (state, message_id, due, ident, part)).rowcount
     if count != 1:
         raise ValueError("No active group delivery part")
-    con.execute("UPDATE requests SET state='running' WHERE id=?", (ident,))
+    con.execute("UPDATE requests SET state=? WHERE id=?", ("queued" if park else "running", ident))
 
 
 def confirm_delivery(ident, part, message_id, *, root=ROOT):
@@ -430,11 +488,11 @@ def confirm_delivery(ident, part, message_id, *, root=ROOT):
         _finish_attempt(con, ident, part, "confirmed", message_id, None)
 
 
-def retry_delivery(ident, part, retry_at, *, root=ROOT):
+def retry_delivery(ident, part, retry_at, *, root=ROOT, park=False):
     if not math.isfinite(retry_at):
         raise ValueError("Invalid Telegram retry time")
     with database(root) as con:
-        _finish_attempt(con, ident, part, "retry", None, retry_at)
+        _finish_attempt(con, ident, part, "retry", None, retry_at, park=park)
 
 
 def outbound(ident, *, root=ROOT):

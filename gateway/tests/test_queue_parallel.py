@@ -30,9 +30,9 @@ class ParallelQueue(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(store, "lease", lambda: lease(root=root)))
         self.messages = {}
         self.enterContext(patch.object(queue.Update, "de_json", side_effect=lambda data, bot:
-                                       NS(message=self.messages[data["update_id"]])))
+                                       NS(message=self.messages[data["update_id"]], update_id=data["update_id"])))
         self.enterContext(patch.object(queue, "typing", AsyncMock()))
-        self.app = NS(running=True, bot=Mock(), adapter=NS(), create_task=asyncio.create_task)
+        self.app = NS(running=True, bot=NS(id=route.BOT), adapter=NS(), create_task=asyncio.create_task)
         self.sent = []
 
     async def enqueue(self, ident, text, uid=17, reply=None):
@@ -43,7 +43,7 @@ class ParallelQueue(unittest.IsolatedAsyncioTestCase):
         async def deliver(text, **kwargs):
             self.sent.append((ident, text))
             return NS(message_id=ident + 100)
-        message = NS(chat=NS(id=-202), from_user=NS(id=uid, is_bot=False), message_id=ident,
+        message = NS(chat=NS(id=-202, type="supergroup"), from_user=NS(id=uid, is_bot=False), message_id=ident,
                      text=text, sender_chat=None, business_connection_id=None,
                      is_topic_message=False, message_thread_id=None, reply_text=deliver)
         self.messages[ident] = message

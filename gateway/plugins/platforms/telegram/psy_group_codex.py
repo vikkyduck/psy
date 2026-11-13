@@ -152,6 +152,11 @@ class ModelIssue(Exception):
         super().__init__(kind)
         self.kind, self.stage, self.reset = kind, stage, reset
 
+    @property
+    def retryable(self):
+        return self.kind in ("signin", "access_wait", "timeout", "connection", "busy", "quota") or (
+            self.kind == "unavailable" and self.stage == "upstream")
+
     def public(self):
         reset = self.reset
         if self.kind == "quota" and type(reset) in (int, float) and time.time() < reset <= time.time() + 32*86400:
@@ -161,6 +166,8 @@ class ModelIssue(Exception):
 
 
 def _failure(status, detail, stage):
+    if status in (408, 504):
+        return ModelIssue("timeout", stage)
     detail = detail if isinstance(detail, dict) else {}
     codes = (detail.get("code"), detail.get("type"))
     if any(c in ("usage_limit_reached", "insufficient_quota", "usage_limit_exceeded") for c in codes):
@@ -171,7 +178,7 @@ def _failure(status, detail, stage):
         return ModelIssue("busy", stage)
     if status == 401 or any(c in ("invalid_token","token_expired") for c in codes):
         return ModelIssue("signin", stage)
-    return ModelIssue("unavailable", stage)
+    return ModelIssue("unavailable", "upstream" if type(status) is int and 500 <= status < 600 else stage)
 
 
 class CredentialIssue(Exception):
@@ -371,10 +378,19 @@ def _authenticated_request(request):
     return request(replacement, headers)
 
 
+class _ResumeModelJob(Exception):
+    """Carry a deferred stage through manuscript editors that normally return partial output."""
+    def __init__(self, issue):
+        self.issue = issue
+
+
 def respond(turns, *, research=False, draw=False, model, question=None, checkpoints=None):
     with _transport():
-        return _respond(turns, research=research, draw=draw, model=model, question=question,
-                        checkpoints=checkpoints)
+        try:
+            return _respond(turns, research=research, draw=draw, model=model, question=question,
+                            checkpoints=checkpoints)
+        except _ResumeModelJob as deferred:
+            raise deferred.issue from None
 
 
 def _admit_long(checkpoints):
@@ -420,7 +436,7 @@ def _respond(turns, *, research=False, draw=False, model, question=None, checkpo
         return Result("", [base64.b64decode(encoded, validate=True)], False)
 
 
-def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None):
+def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=None):
     if read_idle is None:
         read_idle = READ_IDLE_SECONDS[bool(research)]
     tools = [{"type": "web_search"}] if research else []
@@ -453,7 +469,11 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
         interruption = ModelIssue("connection", "stream_end")
         unsaved_chars = 0
         last_save = time.monotonic() if save_prefix else 0
+        last_progress = time.monotonic() if progress_idle else None
         for line in _lines(response):
+            if progress_idle and time.monotonic() - last_progress >= progress_idle:
+                interruption = ModelIssue("timeout", "classification_idle")
+                break
             if isinstance(line, ModelIssue):
                 interruption = line
                 break
@@ -466,6 +486,9 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if not isinstance(event, dict):
                 raise ModelIssue("connection", "stream_format")
             typ = event.get("type")
+            if progress_idle and (typ in ("response.output_text.delta","response.reasoning_summary_text.delta",
+                                           "response.reasoning_text.delta") and event.get("delta")):
+                last_progress = time.monotonic()
             item = event.get("item") or {}
             item_id = event.get("item_id") or item.get("id") or event.get("output_index", 0)
             content_index = event.get("content_index", 0)
@@ -844,11 +867,15 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
             saved_prefix = True
 
         options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
+        if checkpoints is not None and DISPATCH in instructions:
+            options["progress_idle"] = 300
         try:
             with _transport():
                 result = _authenticated_request(lambda token, headers: _stream(
                     client, headers, messages, web, model, instructions=instructions, **options))
-        except ModelIssue:
+        except ModelIssue as exc:
+            if checkpoints is not None and exc.retryable:
+                raise _ResumeModelJob(exc) from None
             # A terminal error (including a provider refusal) invalidates speculative
             # output. Only a process interruption leaves a prefix to resume from.
             if saved_prefix:
@@ -1042,7 +1069,7 @@ def choose_source(question, options, active_id, *, model):
             payload = {"question": question, "active": active_id, "options": options}
             r = _authenticated_request(lambda token, headers: _stream(
                 client, headers, [_user(json.dumps(payload, ensure_ascii=False))], False, model,
-                instructions=instructions, read_idle=45))
+                instructions=instructions, read_idle=45, progress_idle=180))
     data = _json_value(r.text) if r.complete else None
     if not isinstance(data, dict) or "source" not in data:
         return "clarify"
