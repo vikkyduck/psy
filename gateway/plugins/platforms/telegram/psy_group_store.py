@@ -11,6 +11,7 @@ ROOT = Path("/home/hermes/.hermes/vault/group-psy")
 MEMBER_LIMIT = 128 * 1024**2
 TOTAL_LIMIT = 512 * 1024**2
 MAX_LONG_JOBS = 2
+AUTH_WAITS = ("signin", "access_wait")
 
 
 @contextlib.contextmanager
@@ -28,6 +29,11 @@ def database(root=ROOT):
             CREATE TABLE IF NOT EXISTS model_retries (
               request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
               attempts INTEGER NOT NULL, retry_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS auth_recoveries (
+              revision INTEGER PRIMARY KEY, incident TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS model_attempts (
+              request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+              auth_revision INTEGER NOT NULL, wait_kind TEXT);
             CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL,
               body TEXT NOT NULL, state TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schedule (
@@ -381,6 +387,9 @@ def claim_next(*, root=ROOT, now=None):
                        r.rowid LIMIT 1""", (MAX_LONG_JOBS, now, now)).fetchone()
         if record:
             con.execute("UPDATE requests SET state='running' WHERE id=?", (record[0],))
+            # A verified login can arrive while a previously claimed model call is unwinding.
+            con.execute("""INSERT OR REPLACE INTO model_attempts(request_id,auth_revision)
+                           SELECT ?,coalesce(max(revision),0) FROM auth_recoveries""", (record[0],))
         return record
 
 
@@ -435,9 +444,31 @@ def wait_for_model(ident, kind, reset=None, *, root=ROOT, now=None):
         due = now + delay
         if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
             due = max(due, reset)
+        con.execute("UPDATE model_attempts SET wait_kind=? WHERE request_id=?", (kind, ident))
+        if kind in AUTH_WAITS:
+            recovered = con.execute("""SELECT 1 FROM model_attempts
+                                       WHERE request_id=? AND auth_revision <
+                                       (SELECT max(revision) FROM auth_recoveries)""", (ident,)).fetchone()
+            if recovered:
+                due = now
         con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
         con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
         return row is None
+
+
+def release_auth_waits(incident, *, root=ROOT):
+    """Commit one verified recovery; leave Telegram, quota and pre-migration timers intact."""
+    if not isinstance(incident, str) or not incident or len(incident) > 128:
+        raise ValueError("Invalid Codex recovery identifier")
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        saved = con.execute("INSERT OR IGNORE INTO auth_recoveries(incident) VALUES(?)", (incident,))
+        if not saved.rowcount:
+            return 0
+        # Keep model_retries so the next attempt cannot repeat the participant notice.
+        return con.execute("""UPDATE model_retries SET retry_at=0 WHERE request_id IN (
+                              SELECT a.request_id FROM model_attempts a JOIN requests r ON r.id=a.request_id
+                              WHERE a.wait_kind IN (?,?) AND r.state='queued')""", AUTH_WAITS).rowcount
 
 
 def begin_delivery(ident, part, fingerprint, *, root=ROOT, now=None):

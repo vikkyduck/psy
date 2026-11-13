@@ -2,6 +2,8 @@
 import hashlib
 import json
 import math
+import os
+import secrets
 from pathlib import Path
 import time
 
@@ -49,11 +51,11 @@ def refresh_outcome(error):
     return "uncertain"
 
 
-def guarded_exchange(grant, exchange):
+def guarded_exchange(grant, exchange, *, on_received=None):
     """Journal intent before the POST. A crash or partial response must never replay a grant.
 
     All pinned Hermes Codex entry points invoke this below their usual auth-store lock.
-    The private journal stores only state and timestamps. A distinct login has a distinct key.
+    The journal stores state, a random attempt ID and timestamps. A distinct grant has its own key.
     """
     from hermes_cli.auth import _auth_file_path, _global_auth_file_path, _auth_store_lock, _save_private_json
 
@@ -84,7 +86,10 @@ def guarded_exchange(grant, exchange):
         elif previous is not absent:
             raise block_error("psy_refresh_rejected" if state == "rejected" else "psy_refresh_uncertain")
         # Never send on an unwritable store. Atomic writes include fsync of the directory.
-        _save_private_json(path, {"state": "pending"}, fsync_dir=True)
+        pending = {"state": "pending"}
+        if on_received is not None:
+            pending["attempt"] = secrets.token_hex(16)
+        _save_private_json(path, pending, fsync_dir=True)
         try:
             result = exchange()
         except Exception as error:
@@ -97,6 +102,11 @@ def guarded_exchange(grant, exchange):
             if state == "uncertain":
                 raise block_error("psy_refresh_uncertain") from None
             raise
+        if on_received is not None:
+            # Keep pending until the auth-store transaction commits. Its private receipt
+            # allows a later process to finish locally, including when the grant is unchanged.
+            on_received(result, pending["attempt"])
+            return result
         # Keeping the old grant blocked also protects legacy rows read by other Hermes callers.
         if result["refresh_token"] == grant:
             path.unlink()
@@ -111,7 +121,7 @@ def _primary_rows(store):
             and row["priority"] == 0]
 
 
-def preferred(store):
+def preferred(store, *, allow_dead=False):
     from hermes_cli.auth_codex import _codex_pool_route_base_url
     from hermes_cli.auth_constants import _decode_jwt_claims
 
@@ -122,8 +132,10 @@ def preferred(store):
     base = row.get("base_url") or BASE
     if (not row.get("id") or row.get("source") != "manual:device_code" or row.get("auth_type") != "oauth"
             or not isinstance(base, str) or base.rstrip("/") != BASE or _codex_pool_route_base_url(base).rstrip("/") != BASE
-            or row.get("last_status") == "dead" or not all(isinstance(row.get(k), str) and row[k].strip()
+            or not all(isinstance(row.get(k), str) and row[k].strip()
                                                            for k in ("access_token", "refresh_token"))):
+        raise CredentialIssue("signin", "preferred login unavailable, owner login required")
+    if row.get("last_status") == "dead" and not allow_dead:
         raise CredentialIssue("signin", "preferred login unavailable, owner login required")
     expiry = _decode_jwt_claims(row["access_token"]).get("exp")
     if type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= 0:
@@ -236,15 +248,19 @@ def account_denied(markers, row):
     return isinstance(data, dict) and data.get("generation") == generation(row)
 
 
-def admit(store, row, expiry, *, markers, purpose, model_rejected=False):
+def admit(store, row, expiry, *, markers, purpose, model_rejected=False, target=None):
     if legacy_marker(markers / "rejected", row["refresh_token"]):
+        _incident(row, "revoked", target=target)
         raise CredentialIssue("signin", "OpenAI previously rejected this grant, owner login required")
     if purpose not in {"model", "native", "native_probe", "account_401", "scheduled"}:
         raise ValueError("unknown Codex renewal purpose")
     if purpose in {"model", "native", "account_401"} and account_denied(markers, row):
+        _incident(row, "model_rejected", target=target)
         raise CredentialIssue("signin", "Codex account endpoint still returns HTTP 401 after renewal")
     recovery = group_recovery(row)
     if recovery == "access_wait" or (recovery == "signin" and purpose in {"model", "native"}):
+        if recovery == "signin":
+            _incident(row, "model_rejected", target=target)
         raise CredentialIssue(recovery, "model authorization recovery pending")
     if model_rejected and recovery == "renewed":
         raise CredentialIssue("signin", "model refused renewed bearer")
@@ -260,14 +276,187 @@ def admit(store, row, expiry, *, markers, purpose, model_rejected=False):
             raise CredentialIssue("access_wait", "preferred login expired in cooldown; inspect gateway")
 
 
+def _incident(row, reason, *, target=None):
+    from hermes_cli.psy_codex_incident import report
+    report(row, reason, target=target, markers=MARKERS)
+
+
+def _receipt_path(target):
+    from hermes_cli.auth import _auth_file_path
+    return (target or _auth_file_path()).parent / "psy-codex-received.json"
+
+
+def _load_store(target):
+    from hermes_cli.auth import _load_auth_store
+    return _load_auth_store() if target is None else _load_auth_store(target)
+
+
+def _save_store(store, target):
+    from hermes_cli.auth import _save_auth_store
+    if target is None:
+        _save_auth_store(store)
+    else:
+        _save_auth_store(store, target_path=target)
+
+
+def _tokens_for_owner(updated, aliases, *, device_login=False):
+    from hermes_cli.auth_constants import _decode_jwt_claims
+    keys = ("access_token", "refresh_token", "last_refresh")
+    if not isinstance(updated, dict) or any(not isinstance(updated.get(k), str) or not updated[k].strip() for k in keys):
+        raise CredentialIssue("signin", "Codex returned incomplete credentials")
+    bearer = updated["access_token"]
+    expiry = _decode_jwt_claims(bearer).get("exp")
+    if type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= 0:
+        raise CredentialIssue("signin", "Codex returned a credential with no expiration")
+    old = [alias["access_token"] for alias in aliases]
+    if not compatible_owners([*old, bearer]):
+        raise CredentialIssue("signin", "Codex returned another owner, owner login required")
+    if device_login:
+        # The browser can be signed into a different account. Require affirmative
+        # continuity for every identity field known before the interactive login.
+        def device_identity(token):
+            claims = _decode_jwt_claims(token)
+            auth = claims.get("https://api.openai.com/auth")
+            auth = auth if isinstance(auth, dict) else {}
+            return claims.get("sub"), auth.get("chatgpt_user_id"), auth.get("chatgpt_account_id")
+
+        subjects, users, accounts = zip(*(device_identity(token) for token in old))
+        new_sub, new_user, new_account = device_identity(bearer)
+        # Members can share a workspace. Conversely a person can belong to several
+        # workspaces. Both the person and the subscription must be identifiable.
+        if not (any(subjects) or any(users)) or not any(accounts):
+            raise CredentialIssue("signin", "Prior login cannot identify the ChatGPT user and workspace")
+        for recorded, fresh in ((subjects, new_sub), (users, new_user), (accounts, new_account)):
+            if any(value is not None and (not isinstance(value, str) or not value.strip() or value != fresh)
+                   for value in recorded):
+                raise CredentialIssue("signin", "Could not verify the same ChatGPT user and workspace")
+        if expiry <= time.time():
+            raise CredentialIssue("signin", "The new owner login has expired")
+    return {key: updated[key] for key in keys}
+
+
+def _apply_pair(row, aliases, tokens, model_rejected):
+    refused_again = model_rejected and tokens["access_token"] == row["access_token"]
+    for alias in aliases:
+        alias.update(tokens)
+    if model_rejected:
+        mark_model(row, "signin" if refused_again else "renewed", 0 if refused_again else 300)
+    return refused_again
+
+
+def _durably_unlink(path):
+    path.unlink()
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _finish_receipt(path, receipt):
+    from hermes_cli.auth import _auth_store_lock, _save_private_json
+    # Never use an arbitrary file name from an interrupted/corrupted receipt.
+    old = receipt["grant_hash"]
+    if not isinstance(old, str) or len(old) != 64 or any(c not in "0123456789abcdef" for c in old):
+        raise CredentialIssue("access_wait", "damaged Codex renewal receipt")
+    journal = path.parent / "psy-codex-renewals" / (old + ".json")
+    with _auth_store_lock(timeout_seconds=35, target_path=journal):
+        try:
+            previous = json.loads(journal.read_bytes())
+        except FileNotFoundError:
+            previous = None
+        # A newer attempt for an unchanged grant owns its own replay barrier.
+        if previous == {"state": "pending", "attempt": receipt["attempt"]}:
+            if old == fingerprint(receipt["tokens"]["refresh_token"]):
+                _durably_unlink(journal)
+            else:
+                _save_private_json(journal, {"state": "spent"}, fsync_dir=True)
+    _durably_unlink(path)
+
+
+def _recover(store, target):
+    """Under the store's lock finish one received response, or discard a superseded one."""
+    path = _receipt_path(target)
+    try:
+        pending = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return False
+    except ValueError:
+        raise CredentialIssue("access_wait", "damaged Codex renewal receipt") from None
+    if (not isinstance(pending, dict) or not isinstance(pending.get("before"), str)
+            or not isinstance(pending.get("tokens"), dict) or not isinstance(pending["tokens"].get("refresh_token"), str)
+            or not isinstance(pending.get("attempt"), str) or not isinstance(pending.get("grant_hash"), str)
+            or type(pending.get("model_rejected")) is not bool):
+        raise CredentialIssue("access_wait", "damaged Codex renewal receipt")
+    row, _ = preferred(store, allow_dead=True)
+    applied = generation(row) == pending["before"] and row.get("last_status") != "dead"
+    if applied:
+        if fingerprint(row["refresh_token"]) != pending["grant_hash"]:
+            raise CredentialIssue("access_wait", "damaged Codex renewal receipt")
+        aliases = grant_aliases(store["credential_pool"][PROVIDER], row)
+        tokens = _tokens_for_owner(pending["tokens"], aliases)
+        refused = _apply_pair(row, aliases, tokens, pending["model_rejected"])
+        _save_store(store, target)
+        if refused:
+            _incident(row, "model_rejected", target=target)
+    _finish_receipt(path, pending)
+    return applied
+
+
+def _current_store(target=None):
+    from hermes_cli.auth import _auth_store_lock
+    if not _receipt_path(target).exists():
+        return _load_store(target)
+    with _auth_store_lock(timeout_seconds=35, target_path=target):
+        store = _load_store(target)
+        _recover(store, target)
+        return store
+
+
+def credential_snapshot():
+    """Return the sole configured managed identity, including a disabled generation."""
+    return preferred(_current_store(), allow_dead=True)
+
+
+def _active(store, *, target=None):
+    row, expiry = preferred(store, allow_dead=True)
+    if row.get("last_status") == "dead":
+        _incident(row, "revoked", target=target)
+        raise CredentialIssue("signin", "preferred login unavailable, owner login required")
+    return row, expiry
+
+
+def install_owner_login(observed_generation, tokens):
+    """Install a browser-authorized login for the same subscription under generation CAS."""
+    from hermes_cli.auth import _auth_store_lock
+    with _auth_store_lock(timeout_seconds=35):
+        store = _load_store(None)
+        _recover(store, None)
+        row, _ = preferred(store, allow_dead=True)
+        if generation(row) != observed_generation:
+            return generation(row)
+        aliases = grant_aliases(store["credential_pool"][PROVIDER], row)
+        pair = _tokens_for_owner(tokens, aliases, device_login=True)
+        if pair["refresh_token"] == row["refresh_token"]:
+            raise CredentialIssue("signin", "Owner login did not issue a fresh grant")
+        for alias in aliases:
+            if alias.get("last_status") == "dead" or alias.get("last_error_code") == 401:
+                for field in ("last_status", "last_status_at", "last_error_reason", "last_error_code",
+                              "last_error_message", "last_error_reset_at"):
+                    alias.pop(field, None)
+            alias.pop("psy_model_auth_recovery", None)
+            alias.update(pair)
+        _save_store(store, None)
+        return generation(row)
+
+
 def model_credentials(rejected=None):
     """Admit this generation for one real inference. Only a matching HTTP 401 demands renewal."""
-    from hermes_cli.auth import _load_auth_store
     from hermes_cli.auth_constants import httpx
 
     try:
-        store = _load_auth_store()
-        row, expiry = preferred(store)
+        store = _current_store()
+        row, expiry = _active(store)
         model_rejected = rejected == generation(row)
         if model_rejected and group_recovery(row) == "renewed":
             record_model_refusal(rejected)
@@ -297,6 +486,7 @@ def record_model_refusal(observed_generation):
             if observed_generation == generation(row):
                 mark_model(row, "signin", 0)
                 _save_auth_store(store)
+                _incident(row, "model_rejected")
     except OSError:
         raise CredentialIssue("access_wait", "credential store unavailable") from None
 
@@ -311,14 +501,14 @@ def record_account_probe(observed, account, *, after_renewal, markers):
         path = markers / "account-denied"
         if account.http == 401 and after_renewal:
             _save_private_json(path, {"generation": generation(row)}, fsync_dir=True)
+            _incident(row, "model_rejected")
         elif account.auth == "valid" and account_denied(markers, row):
             path.unlink(missing_ok=True)
 
 
 def account_credentials(probe, *, force=False):
     """Perform the scheduled check; only the account probe itself is supplied by the monitor."""
-    from hermes_cli.auth import _load_auth_store
-    row, expiry = preferred(_load_auth_store())
+    row, expiry = _active(_current_store())
     due = force or expiry - time.time() <= RENEW_BEFORE
     account = None if due else probe(row["access_token"])
     renewed = False
@@ -333,64 +523,70 @@ def account_credentials(probe, *, force=False):
 
 def renew(observed, *, markers, purpose, model_rejected=False, timeout_seconds=20.0, target=None):
     """Re-read the preferred generation, check caller admission, rotate aliases in one Hermes write."""
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+    from hermes_cli.auth import _auth_store_lock
     from hermes_cli.auth_codex import refresh_codex_oauth_pure
     from hermes_cli.auth_constants import AuthError, httpx
 
     lock_path = {} if target is None else {"target_path": target}
 
-    def save(store):
-        _save_auth_store(store, **lock_path)
-
     with _auth_store_lock(timeout_seconds=max(35, timeout_seconds + 5), **lock_path):
-        store = _load_auth_store() if target is None else _load_auth_store(target)
-        row, expiry = preferred(store)
+        store = _load_store(target)
+        recovered = _recover(store, target)
+        row, expiry = _active(store, target=target)
         if row["id"] != observed["id"]:
             raise CredentialIssue("access_wait", "preferred login changed during renewal")
         changed = generation(row) != generation(observed)
-        admit(store, row, expiry, markers=markers, purpose=purpose, model_rejected=model_rejected and not changed)
-        if changed:
+        admit(store, row, expiry, markers=markers, purpose=purpose, model_rejected=model_rejected and not changed, target=target)
+        if changed or recovered:
             return row, expiry, False
         grant = row["refresh_token"]
         matching = grant_aliases(store["credential_pool"][PROVIDER], row)
+        receipt = None
+        def received(updated, attempt):
+            from hermes_cli.auth import _save_private_json
+            nonlocal receipt
+            tokens = _tokens_for_owner(updated, matching)
+            receipt = {"before": generation(row), "grant_hash": fingerprint(grant), "attempt": attempt,
+                       "model_rejected": model_rejected, "tokens": tokens}
+            _save_private_json(_receipt_path(target), receipt, fsync_dir=True)
         try:
-            updated = refresh_codex_oauth_pure(row["access_token"], grant, timeout_seconds=timeout_seconds)
+            updated = refresh_codex_oauth_pure(row["access_token"], grant, timeout_seconds=timeout_seconds,
+                                               on_received=received)
+            tokens = _tokens_for_owner(updated, matching)
+        except CredentialIssue:
+            # A syntactically successful exchange returned unusable credentials.
+            for alias in matching:
+                alias.update(last_status="dead", last_status_at=time.time(), last_error_reason="codex_owner_conflict",
+                             last_error_code=None, last_error_message="Unusable Codex renewal response")
+            _save_store(store, target)
+            _incident(row, "revoked", target=target)
+            raise
         except (AuthError, httpx.RequestError, OSError) as error:
             code = getattr(error, "code", None)
             if terminal(error) or code == "psy_refresh_rejected":
                 for alias in matching:
                     alias.update(last_status="dead", last_status_at=time.time(), last_error_reason=code,
                                  last_error_code=None, last_error_message="Codex OAuth grant rejected")
-                save(store)
+                _save_store(store, target)
+                _incident(row, "revoked", target=target)
                 raise CredentialIssue("signin", "OpenAI rejected renewal, owner login required") from None
             if code == "psy_refresh_uncertain":
+                _incident(row, "uncertain", target=target)
                 if model_rejected:
                     mark_model(row, "signin", 0)
-                    save(store)
+                    _save_store(store, target)
                 raise CredentialIssue("signin", "renewal outcome unknown, owner login required", may_use_current=True) from None
             if model_rejected:
                 mark_model(row, "access_wait", 60)
-                save(store)
+                _save_store(store, target)
             raise CredentialIssue("access_wait", "OpenAI did not complete renewal, retry next check", may_use_current=True) from error
 
-        tokens = {key: updated[key] for key in ("access_token", "refresh_token", "last_refresh")}
-        same_rejected_bearer = model_rejected and tokens["access_token"] == row["access_token"]
-        if not compatible_owners([alias.get("access_token") for alias in matching] + [tokens["access_token"]]):
-            # The rotating grant may already have been spent. Quarantine all its old aliases
-            # and discard the returned credentials without making them available to any caller.
-            for alias in matching:
-                alias.update(last_status="dead", last_status_at=time.time(), last_error_reason="codex_owner_conflict",
-                             last_error_code=None, last_error_message="Codex renewal returned another account")
-            save(store)
-            raise CredentialIssue("signin", "Codex renewal returned another owner, owner login required")
-        for alias in matching:
-            alias.update(tokens)
+        same_rejected_bearer = _apply_pair(row, matching, tokens, model_rejected)
+        _save_store(store, target)
+        if receipt is not None:
+            _finish_receipt(_receipt_path(target), receipt)
         if same_rejected_bearer:
-            mark_model(row, "signin", 0)
-        elif model_rejected:
-            mark_model(row, "renewed", 300)
-        save(store)
-        if same_rejected_bearer:
+            _incident(row, "model_rejected", target=target)
             raise CredentialIssue("signin", "renewal returned the rejected bearer")
         row, expiry = preferred(store)
         return row, expiry, True
@@ -419,18 +615,17 @@ def renew_native(observed, *, timeout_seconds=20.0, quota_probe=False):
     Entry points decide when a refresh is needed. This function always checks
     admission, even for forced requests, and adopts a peer's rotation if present.
     """
-    from hermes_cli.auth import _load_auth_store
     from hermes_cli.auth_codex import _codex_pool_owner_lock
 
     with _codex_pool_owner_lock() as target:
-        store = _load_auth_store(target) if target is not None else _load_auth_store()
+        store = _current_store(target)
         if not is_managed(store, observed):
             return None
         rows = store["credential_pool"][PROVIDER]
         identifier = observed.get("id")
         grant = observed.get("refresh_token")
         by_id = [row for row in rows if isinstance(row, dict) and identifier and row.get("id") == identifier]
-        primary, expiry = preferred(store)
+        primary, expiry = _active(store, target=target)
         aliases = grant_aliases(rows, primary)
         if identifier and (len(by_id) != 1 or not any(by_id[0] is alias for alias in aliases)):
             raise CredentialIssue("access_wait", "ambiguous native Codex credential")
@@ -445,11 +640,11 @@ def renew_native(observed, *, timeout_seconds=20.0, quota_probe=False):
         grant_aliases([*aliases, snapshot], primary)
         purpose = "native_probe" if quota_probe else "native"
         if grant != primary["refresh_token"] or observed.get("access_token") != current["access_token"]:
-            admit(store, primary, expiry, markers=MARKERS, purpose=purpose)
+            admit(store, primary, expiry, markers=MARKERS, purpose=purpose, target=target)
             return current, expiry, False
         updated, expiry, changed = renew(primary, markers=MARKERS, purpose=purpose,
                                          timeout_seconds=timeout_seconds, target=target)
         if identifier and identifier != primary["id"]:
-            store = _load_auth_store(target) if target is not None else _load_auth_store()
+            store = _load_store(target)
             updated = next(row for row in store["credential_pool"][PROVIDER] if isinstance(row, dict) and row.get("id") == identifier)
         return updated, expiry, changed

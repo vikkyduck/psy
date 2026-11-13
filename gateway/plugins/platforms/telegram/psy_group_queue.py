@@ -303,6 +303,16 @@ def schedule(app):
 
 
 async def start(app):
+    from .psy_owner_recovery import start as start_owner_recovery
+    schedule(app)
+    start_owner_recovery(app)
+
+
+async def resume_authorized(app, incident_id):
+    """Called by the owner service after this configured group model accepted the new login."""
+    await ensure_vault(app.bot)
+    await committed_call(store.release_auth_waits, incident_id)
+    # A repeated call after a crash must also wake an existing sleeping drain.
     schedule(app)
 
 

@@ -55,7 +55,7 @@ class TestCodexMaintenance(unittest.TestCase):
             self.assertTrue(self.locked)
             self.store = copy.deepcopy(store)
 
-        def rotate(access, refresh, *, timeout_seconds=20.0):
+        def rotate(access, refresh, *, timeout_seconds=20.0, on_received=None):
             self.assertTrue(self.locked)
             self.assertEqual((access, refresh), ("initial", "first-grant"))
             return self.rotated.copy()
@@ -81,11 +81,13 @@ class TestCodexMaintenance(unittest.TestCase):
         modules["hermes_cli.auth_constants"]._decode_jwt_claims = lambda token: {"exp": self.expiry[token]}
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
+        modules["hermes_cli.auth"]._auth_file_path = lambda: Path(directory.name) / "auth.json"
         self.available = guard.classify_account(200, {"rate_limit": {"allowed": True}})
         self.rejected = guard.classify_account(401)
         self.probe = Mock(return_value=self.available)
         for replacement in (
             patch.dict(sys.modules, modules),
+            patch.object(policy, "_incident"),
             patch.object(guard, "time", SimpleNamespace(time=lambda: self.now)),
             patch.object(policy, "MARKERS", Path(directory.name)),
             patch.object(policy, "time", SimpleNamespace(time=lambda: self.now)),

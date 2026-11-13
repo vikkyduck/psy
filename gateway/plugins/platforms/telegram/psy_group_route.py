@@ -361,6 +361,9 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
 
 
 async def intercept(app, update):
+    from .psy_owner_recovery import handle as owner_recovery
+    if await owner_recovery(app, update):
+        return True
     route = scope(update)
     if route == "owner":
         return False

@@ -96,10 +96,33 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(accepted, [])
             self.assertEqual(store.state(self.ident),"queued")
             refused.assert_called_once_with("fixture-generation")
-            store.recover()
-            self.now += 1 + store.next_retry_delay()
+            self.assertEqual(store.next_retry_delay(), 300)
+            # Start a fresh gateway worker with the same private SQLite and no new updates.
+            # Its ordinary retry lies five minutes in the future on the frozen clock.
+            store.bind_instance(route.BOT, route.GROUP, adopt_legacy=True)
+            self.app.adapter = NS()
+            self.app.create_task = asyncio.create_task
             authenticated = True
-            await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
+            sleep_started = asyncio.Event()
+            next_delay = store.next_retry_delay
+            loop = asyncio.get_running_loop()
+            def observe_wait(**kwargs):
+                delay = next_delay(**kwargs)
+                if delay == 300:
+                    loop.call_soon_threadsafe(sleep_started.set)
+                return delay
+            with tempfile.TemporaryDirectory() as lease_dir, patch.object(
+                    store, "lease", lambda lock=store.lease: lock(root=Path(lease_dir))), patch.object(
+                    store, "next_retry_delay", side_effect=observe_wait):
+                queue.schedule(self.app)
+                worker = self.app.adapter._psy_group_task
+                try:
+                    await asyncio.wait_for(sleep_started.wait(), 3)
+                    await queue.resume_authorized(self.app, "verified-owner-login")
+                    await asyncio.wait_for(worker, 3)
+                finally:
+                    worker.cancel()
+                    await asyncio.gather(worker, return_exceptions=True)
         self.assertEqual(counts, Counter({1:1,2:1,3:1,4:1}))
         self.assertEqual(len(accepted),1)
         self.assertTrue(all(f"chapter {i} completed." in accepted[0] for i in range(1,5)))

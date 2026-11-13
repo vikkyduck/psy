@@ -8,12 +8,12 @@ DEPLOY = Path("/usr/local/lib/psy-group")
 PLATFORM = Path("/home/hermes/.hermes/hermes-agent/plugins/platforms/telegram")
 NATIVE = {
     "agent/auxiliary_client.py", "agent/credential_pool.py",
-    "hermes_cli/auth.py", "hermes_cli/auth_codex.py", "hermes_cli/psy_codex_policy.py",
+    "hermes_cli/auth.py", "hermes_cli/auth_codex.py", "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_codex_incident.py",
 }
 EXPECTED = NATIVE | {
     "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py",
     "psy_source_evidence.py", "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py",
-    "psy_group_queue.py", "psy_local_media.py", "psy_upload_handoff.py",
+    "psy_group_queue.py", "psy_owner_recovery.py", "psy_local_media.py", "psy_upload_handoff.py",
 }
 
 def verify():

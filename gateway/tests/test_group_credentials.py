@@ -8,7 +8,7 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 import json
 
 from psy_modules import psy_group_codex as adapter
@@ -45,6 +45,8 @@ class TestPreferredCredentials(unittest.TestCase):
         constants.httpx = self.modules["httpx"]
         for name in ("PoolTimeout", "ConnectTimeout", "ConnectError", "ReadTimeout", "WriteError"):
             setattr(constants.httpx, name, type(name, (constants.httpx.RequestError,), {}))
+        stack.enter_context(patch.object(adapter.codex_policy, "_incident"))
+        self.auth._auth_file_path = lambda: self.markers / "test-auth.json"
         self.auth._load_auth_store = lambda: deepcopy(self.store)
         self.auth._save_auth_store = Mock(side_effect=self._save)
         self.auth._auth_store_lock = self._lock
@@ -66,7 +68,7 @@ class TestPreferredCredentials(unittest.TestCase):
         finally:
             self.locked = False
 
-    def _refresh(self, access, grant, *, timeout_seconds=20.0):
+    def _refresh(self, access, grant, *, timeout_seconds=20.0, on_received=None):
         self.assertTrue(self.locked)
         self.assertEqual((access, grant), (self.primary["access_token"], self.primary["refresh_token"]))
         return dict(access_token="renewed", refresh_token="rotated", last_refresh="now")
@@ -157,7 +159,7 @@ class TestPreferredCredentials(unittest.TestCase):
             return error
         self.enterContext(patch.object(policy, "block_error", block))
         self.codex.refresh_codex_oauth_pure = lambda access, grant, **options: policy.guarded_exchange(
-            grant, lambda: self.network(access, grant))
+            grant, lambda: self.network(access, grant), on_received=options.get("on_received"))
 
     def test_three_questions_preconnect_failure_share_backoff_and_restart_recovers(self):
         self.install_grant_guard()
@@ -365,7 +367,7 @@ class TestPreferredCredentials(unittest.TestCase):
         reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
         self.assertEqual(self.group_question(reply).text, "42")
         self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "renewed"])
-        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0)
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0, on_received=ANY)
 
     def test_rejected_refresh_on_model_401_blocks_later_questions_until_owner_login(self):
         self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("refresh_token_expired", 401)
@@ -375,7 +377,7 @@ class TestPreferredCredentials(unittest.TestCase):
                 self.group_question(reply)
             self.assertEqual((caught.exception.kind, caught.exception.stage), ("signin", "credentials"))
         reply.assert_called_once_with("live")
-        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0)
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0, on_received=ANY)
         self.assertEqual(self.store["credential_pool"]["openai-codex"][0], self.other)
 
     def test_second_model_401_does_not_keep_rotating_a_fresh_grant(self):

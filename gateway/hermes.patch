@@ -321,7 +321,7 @@ index e296bbb6..a5879acb 100644
      "xai-oauth": OAuthProviderFlow(
          "xai-oauth", "resolve_xai_oauth_runtime_credentials", "get_xai_oauth_auth_status",
 diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
-index 257b4314..03370da6 100644
+index 257b4314..2ace588a 100644
 --- a/hermes_cli/auth_codex.py
 +++ b/hermes_cli/auth_codex.py
 @@ -16,7 +16,7 @@ import json
@@ -372,11 +372,12 @@ index 257b4314..03370da6 100644
  
  
  def refresh_codex_oauth_pure(
-     access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
+-    access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
 -    """Refresh Codex OAuth tokens without mutating Hermes auth state."""
 -    from hermes_cli.auth import _nonempty_str, _utc_now_z
 -    del access_token  # Access token is only used by callers to decide whether to refresh.
 -    if not _nonempty_str(refresh_token):
++    access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0, on_received=None) -> dict[str, Any]:
 +    """Serialize the single-use grant, including failures after dispatch."""
 +    from hermes_cli.psy_codex_policy import guarded_exchange
 +
@@ -397,7 +398,7 @@ index 257b4314..03370da6 100644
 -        raise _codex_quota_exhausted_error(
 -            _parse_retry_after_seconds(getattr(response, "headers", None)))
 +    grant = refresh_token.strip()
-+    return guarded_exchange(grant, lambda: _exchange_codex_token(grant, timeout_seconds))
++    return guarded_exchange(grant, lambda: _exchange_codex_token(grant, timeout_seconds), on_received=on_received)
 +
 +
 +def _exchange_codex_token(refresh_token: str, timeout_seconds: float) -> dict[str, Any]:
