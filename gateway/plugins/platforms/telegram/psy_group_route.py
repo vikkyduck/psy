@@ -8,7 +8,7 @@ import time
 
 from . import psy_group_store as store
 from . import psy_group_audio as audio
-from .psy_group_codex import ModelIssue, respond
+from .psy_group_codex import ModelIssue, choose_source, research_requested, respond
 
 from .psy_instance import BOT, BOT_USERNAME, GROUP, OWNER
 
@@ -19,7 +19,7 @@ HELLO = ("В этой группе я отвечаю на сообщения, и
          "/files показывает Ваши сохраненные в этой группе материалы. /get НОМЕР возвращает выбранный файл. "
          "/read НОМЕР ВОПРОС открывает его для разбора. /research ВОПРОС запускает поиск по источникам. "
          "/image ОПИСАНИЕ создает изображение через Codex.")
-MAX_TEXT = 1024**2
+MAX_TEXT = 8 * 1024**2
 MAX_IMAGE = 5 * 1024**2
 log = logging.getLogger("psy.group")
 
@@ -79,12 +79,16 @@ async def attachment(msg):
     else:
         return None
     if not (type(item.file_size) is int and 0 < item.file_size <= limit):
+        if kind == "text":
+            raise ValueError(TEXT_SIZE_ERROR)
         raise ValueError("Размер файла больше допустимого для разбора.")
     file = await item.get_file()
     if not isinstance(file.file_path, str) or not file.file_path.startswith("https://api.telegram.org/file/bot"):
         raise ValueError("Telegram не предоставил разрешенную ссылку на файл.")
     data = bytes(await file.download_as_bytearray())
     if not data or len(data) > limit:
+        if kind == "text":
+            raise ValueError(TEXT_SIZE_ERROR)
         raise ValueError("Размер полученного файла за пределами лимита.")
     if kind == "text":
         try:
@@ -95,16 +99,14 @@ async def attachment(msg):
 
 
 def content(question, source, quote):
-    text = question
+    text = question or "Разбери приложенный материал."
     if quote:
-        text += "\n\nЦитата из этого чата:\n" + quote[:4000]
-    result = [{"type": "input_text", "text": text or "Разбери приложенный материал."}]
+        text += "\n\nЦитата из этого чата:\n" + quote
+    result = [{"type": "input_text", "text": text}]
     if source:
         name, kind, data = source
         if kind == "text":
             body = data.decode("utf-8-sig")
-            if len(body) > 220000:
-                raise ValueError("Текст превышает 220 000 знаков для разбора за один запрос. Пришлите нужную часть.")
             result.append({"type":"input_text","text":"Материал: " + name + "\n" + body})
         else:
             result.append({"type":"input_image", "image_url": "data:image/" + kind + ";base64," + base64.b64encode(data).decode("ascii")})
@@ -112,7 +114,60 @@ def content(question, source, quote):
 
 
 async def deliver(msg, name, data):
-    await msg.reply_document(document=io.BytesIO(data), filename=name)
+    return await msg.reply_document(document=io.BytesIO(data), filename=name)
+
+
+def message_topic(msg):
+    return int(msg.message_thread_id or 0) if getattr(msg, "is_topic_message", False) else 0
+
+
+def mentions_material(question):
+    # The semantic selector handles free-form follow-ups whenever a source is active.
+    # After a topic switch, only invite the library back when the user refers to a material.
+    return bool(re.search(r"\b(?:расшифровк|стенограмм|транскрипт|приложенн|загруженн|файл|документ|лекци|запис[ьи]|transcript)\w*",
+                          question, re.I))
+
+
+def choice_help(options):
+    rows = "\n".join(f'{o["id"]}. {o["name"]}' for o in options)
+    return ("Уточните, какой материал разобрать. Ответьте на сообщение с исходным файлом "
+            "или отправьте /read НОМЕР и Ваш вопрос." + ("\n" + rows if rows else " Номера доступны в /files."))
+
+
+async def archive_source(uid, topic, msg, source):
+    return await asyncio.to_thread(store.archive, uid, topic, *source, message_id=getattr(msg, "message_id", None))
+
+
+async def quoted_material(uid, topic, quoted):
+    """A referenced answer may expose only a source explicitly bound for this member."""
+    mid = getattr(quoted, "message_id", None)
+    saved = await asyncio.to_thread(store.message_source, uid, topic, mid)
+    sender = getattr(quoted, "from_user", None)
+    bot_reply = getattr(sender, "id", None) == BOT
+    quote = quoted.text or quoted.caption or ""
+    if saved:
+        doc_id, answer, turn_id = saved
+        doc = await asyncio.to_thread(store.document, uid, topic, doc_id) if doc_id is not None else None
+        # A long Telegram answer is a document with no text in its envelope.
+        if bot_reply and answer:
+            quote = answer
+        return doc_id, doc, quote, turn_id if bot_reply else None
+    if bot_reply:
+        # Mini App delivery is an original group-visible transcript. Unknown bot answers,
+        # exported cabinet documents and other members' reply IDs never rebuild a binding.
+        name = getattr(getattr(quoted, "document", None), "file_name", None)
+        recorded = re.fullmatch(r'Расшифровка записи "(.+)" готова\..*', quote, re.S)
+        if name != "Расшифровка.txt" or not recorded:
+            raise ValueError(UNLINKED_REPLY)
+        source = await attachment(quoted)
+        if source:
+            source = ("Расшифровка " + label(recorded[1])[:100] + ".txt", source[1], source[2])
+    else:
+        source = await attachment(quoted)
+    if source:
+        doc_id = await archive_source(uid, topic, quoted, source)
+        return doc_id, source, quote, None
+    return None, None, quote, None
 
 
 async def group_message(msg):
@@ -120,7 +175,7 @@ async def group_message(msg):
     if not user or user.is_bot or msg.sender_chat or msg.business_connection_id:
         return
     uid = user.id
-    topic = int(msg.message_thread_id or 0) if msg.is_topic_message else 0
+    topic = message_topic(msg)
     text = (msg.text or msg.caption or "").strip()
     command = ""
     param = text
@@ -150,31 +205,36 @@ async def group_message(msg):
         rows = await asyncio.to_thread(store.listing, uid, topic)
         await msg.reply_text("\n".join(f"{ident}. {name}" for ident,name in rows)[:4000] or "У Вас пока нет сохраненных материалов в этой теме.")
         return
-    read_doc = None
+    doc_id = None
+    source = None
     if command in ("/get", "/read"):
         numeral, _, param = param.partition(" ")
         if not re.fullmatch("[1-9][0-9]{0,9}", numeral):
             await msg.reply_text("Укажите номер из /files.")
             return
-        read_doc = await asyncio.to_thread(store.document, uid, topic, int(numeral))
-        if not read_doc:
+        doc_id = int(numeral)
+        source = await asyncio.to_thread(store.document, uid, topic, doc_id)
+        if not source:
             await msg.reply_text("Материал с этим номером в Вашем кабинете не найден.")
             return
         if command == "/get":
-            await deliver(msg, read_doc[0], read_doc[2])
+            sent = await deliver(msg, source[0], source[2])
+            await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id)
             return
     elif command and command not in ("/research", "/image", "/ask"):
         await msg.reply_text("Доступные в группе команды перечислены в /help.")
         return
     quoted = getattr(msg, "reply_to_message", None)
-    if quoted and (quoted.chat.id != GROUP or (quoted.is_topic_message and (quoted.message_thread_id or 0) != topic)):
+    if quoted and (quoted.chat.id != GROUP or message_topic(quoted) != topic):
+        if source is None and not msg.document and not getattr(msg, "photo", ()):
+            raise ValueError(UNLINKED_REPLY)
         quoted = None
-    source = read_doc or await attachment(msg)
-    # A current group attachment can be retained in the sender's own library.
-    if source and not read_doc:
-        await asyncio.to_thread(store.archive, uid, topic, *source)
-    elif not source and quoted:
-        source = await attachment(quoted)
+    quote = ""
+    quoted_turn = None
+    if not source:
+        source = await attachment(msg)
+        if source:
+            doc_id = await archive_source(uid, topic, msg, source)
     if msg.document and not source:
         ext = (msg.document.file_name or "").lower().rsplit(".",1)[-1]
         if ext in ("m4a","mp3","wav","mp4","flac","ogg","mov","mkv","opus","aac","webm"):
@@ -182,32 +242,55 @@ async def group_message(msg):
         else:
             await msg.reply_text("Для разбора пришлите текст в TXT, Markdown, CSV или фотографию в JPEG, PNG, WebP.")
         return
+    if quoted and not source:
+        doc_id, source, quote, quoted_turn = await quoted_material(uid, topic, quoted)
+    elif quoted and getattr(getattr(quoted, "from_user", None), "id", None) == uid:
+        quote = quoted.text or quoted.caption or ""
     if not text and not source:
         return
     question = param if command else text
-    query = content(question, source, (quoted.text or quoted.caption or "") if quoted else "")
-    sessions = await asyncio.to_thread(store.history, uid, topic)
-    sessions.append({"role":"user","content":query})
     from hermes_cli.config import load_config
     model = load_config()["model"]
     if model["provider"] != "openai-codex":
         raise RuntimeError("wrong provider")
-    research = command == "/research" or bool(re.search(r"\b(найди|поищи|исследу\w*|исследова\w*|research|сверь|проверь.{0,20}источник\w*)\b", question, re.I))
+    if not source and not quoted:
+        active_id, options = await asyncio.to_thread(store.choices, uid, topic, mentions_material(question))
+        if options:
+            selected = await asyncio.to_thread(choose_source, question, options, active_id, model=model["default"])
+            if selected == "clarify" or (selected is not None and
+                    (type(selected) is not int or selected not in {item["id"] for item in options})):
+                await msg.reply_text(choice_help(options))
+                return
+            if selected is not None:
+                doc_id = selected
+                source = await asyncio.to_thread(store.document, uid, topic, doc_id)
+                if source is None:
+                    await msg.reply_text(choice_help(options))
+                    return
+    mid = getattr(msg, "message_id", None)
+    await asyncio.to_thread(store.set_current, uid, topic, doc_id, mid)
+    query = content(question, source, quote)
+    sessions = await asyncio.to_thread(store.history, uid, topic, source_id=doc_id, exclude_turn=quoted_turn)
+    sessions.append({"role":"user","content":query})
+    research = command == "/research" or research_requested(question)
     draw = command == "/image" or bool(re.search(r"(?:нарисуй|сгенерируй\s+(?:изображение|картин\w*)|создай\s+(?:изображение|картин\w*))", question, re.I))
-    result = await asyncio.to_thread(respond, sessions, research=research and not draw, draw=draw, model=model["default"])
-    await asyncio.to_thread(store.remember, uid, topic, question, result.text)
+    result = await asyncio.to_thread(respond, sessions, research=research and not draw, draw=draw, model=model["default"],
+                                     question=question)
+    turn_id = await asyncio.to_thread(store.remember, uid, topic, question, result.text, source_id=doc_id, message_id=mid)
     if result.text:
         if len(result.text) <= 4000:
-            await msg.reply_text(result.text, disable_web_page_preview=True)
+            sent = await msg.reply_text(result.text, disable_web_page_preview=True)
         else:
             name = "Ответ PSY.txt"
             data = result.text.encode()
             await asyncio.to_thread(store.archive, uid, topic, name, "text", data)
-            await deliver(msg, name, data)
+            sent = await deliver(msg, name, data)
+        await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
     for img in result.images:
         name = "Изображение PSY.png"
         await asyncio.to_thread(store.archive, uid, topic, name, "png", img)
-        await deliver(msg, name, img)
+        sent = await deliver(msg, name, img)
+        await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
 
 
 async def intercept(app, update):
@@ -250,10 +333,15 @@ async def process_group(msg):
         await msg.reply_text(safe or "Не удалось завершить запрос. Попробуйте еще раз.")
 
 
+UNLINKED_REPLY = ("В этой теме у Вас нет привязки этого сообщения к исходному материалу. "
+                  "Ответьте на исходный файл или выберите свой материал командой /read НОМЕР из /files.")
+TEXT_SIZE_ERROR = ("Для разбора нужен непустой UTF-8 файл до 8 МиБ. "
+                   "Если расшифровка больше, разделите ее на части и укажите нужную для вопроса.")
+
 SAFE_ERRORS = {
+    UNLINKED_REPLY, TEXT_SIZE_ERROR,
     "В хранилище недостаточно места для нового файла.",
     "Фотография превышает 5 МБ.", "Размер файла больше допустимого для разбора.",
     "Telegram не предоставил разрешенную ссылку на файл.", "Размер полученного файла за пределами лимита.",
     "Для текстового файла нужна кодировка UTF-8.",
-    "Текст превышает 220 000 знаков для разбора за один запрос. Пришлите нужную часть.",
 }

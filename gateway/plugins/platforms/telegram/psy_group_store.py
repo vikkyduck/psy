@@ -28,6 +28,16 @@ def database(root=ROOT):
               id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, topic INTEGER NOT NULL,
               prompt TEXT NOT NULL, answer TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS member_turns ON turns(uid,topic,id);
+            CREATE TABLE IF NOT EXISTS turn_sources (
+              turn_id INTEGER PRIMARY KEY, doc_id INTEGER);
+            CREATE INDEX IF NOT EXISTS source_turns ON turn_sources(doc_id,turn_id);
+            CREATE TABLE IF NOT EXISTS message_sources (
+              uid INTEGER NOT NULL, topic INTEGER NOT NULL, message_id INTEGER NOT NULL,
+              doc_id INTEGER, turn_id INTEGER, PRIMARY KEY(uid,topic,message_id));
+            CREATE INDEX IF NOT EXISTS source_messages ON message_sources(uid,topic,doc_id);
+            CREATE TABLE IF NOT EXISTS current_sources (
+              uid INTEGER NOT NULL, topic INTEGER NOT NULL, doc_id INTEGER,
+              PRIMARY KEY(uid,topic));
         """)
         yield con
         con.commit()
@@ -35,16 +45,48 @@ def database(root=ROOT):
         con.close()
 
 
-def archive(uid, topic, name, kind, data, *, root=ROOT):
+def _bind(con, uid, topic, message_id, doc_id, turn_id):
+    if type(message_id) is int and message_id > 0:
+        con.execute("""INSERT INTO message_sources(uid,topic,message_id,doc_id,turn_id) VALUES (?,?,?,?,?)
+                       ON CONFLICT(uid,topic,message_id) DO UPDATE SET
+                         doc_id=excluded.doc_id,turn_id=coalesce(excluded.turn_id,message_sources.turn_id)""",
+                    (uid, topic, message_id, doc_id, turn_id))
+
+
+def bind_message(uid, topic, message_id, doc_id, turn_id=None, *, root=ROOT):
+    with database(root) as con:
+        _bind(con, uid, topic, message_id, doc_id, turn_id)
+
+
+def message_source(uid, topic, message_id, *, root=ROOT):
+    if type(message_id) is not int:
+        return None
+    with database(root) as con:
+        return con.execute("""SELECT s.doc_id,t.answer,t.id FROM message_sources s
+                              LEFT JOIN turns t ON t.id=s.turn_id AND t.uid=s.uid AND t.topic=s.topic
+                              WHERE s.uid=? AND s.topic=? AND s.message_id=?""",
+                           (uid, topic, message_id)).fetchone()
+
+
+def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
+        if type(message_id) is int:
+            existing = con.execute("""SELECT d.id FROM message_sources s JOIN documents d
+                                      ON d.id=s.doc_id AND d.uid=s.uid AND d.topic=s.topic
+                                      WHERE s.uid=? AND s.topic=? AND s.message_id=?""",
+                                   (uid, topic, message_id)).fetchone()
+            if existing:
+                return existing[0]
         member, total = con.execute("""SELECT coalesce(sum(CASE WHEN uid=? THEN length(data)
                       ELSE 0 END),0), coalesce(sum(length(data)),0) FROM documents""", (uid,)).fetchone()
         if member + len(data) > MEMBER_LIMIT or total + len(data) > TOTAL_LIMIT:
             raise ValueError("В хранилище недостаточно места для нового файла.")
         cursor = con.execute("INSERT INTO documents(uid,topic,name,kind,data) VALUES (?,?,?,?,?)",
                              (uid, topic, name[:140], kind, data))
-        return cursor.lastrowid
+        doc_id = cursor.lastrowid
+        _bind(con, uid, topic, message_id, doc_id, None)
+        return doc_id
 
 
 def listing(uid, topic, *, root=ROOT):
@@ -59,21 +101,65 @@ def document(uid, topic, ident, *, root=ROOT):
                            (uid, topic, ident)).fetchone()
 
 
-def history(uid, topic, *, root=ROOT):
+def set_current(uid, topic, doc_id, message_id, *, root=ROOT):
     with database(root) as con:
-        rows = con.execute("SELECT prompt,answer FROM turns WHERE uid=? AND topic=? ORDER BY id DESC LIMIT 6",
-                           (uid, topic)).fetchall()
+        con.execute("""INSERT INTO current_sources(uid,topic,doc_id) VALUES (?,?,?)
+                       ON CONFLICT(uid,topic) DO UPDATE SET doc_id=excluded.doc_id""", (uid, topic, doc_id))
+        _bind(con, uid, topic, message_id, doc_id, None)
+
+
+def choices(uid, topic, include_library=False, *, root=ROOT):
+    """Return only the member's source labels and discussion cues, never document bodies."""
+    with database(root) as con:
+        current = con.execute("SELECT doc_id FROM current_sources WHERE uid=? AND topic=?", (uid, topic)).fetchone()
+        active_id = current[0] if current else None
+        if active_id is None and not include_library:
+            return None, []
+        docs = con.execute("""SELECT d.id,d.name FROM documents d
+                              WHERE d.uid=? AND d.topic=? AND (
+                                d.id=? OR EXISTS(SELECT 1 FROM message_sources s WHERE
+                                  s.uid=d.uid AND s.topic=d.topic AND s.doc_id=d.id)
+                                OR (? AND d.kind='text' AND d.name!='Ответ PSY.txt'))
+                              ORDER BY (d.id IS ?) DESC,d.id DESC LIMIT 16""",
+                           (uid, topic, active_id, include_library, active_id)).fetchall()
+        options = []
+        for doc_id, name in docs:
+            related = """FROM turns t JOIN turn_sources s ON s.turn_id=t.id
+                         WHERE t.uid=? AND t.topic=? AND s.doc_id=?"""
+            args = (uid, topic, doc_id)
+            first = con.execute("SELECT substr(t.prompt,1,320) " + related + " ORDER BY t.id LIMIT 1", args).fetchone()
+            last = con.execute("SELECT substr(t.prompt,1,320), substr(t.answer,1,600) " + related
+                               + " ORDER BY t.id DESC LIMIT 1", args).fetchone()
+            options.append(dict(id=doc_id, name=name, first_question=first[0] if first else "",
+                                last_question=last[0] if last else "", last_answer=last[1] if last else ""))
+        return active_id, options
+
+
+def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT):
+    with database(root) as con:
+        if source_id is Ellipsis:
+            rows = con.execute("SELECT prompt,answer FROM turns WHERE uid=? AND topic=? ORDER BY id DESC LIMIT 6",
+                               (uid, topic)).fetchall()
+        else:
+            rows = con.execute("""SELECT prompt,answer FROM turns JOIN turn_sources ON turn_id=id
+                                  WHERE uid=? AND topic=? AND doc_id IS ? AND id IS NOT ?
+                                  ORDER BY id DESC LIMIT 6""", (uid, topic, source_id, exclude_turn)).fetchall()
     turns = []
-    for prompt, answer in reversed(rows):
+    for i, (prompt, answer) in enumerate(reversed(rows)):
         turns.append({"role": "user", "content": prompt[:3000]})
-        turns.append({"role": "assistant", "content": answer[:4000]})
+        latest_source_answer = source_id not in (None, Ellipsis) and exclude_turn is None and i == len(rows)-1
+        turns.append({"role": "assistant", "content": answer if latest_source_answer else answer[:4000]})
     return turns
 
 
-def remember(uid, topic, question, answer, *, root=ROOT):
+def remember(uid, topic, question, answer, *, source_id=None, message_id=None, root=ROOT):
     with database(root) as con:
-        con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
-                    (uid, topic, question[:5000], answer[:65000]))
+        row = con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
+                          (uid, topic, question[:5000], answer))
+        turn_id = row.lastrowid
+        con.execute("INSERT INTO turn_sources(turn_id,doc_id) VALUES (?,?)", (turn_id, source_id))
+        _bind(con, uid, topic, message_id, source_id, turn_id)
+        return turn_id
 
 
 def pending(uid, ident, payload, *, root=ROOT):
