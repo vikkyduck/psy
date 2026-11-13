@@ -1,7 +1,10 @@
 """A member's group materials and conversations. No filename from a message is opened."""
 import contextlib
+import json
+import math
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 ROOT = Path("/home/hermes/.hermes/vault/group-psy")
@@ -17,9 +20,24 @@ def database(root=ROOT):
     os.close(fd)
     con = sqlite3.connect(database_path, timeout=5)
     try:
+        con.execute("PRAGMA foreign_keys = ON")
         con.executescript("""
             CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL,
               body TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS checkpoints (
+              request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+              key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(request_id,key));
+            CREATE TABLE IF NOT EXISTS write_receipts (
+              request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+              operation TEXT NOT NULL, kind TEXT NOT NULL, topic INTEGER NOT NULL, result_id INTEGER NOT NULL,
+              PRIMARY KEY(request_id, operation));
+            CREATE TABLE IF NOT EXISTS delivery_parts (
+              request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+              part INTEGER NOT NULL, fingerprint TEXT NOT NULL, state TEXT NOT NULL,
+              message_id INTEGER, retry_at REAL, PRIMARY KEY(request_id,part));
+            CREATE TABLE IF NOT EXISTS completed_updates (
+              id INTEGER PRIMARY KEY, completed_at REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS completed_age ON completed_updates(completed_at);
             CREATE TABLE IF NOT EXISTS documents (
               id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, topic INTEGER NOT NULL,
               name TEXT NOT NULL, kind TEXT NOT NULL, data BLOB NOT NULL);
@@ -68,15 +86,40 @@ def message_source(uid, topic, message_id, *, root=ROOT):
                            (uid, topic, message_id)).fetchone()
 
 
-def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT):
+def _previous_write(con, request_key, uid, topic, kind):
+    ident, operation = request_key
+    owner = con.execute("SELECT uid FROM requests WHERE id=?", (ident,)).fetchone()
+    if owner != (uid,):
+        raise ValueError("Group job owner mismatch")
+    receipt = con.execute("""SELECT kind,topic,result_id FROM write_receipts
+                             WHERE request_id=? AND operation=?""", (ident, operation)).fetchone()
+    if receipt is None:
+        return None
+    if receipt[:2] != (kind, topic):
+        raise ValueError("Group job operation mismatch")
+    return receipt[2]
+
+
+def _record_write(con, request_key, topic, kind, result_id):
+    if request_key is not None:
+        con.execute("INSERT INTO write_receipts VALUES(?,?,?,?,?)",
+                    (*request_key, kind, topic, result_id))
+
+
+def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT, request_key=None):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
+        if request_key is not None:
+            saved = _previous_write(con, request_key, uid, topic, "document")
+            if saved is not None:
+                return saved
         if type(message_id) is int:
             existing = con.execute("""SELECT d.id FROM message_sources s JOIN documents d
                                       ON d.id=s.doc_id AND d.uid=s.uid AND d.topic=s.topic
                                       WHERE s.uid=? AND s.topic=? AND s.message_id=?""",
                                    (uid, topic, message_id)).fetchone()
             if existing:
+                _record_write(con, request_key, topic, "document", existing[0])
                 return existing[0]
         member, total = con.execute("""SELECT coalesce(sum(CASE WHEN uid=? THEN length(data)
                       ELSE 0 END),0), coalesce(sum(length(data)),0) FROM documents""", (uid,)).fetchone()
@@ -86,6 +129,7 @@ def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT):
                              (uid, topic, name[:140], kind, data))
         doc_id = cursor.lastrowid
         _bind(con, uid, topic, message_id, doc_id, None)
+        _record_write(con, request_key, topic, "document", doc_id)
         return doc_id
 
 
@@ -152,19 +196,51 @@ def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT):
     return turns
 
 
-def remember(uid, topic, question, answer, *, source_id=None, message_id=None, root=ROOT):
+def remember(uid, topic, question, answer, *, source_id=None, message_id=None, root=ROOT, request_key=None):
     with database(root) as con:
+        if request_key is not None:
+            con.execute("BEGIN IMMEDIATE")
+            saved = _previous_write(con, request_key, uid, topic, "turn")
+            if saved is not None:
+                return saved
         row = con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
                           (uid, topic, question[:5000], answer))
         turn_id = row.lastrowid
         con.execute("INSERT INTO turn_sources(turn_id,doc_id) VALUES (?,?)", (turn_id, source_id))
         _bind(con, uid, topic, message_id, source_id, turn_id)
+        _record_write(con, request_key, topic, "turn", turn_id)
         return turn_id
+
+
+class Checkpoints:
+    """Private JSON stages for one queued update. Each thread opens its own connection."""
+
+    def __init__(self, ident, *, root=ROOT):
+        self.ident = ident
+        self.root = root
+
+    def get(self, key):
+        with database(self.root) as con:
+            row = con.execute("SELECT value FROM checkpoints WHERE request_id=? AND key=?",
+                              (self.ident, key)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def put(self, key, value):
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        with database(self.root) as con:
+            con.execute("""INSERT INTO checkpoints(request_id,key,value) VALUES(?,?,?)
+                           ON CONFLICT(request_id,key) DO UPDATE SET value=excluded.value""",
+                        (self.ident, key, encoded))
 
 
 def pending(uid, ident, payload, *, root=ROOT):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
+        # Telegram can redeliver an update after our worker has already acknowledged it.
+        # Keep only its ID beyond the transport replay window; no request body or user ID.
+        con.execute("DELETE FROM completed_updates WHERE completed_at<?", (time.time() - 7*86400,))
+        if con.execute("SELECT 1 FROM completed_updates WHERE id=?", (ident,)).fetchone():
+            return "existing"
         if con.execute("SELECT 1 FROM requests WHERE id=?", (ident,)).fetchone():
             return "existing"
         count, own = con.execute("""SELECT count(*),coalesce(sum(uid=?),0)
@@ -175,13 +251,79 @@ def pending(uid, ident, payload, *, root=ROOT):
         return "queued"
 
 
-def claim_next(*, root=ROOT):
+def claim_next(*, root=ROOT, now=None):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
-        record = con.execute("SELECT id,body FROM requests WHERE state='queued' ORDER BY rowid LIMIT 1").fetchone()
+        record = con.execute("""SELECT id,body FROM requests r WHERE state='queued'
+                                AND NOT EXISTS(SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
+                                               AND p.state='retry' AND p.retry_at>?)
+                                ORDER BY r.rowid LIMIT 1""",
+                             (time.time() if now is None else now,)).fetchone()
         if record:
             con.execute("UPDATE requests SET state='running' WHERE id=?", (record[0],))
         return record
+
+
+def next_retry_delay(*, root=ROOT, now=None):
+    with database(root) as con:
+        due = con.execute("""SELECT min(p.retry_at) FROM delivery_parts p JOIN requests r ON r.id=p.request_id
+                             WHERE r.state='queued' AND p.state='retry'""").fetchone()[0]
+    return None if due is None else max(0, due - (time.time() if now is None else now))
+
+
+def begin_delivery(ident, part, fingerprint, *, root=ROOT, now=None):
+    """Decide whether this exact part may cross the non-idempotent Telegram send boundary."""
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        request = con.execute("SELECT state FROM requests WHERE id=?", (ident,)).fetchone()
+        if request != ("running",):
+            return "uncertain", None
+        row = con.execute("""SELECT fingerprint,state,message_id,retry_at FROM delivery_parts
+                             WHERE request_id=? AND part=?""", (ident, part)).fetchone()
+        if row:
+            saved, state, message_id, due = row
+            if saved != fingerprint:
+                return "uncertain", None
+            if state == "confirmed":
+                return "confirmed", message_id
+            if state != "retry":
+                return "uncertain", None
+            if due > (time.time() if now is None else now):
+                return "wait", due
+            con.execute("""UPDATE delivery_parts SET state='sending',retry_at=NULL
+                           WHERE request_id=? AND part=?""", (ident, part))
+        else:
+            con.execute("""INSERT INTO delivery_parts(request_id,part,fingerprint,state)
+                           VALUES(?,?,?,'sending')""", (ident, part, fingerprint))
+        con.execute("UPDATE requests SET state='sending' WHERE id=?", (ident,))
+        return "send", None
+
+
+def _finish_attempt(con, ident, part, state, message_id, due):
+    con.execute("BEGIN IMMEDIATE")
+    request = con.execute("SELECT state FROM requests WHERE id=?", (ident,)).fetchone()
+    if request != ("sending",):
+        raise ValueError("No active group delivery")
+    count = con.execute("""UPDATE delivery_parts SET state=?,message_id=?,retry_at=?
+                           WHERE request_id=? AND part=? AND state='sending'""",
+                        (state, message_id, due, ident, part)).rowcount
+    if count != 1:
+        raise ValueError("No active group delivery part")
+    con.execute("UPDATE requests SET state='running' WHERE id=?", (ident,))
+
+
+def confirm_delivery(ident, part, message_id, *, root=ROOT):
+    if type(message_id) is not int or message_id <= 0:
+        raise ValueError("Missing Telegram message ID")
+    with database(root) as con:
+        _finish_attempt(con, ident, part, "confirmed", message_id, None)
+
+
+def retry_delivery(ident, part, retry_at, *, root=ROOT):
+    if not math.isfinite(retry_at):
+        raise ValueError("Invalid Telegram retry time")
+    with database(root) as con:
+        _finish_attempt(con, ident, part, "retry", None, retry_at)
 
 
 def outbound(ident, *, root=ROOT):
@@ -193,6 +335,8 @@ def outbound(ident, *, root=ROOT):
 def settle(ident, success, *, root=ROOT):
     with database(root) as con:
         if success:
+            con.execute("""INSERT OR REPLACE INTO completed_updates(id,completed_at)
+                           SELECT id,? FROM requests WHERE id=?""", (time.time(), ident))
             con.execute("DELETE FROM requests WHERE id=?", (ident,))
         else:
             con.execute("UPDATE requests SET state='uncertain',body='' WHERE id=?", (ident,))

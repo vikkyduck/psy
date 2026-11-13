@@ -3,7 +3,7 @@ import importlib.util
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 from psy_modules import psy_group_route as route
 
@@ -24,7 +24,10 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
         offset = 0
         processing = asyncio.Event()
         finish = asyncio.Event()
-        message = SimpleNamespace(is_topic_message=False, reply_document=AsyncMock(), reply_text=AsyncMock())
+        message = SimpleNamespace(is_topic_message=False, chat=SimpleNamespace(id=-202),
+                                  from_user=SimpleNamespace(id=101), message_id=11,
+                                  reply_document=AsyncMock(return_value=SimpleNamespace(message_id=12)),
+                                  reply_text=AsyncMock())
 
         async def write_lecture(outbound):
             processing.set()
@@ -36,7 +39,10 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
             patch.object(loop, "time", lambda: real_time() + offset),
             patch.object(queue.Update, "de_json", return_value=SimpleNamespace(message=message)),
             patch.object(queue.store, "claim_next", side_effect=[(7, "{}"), None]),
-            patch.object(queue.store, "outbound") as begin_send,
+            patch.object(queue.store, "next_retry_delay", return_value=None),
+            patch.object(queue.store.Checkpoints, "get", return_value=None),
+            patch.object(queue.store, "begin_delivery", return_value=("send", None)) as begin_send,
+            patch.object(queue.store, "confirm_delivery") as confirm,
             patch.object(queue.store, "settle") as settle,
             patch.object(queue.store, "state", return_value="running"),
             patch.object(queue, "typing", AsyncMock()),
@@ -55,8 +61,9 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
             finally:
                 worker.cancel()
                 await asyncio.gather(worker, return_exceptions=True)
-        begin_send.assert_called_once_with(7)
-        message.reply_document.assert_awaited_once_with(b"completed lecture")
+        begin_send.assert_called_once_with(7, 0, ANY)
+        confirm.assert_called_once_with(7, 0, 12)
+        message.reply_document.assert_awaited_once_with(document=b"completed lecture")
         message.reply_text.assert_not_awaited()
         settle.assert_called_once_with(7, True)
 

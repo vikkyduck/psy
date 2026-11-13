@@ -176,6 +176,12 @@ async def group_message(msg):
         return
     uid = user.id
     topic = message_topic(msg)
+    destination = [msg.chat.id, uid, topic, getattr(msg, "message_id", None)]
+    checkpoints = getattr(msg, "checkpoints", None)
+    if checkpoints is not None:
+        job = await asyncio.to_thread(checkpoints.get, "route:input:v1")
+        if job is not None:
+            return await prepared_answer(msg, job, checkpoints)
     text = (msg.text or msg.caption or "").strip()
     command = ""
     param = text
@@ -269,26 +275,64 @@ async def group_message(msg):
                     return
     mid = getattr(msg, "message_id", None)
     await asyncio.to_thread(store.set_current, uid, topic, doc_id, mid)
-    query = content(question, source, quote)
-    sessions = await asyncio.to_thread(store.history, uid, topic, source_id=doc_id, exclude_turn=quoted_turn)
-    sessions.append({"role":"user","content":query})
+    history = await asyncio.to_thread(store.history, uid, topic, source_id=doc_id, exclude_turn=quoted_turn)
     research = command == "/research" or research_requested(question)
     draw = command == "/image" or bool(re.search(r"(?:нарисуй|сгенерируй\s+(?:изображение|картин\w*)|создай\s+(?:изображение|картин\w*))", question, re.I))
-    result = await asyncio.to_thread(respond, sessions, research=research and not draw, draw=draw, model=model["default"],
-                                     question=question)
-    turn_id = await asyncio.to_thread(store.remember, uid, topic, question, result.text, source_id=doc_id, message_id=mid)
-    if result.text:
-        if len(result.text) <= 4000:
-            sent = await msg.reply_text(result.text, disable_web_page_preview=True)
+    job = dict(destination=destination, question=question, doc_id=doc_id, quote=quote, history=history,
+               model=model["default"], research=research and not draw, draw=draw)
+    if checkpoints is not None:
+        await asyncio.to_thread(checkpoints.put, "route:input:v1", job)
+    await prepared_answer(msg, job, checkpoints, source=source)
+
+
+async def prepared_answer(msg, job, checkpoints, *, source=None):
+    # Bind recovery to the original member, topic and incoming message. Read source files
+    # by their private database IDs rather than copying attachments into checkpoints.
+    uid = msg.from_user.id
+    topic = message_topic(msg)
+    mid = getattr(msg, "message_id", None)
+    if job["destination"] != [msg.chat.id, uid, topic, mid]:
+        raise RuntimeError("checkpoint destination mismatch")
+    doc_id = job["doc_id"]
+    question = job["question"]
+    if checkpoints is not None:
+        msg.model_delivery()
+        final = await asyncio.to_thread(checkpoints.get, "route:answer:v1")
+    else:
+        final = None
+    if final is None:
+        if doc_id is not None and source is None:
+            source = await asyncio.to_thread(store.document, uid, topic, doc_id)
+            if source is None:
+                raise ValueError(UNLINKED_REPLY)
+        sessions = [*job["history"], {"role": "user", "content": content(question, source, job["quote"])}]
+        options = {"checkpoints": checkpoints} if checkpoints is not None else {}
+        result = await asyncio.to_thread(respond, sessions, research=job["research"], draw=job["draw"],
+                                         model=job["model"], question=question, **options)
+        text, images = result.text, result.images
+        if checkpoints is not None:
+            final = {"text": text, "images": [base64.b64encode(img).decode("ascii") for img in images]}
+            await asyncio.to_thread(checkpoints.put, "route:answer:v1", final)
+    else:
+        text = final["text"]
+        images = [base64.b64decode(encoded, validate=True) for encoded in final["images"]]
+
+    def receipt(part):
+        return {"request_key": (msg.ident, part)} if checkpoints is not None else {}
+
+    turn_id = await asyncio.to_thread(store.remember, uid, topic, question, text, source_id=doc_id, message_id=mid, **receipt("turn"))
+    if text:
+        if len(text) <= 4000:
+            sent = await msg.reply_text(text, disable_web_page_preview=True)
         else:
             name = "Ответ PSY.txt"
-            data = result.text.encode()
-            await asyncio.to_thread(store.archive, uid, topic, name, "text", data)
+            data = text.encode()
+            await asyncio.to_thread(store.archive, uid, topic, name, "text", data, **receipt("text"))
             sent = await deliver(msg, name, data)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
-    for img in result.images:
+    for index, img in enumerate(images):
         name = "Изображение PSY.png"
-        await asyncio.to_thread(store.archive, uid, topic, name, "png", img)
+        await asyncio.to_thread(store.archive, uid, topic, name, "png", img, **receipt(f"image:{index}"))
         sent = await deliver(msg, name, img)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
 
@@ -310,6 +354,13 @@ async def intercept(app, update):
     return True
 
 
+async def error_reply(msg, text):
+    mode = getattr(msg, "error_delivery", None)
+    if mode is not None:
+        mode()
+    await msg.reply_text(text)
+
+
 async def process_group(msg):
     start = time.monotonic()
     try:
@@ -317,7 +368,7 @@ async def process_group(msg):
         log.info("group action finished elapsed=%.1fs", time.monotonic() - start)
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
-        await msg.reply_text(exc.public())
+        await error_reply(msg, exc.public())
     except Exception as exc:
         # A timed-out Telegram send may already have reached the group.
         if type(exc).__name__ == "DeliveryUncertain":
@@ -330,7 +381,7 @@ async def process_group(msg):
         log.warning("group request failed class=%s function=%s line=%d elapsed=%.1fs",
                     type(exc).__name__, fn, tb.tb_lineno if tb else 0, time.monotonic() - start)
         safe = str(exc) if type(exc) is ValueError and str(exc) in SAFE_ERRORS else None
-        await msg.reply_text(safe or "Не удалось завершить запрос. Попробуйте еще раз.")
+        await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
 
 
 UNLINKED_REPLY = ("В этой теме у Вас нет привязки этого сообщения к исходному материалу. "

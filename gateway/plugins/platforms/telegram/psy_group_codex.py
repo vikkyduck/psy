@@ -1,5 +1,6 @@
 """Closed Codex interface: no filesystem tools, MCP, callbacks, local execution or previous response IDs."""
 import base64
+import hashlib
 import importlib
 import json
 import math
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 
 ENDPOINT = "https://chatgpt.com/backend-api/codex"
@@ -327,19 +329,20 @@ def _connection():
     return token, {**codex_cloudflare_headers(token), "Authorization": f"Bearer {token}", "Accept": "text/event-stream"}
 
 
-def respond(turns, *, research=False, draw=False, model, question=None):
+def respond(turns, *, research=False, draw=False, model, question=None, checkpoints=None):
     with _transport():
-        return _respond(turns, research=research, draw=draw, model=model, question=question)
+        return _respond(turns, research=research, draw=draw, model=model, question=question,
+                        checkpoints=checkpoints)
 
 
-def _respond(turns, *, research=False, draw=False, model, question=None):
+def _respond(turns, *, research=False, draw=False, model, question=None, checkpoints=None):
     import httpx
     from agent.process_bootstrap import enable_happy_eyeballs_on_client
 
     if not draw:
         with httpx.Client(timeout=httpx.Timeout(120, connect=10), trust_env=False) as client:
             enable_happy_eyeballs_on_client(client)
-            return _compose(client, turns, research, model, question)
+            return _compose(client, turns, research, model, question, checkpoints=checkpoints)
     if draw:
         # Invoke only the native image endpoint. All reference images are bytes from this
         # group's Telegram message, never arbitrary URLs, local paths or owner assets.
@@ -358,7 +361,7 @@ def _respond(turns, *, research=False, draw=False, model, question=None):
         return Result("", [base64.b64decode(encoded, validate=True)], False)
 
 
-def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None):
+def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None):
     if read_idle is None:
         read_idle = READ_IDLE_SECONDS[bool(research)]
     tools = [{"type": "web_search"}] if research else []
@@ -387,6 +390,9 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
         source_urls = set()
         images = []
         written = {}
+        final_items = set()
+        unsaved_chars = 0
+        last_save = time.monotonic() if save_prefix else 0
         for line in _lines(response):
             if line is None:
                 partial = _written(written, commentary)
@@ -407,8 +413,21 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if typ in ("response.output_item.added", "response.output_item.done") and item.get("phase") == "commentary":
                 commentary.add(item_id)
                 commentary.add(event.get("output_index", item_id))
+            if typ == "response.output_item.added" and item.get("type") == "message" and item.get("phase") == "final_answer":
+                final_items.add(item_id)
             if typ == "response.output_text.delta" and item_id not in commentary:
-                written.setdefault(item_id, []).append(event.get("delta") or "")
+                delta = event.get("delta") or ""
+                written.setdefault(item_id, []).append(delta)
+                if save_prefix and item_id in final_items and delta:
+                    unsaved_chars += len(delta)
+                    if unsaved_chars >= 8192 or time.monotonic() - last_save >= 30:
+                        # Positive phase identification keeps commentary/reasoning out
+                        # of durable drafts. Unlabelled streams checkpoint at completion.
+                        prefix = _written({k: v for k, v in written.items() if k in final_items}, commentary)
+                        if prefix and not prefix.startswith("PSY_TASK"):
+                            save_prefix(prefix)
+                        last_save = time.monotonic()
+                        unsaved_chars = 0
             if typ == "response.output_item.done":
                 if research:
                     source_urls.update(_trace_urls(item))
@@ -718,32 +737,63 @@ def _complete(call, turns, instructions, *, initial=None):
     return Result("\n".join(pieces), [], 0, part.complete and len(pieces) > 0)
 
 
-def _compose(client, turns, research, model, question):
-    def call(messages, instructions, *, web=False):
-        # The next stage may start after the original access token has expired.
-        # Resolve the same group's subscription again, using its locked refresh.
-        with _transport():
-            _, headers = _connection()
-            return _stream(client, headers, messages, web, model, instructions=instructions)
+def _compose(client, turns, research, model, question, *, checkpoints=None):
+    def call(messages, instructions, *, web=False, prose=False):
+        # All expensive stages go through this boundary, including parallel chapters.
+        # Replaying completed calls reconstructs the validated plan, ordered sections,
+        # source cards and edits without querying the model or repeating web searches.
+        if checkpoints is not None:
+            request = json.dumps([model, web, prose, instructions, messages], ensure_ascii=False,
+                                 sort_keys=True, separators=(",", ":")).encode()
+            key = "model:v1:" + hashlib.sha256(request).hexdigest()
+            saved = checkpoints.get(key)
+            if saved is not None:
+                return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]))
 
+        def save(result):
+            checkpoints.put(key, {"text": result.text, "searches": result.searches,
+                                  "complete": result.complete, "source_urls": list(result.source_urls)})
+
+        saved_prefix = False
+        def save_prefix(text):
+            nonlocal saved_prefix
+            save(Result(text, [], 0, False))
+            saved_prefix = True
+
+        options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
+        try:
+            with _transport():
+                _, headers = _connection()
+                result = _stream(client, headers, messages, web, model, instructions=instructions, **options)
+        except ModelIssue:
+            # A terminal error (including a provider refusal) invalidates speculative
+            # output. Only a process interruption leaves a prefix to resume from.
+            if saved_prefix:
+                checkpoints.put(key, None)
+            raise
+        if checkpoints is not None and (result.complete or (prose and result.text and not result.text.startswith("PSY_TASK"))):
+            save(result)
+        return result
+
+    write_prose = partial(call, prose=True)
     dispatch = SYSTEM + DISPATCH
     if research:
         dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
                      "публичной темой. Если искать приватно нельзя, верни пустую public_topic.")
     try:
-        initial = call(turns, dispatch)
+        initial = call(turns, dispatch, prose=not research)
     except ModelIssue as exc:
         if exc.kind != "context":
             raise
         turns = _map_source(call, turns, question)
-        initial = call(turns, dispatch)
+        initial = call(turns, dispatch, prose=not research)
 
     marker = "PSY_TASK "
     task = _json_value(initial.text[len(marker):]) if initial.complete and initial.text.startswith(marker) else None
     if not isinstance(task, dict):
         if research:
             raise ModelIssue("unavailable", "research_dispatch")
-        result = _complete(call, turns, SYSTEM, initial=initial)
+        result = _complete(write_prose, turns, SYSTEM, initial=initial)
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
         return result
@@ -777,9 +827,9 @@ def _compose(client, turns, research, model, question):
         # Source evidence is untrusted data, never privileged instructions.
         turns = [*turns, _user("Выписки из первоисточников и границы проверки:\n" + sources.text)]
     if long_form:
-        result = _lecture(call, turns, minutes)
+        result = _lecture(call, turns, minutes, write_prose=write_prose)
     else:
-        result = _complete(call, turns, SYSTEM + "\nВыполни исходный запрос целиком по доступным материалам."
+        result = _complete(write_prose, turns, SYSTEM + "\nВыполни исходный запрос целиком по доступным материалам."
                            + ("\n" + ATTRIBUTION if sources else ""))
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
@@ -900,7 +950,7 @@ def choose_source(question, options, active_id, *, model):
     return "clarify"
 
 
-def _lecture(call, turns, minutes):
+def _lecture(call, turns, minutes, *, write_prose=None):
     # A real manuscript needs an explicit division of labour, with usable
     # examples and cross-references assigned once before parallel drafting.
     planning = SYSTEM + "\n" + ATTRIBUTION + f"""
@@ -914,6 +964,8 @@ def _lecture(call, turns, minutes):
 Если специально заказано непрерывное выступление, activity_minutes всегда 0. В brief укажи единые для
 авторов понятия, атрибуцию и учебную цель. Если участник сам задал объем всей рукописи, распредели его
 между разделами в плане. В остальных случаях планируй по содержанию. Ссылки должны быть из проверенных материалов."""
+    if write_prose is None:
+        write_prose = call
     plan = None
     for attempt in range(2):
         response = call(turns, planning)
@@ -943,7 +995,7 @@ def _lecture(call, turns, minutes):
 При нуле минут на практику такие вставки не нужны. Ссылки у соответствующих тезисов.
 Различай работу самого автора и позднейшие интерпретации.
 Не утверждай, что материал занимает заказанное время, лишь на основании таймкодов плана."""
-        result = _complete(call, draft_turns, instruction)
+        result = _complete(write_prose, draft_turns, instruction)
         if not result.complete:
             return result
         # Review the actual manuscript in the context of the original request.
@@ -961,7 +1013,7 @@ def _lecture(call, turns, minutes):
                 raise ModelIssue("unavailable", "lecture_review")
             missing = verdict["missing"].strip()
             if missing:
-                supplement = _complete(call, [*review_turns, _user(
+                supplement = _complete(write_prose, [*review_turns, _user(
                     "Напиши только недостающий фрагмент в форме речи преподавателя. "
                     "Дополнение должно читаться сразу после готового текста, без повтора и служебных отметок. "
                     "Вопрос для раскрытия:\n" + missing)], SYSTEM + "\n" + ATTRIBUTION)

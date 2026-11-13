@@ -1,8 +1,13 @@
 """One durable group worker with bounded admission and independent Telegram dispatch."""
 import asyncio
+from datetime import timedelta
+import hashlib
+import io
 import json
 import logging
 import os
+import time
+from types import SimpleNamespace
 
 from telegram import Update
 from . import psy_group_store as store
@@ -14,26 +19,109 @@ class DeliveryUncertain(Exception):
     pass
 
 
+def retry_seconds(exc):
+    from telegram.error import RetryAfter
+    if not isinstance(exc, RetryAfter):
+        return None
+    delay = exc.retry_after
+    return max(1.0, delay.total_seconds() if isinstance(delay, timedelta) else float(delay))
+
+
 class Outbound:
-    """Record entry to Telegram's non-idempotent send boundary without serializing a credential."""
-    def __init__(self,msg,ident):
+    """Send each numbered part once, retrying only when Telegram explicitly refused it."""
+    def __init__(self, msg, ident):
         self.msg, self.ident = msg, ident
+        self.checkpoints = store.Checkpoints(ident)
+        self.part = 0
+        self._model = False
 
-    def __getattr__(self,key):
-        return getattr(self.msg,key)
+    def __getattr__(self, key):
+        return getattr(self.msg, key)
 
-    async def reply_text(self,*args,**kwargs):
-        await asyncio.to_thread(store.outbound,self.ident)
+    def model_delivery(self):
+        # Model text and images may form several parts, and have post-send history bindings.
+        self._model = True
+
+    def error_delivery(self):
+        if self.part:
+            raise DeliveryUncertain()
+        self._model = False
+
+    def _destination(self):
+        return [self.msg.chat.id, self.msg.from_user.id,
+                self.msg.message_thread_id if self.msg.is_topic_message else None, self.msg.message_id]
+
+    async def resume_saved_text(self):
+        saved = await asyncio.to_thread(self.checkpoints.get, "outbound.single_text")
+        if saved is None:
+            return False
+        await self._send_saved_text(saved)
+        return True
+
+    async def reply_text(self, text, **kwargs):
+        options = dict(kwargs)
+        markup = options.get("reply_markup")
+        if markup is not None:
+            options["reply_markup"] = markup.to_dict()
+        saved = {"destination": self._destination(), "text": text, "options": options}
+        if not self._model:
+            # Commands like /files or an error reply can change after a restart.
+            # Persist the exact one-part response before contacting Telegram.
+            try:
+                await asyncio.to_thread(self.checkpoints.put, "outbound.single_text", saved)
+            except Exception:
+                raise DeliveryUncertain() from None
+        return await self._send_saved_text(saved)
+
+    async def _send_saved_text(self, saved):
+        if saved["destination"] != self._destination():
+            raise DeliveryUncertain()
+        options = dict(saved["options"])
+        if options.get("reply_markup") is not None:
+            from telegram import InlineKeyboardMarkup
+            options["reply_markup"] = InlineKeyboardMarkup.de_json(options["reply_markup"], None)
+        return await self._send("text", saved, lambda: self.msg.reply_text(saved["text"], **options))
+
+    async def reply_document(self, document, **kwargs):
+        # PTB can consume the stream before returning a 429. Reopen it from byte zero each time.
+        buffered = isinstance(document, io.BytesIO)
+        data = document.getvalue() if buffered else document
+        fingerprint = {"sha256": hashlib.sha256(data).hexdigest(), "options": kwargs}
+        def send():
+            return self.msg.reply_document(document=io.BytesIO(data) if buffered else data, **kwargs)
+        return await self._send("document", fingerprint, send)
+
+    async def _send(self, kind, content, send):
+        part = self.part
+        self.part += 1
+        envelope = [self._destination(), kind, content]
+        fingerprint = hashlib.sha256(json.dumps(envelope, sort_keys=True, ensure_ascii=False,
+                                                separators=(",", ":")).encode()).hexdigest()
         try:
-            return await self.msg.reply_text(*args,**kwargs)
+            while True:
+                action, value = await asyncio.to_thread(store.begin_delivery, self.ident, part, fingerprint)
+                if action == "confirmed":
+                    return SimpleNamespace(message_id=value)
+                if action == "wait":
+                    await asyncio.sleep(max(0, value - time.time()))
+                    continue
+                if action != "send":
+                    raise DeliveryUncertain()
+                try:
+                    sent = await send()
+                except Exception as exc:
+                    delay = retry_seconds(exc)
+                    if delay is None:
+                        raise DeliveryUncertain() from None
+                    await asyncio.to_thread(store.retry_delivery, self.ident, part, time.time() + delay)
+                    continue
+                if type(sent.message_id) is not int or sent.message_id <= 0:
+                    raise DeliveryUncertain()
+                await asyncio.to_thread(store.confirm_delivery, self.ident, part, sent.message_id)
+                return sent
         except Exception:
-            raise DeliveryUncertain() from None
-
-    async def reply_document(self,*args,**kwargs):
-        await asyncio.to_thread(store.outbound,self.ident)
-        try:
-            return await self.msg.reply_document(*args,**kwargs)
-        except Exception:
+            # A receipt write can fail after Telegram accepted an answer. The route must
+            # never answer that failure with another message or retry an ambiguous send.
             raise DeliveryUncertain() from None
 
 
@@ -72,16 +160,25 @@ async def work(app, wake):
         wake.clear()
         item = await asyncio.to_thread(store.claim_next)
         if not item:
+            delay = await asyncio.to_thread(store.next_retry_delay)
             if wake.is_set():
                 continue
-            return
+            if delay is None:
+                return
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            continue
         ident, body = item
         try:
             update=Update.de_json(json.loads(body),app.bot)
             finished = asyncio.Event()
             hint = asyncio.create_task(typing(app.bot, update.message, finished), name="psy-group-typing")
             try:
-                await process_group(Outbound(update.message, ident))
+                outbound = Outbound(update.message, ident)
+                if not await outbound.resume_saved_text():
+                    await process_group(outbound)
             finally:
                 finished.set()
                 hint.cancel()
