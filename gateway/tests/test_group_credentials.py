@@ -4,7 +4,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
@@ -168,7 +168,100 @@ class TestPreferredCredentials(unittest.TestCase):
         self.primary["access_token"] = "old"
         self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("http_error",403)
         self.issue("access_wait")
-        self.auth._save_auth_store.assert_not_called()
+        self.issue("access_wait")
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+        self.assertNotEqual(self.store["credential_pool"]["openai-codex"][1].get("last_status"), "dead")
+        self.codex.refresh_codex_oauth_pure.side_effect = self._refresh
+        with patch("time.time", return_value=time.time()+65):
+            self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+
+    def group_question(self, reply):
+        headers = ModuleType("agent.codex_headers")
+        headers.codex_cloudflare_headers = lambda token: {}
+        self.modules["httpx"].TimeoutException = type("TimeoutException", (self.modules["httpx"].RequestError,), {})
+        def stream(method, url, *, headers, **kwargs):
+            token = headers["Authorization"].removeprefix("Bearer ")
+            self.assertEqual(url, adapter.ENDPOINT + "/responses")
+            if reply(token) == 401:
+                response = Mock(status_code=401, iter_bytes=lambda *_: [b'{"error":{"code":"token_expired"}}'])
+            else:
+                response = Mock(status_code=200, iter_lines=lambda: [
+                    'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"42"}]}]}}'])
+            return nullcontext(response)
+        with patch.dict(sys.modules, {"agent.codex_headers": headers}):
+            return adapter._compose(Mock(stream=stream), [adapter._user("6 * 7?")], False, "test", "6 * 7?")
+
+    def test_model_401_before_local_expiry_rotates_once_and_completes_question(self):
+        reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
+        self.assertEqual(self.group_question(reply).text, "42")
+        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "renewed"])
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant")
+
+    def test_rejected_refresh_on_model_401_blocks_later_questions_until_owner_login(self):
+        self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("refresh_token_expired", 401)
+        reply = Mock(return_value=401)
+        for _ in range(2):
+            with self.assertRaises(adapter.ModelIssue) as caught:
+                self.group_question(reply)
+            self.assertEqual((caught.exception.kind, caught.exception.stage), ("signin", "credentials"))
+        reply.assert_called_once_with("live")
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant")
+        self.assertEqual(self.store["credential_pool"]["openai-codex"][0], self.other)
+
+    def test_second_model_401_does_not_keep_rotating_a_fresh_grant(self):
+        reply = Mock(return_value=401)
+        for _ in range(2):
+            with self.assertRaises(adapter.ModelIssue) as caught:
+                self.group_question(reply)
+            self.assertEqual(caught.exception.kind, "signin")
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+        self.assertEqual(self.store["credential_pool"]["openai-codex"][1]["refresh_token"], "rotated")
+
+    def test_model_401_adopts_a_token_already_rotated_by_peer(self):
+        self.on_lock = lambda: self.primary.update(access_token="peer-live", refresh_token="peer-grant")
+        reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
+        self.assertEqual(self.group_question(reply).text, "42")
+        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "peer-live"])
+        self.codex.refresh_codex_oauth_pure.assert_not_called()
+
+    def test_model_401_renewal_temporarily_unavailable_then_recovers(self):
+        self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("http_error", 503)
+        reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
+        for _ in range(2):
+            with self.assertRaises(adapter.ModelIssue) as caught:
+                self.group_question(reply)
+            self.assertEqual(caught.exception.kind, "access_wait")
+        reply.assert_called_once_with("live")
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+        self.codex.refresh_codex_oauth_pure.side_effect = self._refresh
+        with patch("time.time", return_value=time.time()+65):
+            self.assertEqual(self.group_question(reply).text, "42")
+
+    def test_identical_access_token_from_refresh_is_never_replayed(self):
+        self.codex.refresh_codex_oauth_pure.side_effect = None
+        self.codex.refresh_codex_oauth_pure.return_value = dict(access_token="live", refresh_token="rotated", last_refresh="now")
+        reply = Mock(return_value=401)
+        with self.assertRaises(adapter.ModelIssue) as caught:
+            self.group_question(reply)
+        self.assertEqual(caught.exception.kind, "signin")
+        reply.assert_called_once()
+
+    def test_image_401_recovers_without_publishing_provider_detail(self):
+        import base64
+        headers = ModuleType("agent.codex_headers")
+        headers.codex_cloudflare_headers = lambda token: {}
+        bootstrap = ModuleType("agent.process_bootstrap")
+        bootstrap.enable_happy_eyeballs_on_client = lambda client: None
+        plugin = Mock()
+        plugin._resolve_model.return_value = ("image-fixture", {"quality": "medium"})
+        plugin._post_image_request.side_effect = [RuntimeError("Codex images API returned HTTP 401: private fixture"),
+                                                 {"data": [{"b64_json": base64.b64encode(b"fake image").decode()}]}]
+        modules = {"agent.codex_headers": headers, "agent.process_bootstrap": bootstrap, "plugins.image_gen.openai-codex": plugin}
+        with patch.dict(sys.modules, modules):
+            turns = [{"role": "user", "content": [{"type": "input_text", "text": "Нарисуй круг"}]}]
+            result = adapter._respond(turns, draw=True, model="test")
+        self.assertEqual(result.images, [b"fake image"])
+        self.assertEqual([call.args[0] for call in plugin._post_image_request.call_args_list], ["live", "renewed"])
 
 
 if __name__ == "__main__":

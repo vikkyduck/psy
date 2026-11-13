@@ -21,6 +21,7 @@ class Duration(unittest.TestCase):
         module.RequestError = type("RequestError", (Exception,), {})
         module.TimeoutException = type("TimeoutException", (module.RequestError,), {})
         self.timeout = module.TimeoutException
+        self.reset = module.RequestError
         for scope in (patch.dict(sys.modules, {"httpx": module}),
                       patch.object(m.time, "monotonic", side_effect=lambda: self.elapsed),
                       patch.object(m, "_connection", side_effect=self.connection)):
@@ -119,3 +120,88 @@ class Duration(unittest.TestCase):
                 self.assertFalse(result.complete)
                 self.assertTrue(result.text.startswith("Начало"))
                 self.assertEqual(len(self.streams), 2)
+
+    def test_resume_after_idle_reset_or_eof_uses_all_public_items_once(self):
+        for ending in (self.timeout, self.reset, None):
+            with self.subTest(ending=ending):
+                self.streams.clear()
+                def stage(payload):
+                    if len(self.streams) == 2:
+                        self.assertEqual(payload["input"][-2]["content"], "Готовый раздел.\nНачало следующего.")
+                        yield event("response.output_text.delta", delta="Окончание.")
+                        yield event("response.completed")
+                        return
+                    yield event("response.output_item.done", item={"id":"c", "type":"message", "phase":"commentary",
+                                "content":[{"type":"output_text", "text":"Служебный черновик"}]})
+                    yield event("response.output_item.done", item={"id":"a", "type":"message", "phase":"final_answer",
+                                "content":[{"type":"output_text", "text":"Готовый раздел."}]})
+                    yield event("response.output_text.delta", item_id="b", delta="Начало следующего.")
+                    if ending is not None:
+                        raise ending()
+                result = self.compose("Напиши разбор", stage)
+                self.assertTrue(result.complete)
+                self.assertEqual(result.text, "Готовый раздел.\nНачало следующего.\nОкончание.")
+                self.assertEqual(len(self.streams), 2)
+
+    def test_interrupted_refusal_does_not_continue_the_prior_text(self):
+        def stage(payload):
+            yield event("response.output_text.delta", item_id="a", delta="Черновик")
+            yield event("response.refusal.delta", item_id="a", delta="Не могу")
+            raise self.timeout()
+        with self.assertRaises(m.ModelIssue):
+            self.compose("Напиши разбор", stage)
+        self.assertEqual(len(self.streams), 1)
+
+    def test_silent_reset_and_eof_without_public_text_keep_their_error(self):
+        for ending, stage_name in ((self.reset, "stream_read"), (None, "stream_end")):
+            with self.subTest(stage=stage_name):
+                self.streams.clear()
+                def stage(payload):
+                    yield event("response.output_item.added", item={"id":"c", "type":"message", "phase":"commentary"})
+                    yield event("response.output_text.delta", item_id="c", delta="Служебная заметка")
+                    if ending is not None:
+                        raise ending()
+                with self.assertRaises(m.ModelIssue) as error:
+                    self.compose("Вопрос", stage)
+                self.assertEqual((error.exception.kind, error.exception.stage), ("connection", stage_name))
+                self.assertEqual(len(self.streams), 1)
+
+    def test_confirmed_text_parts_complete_without_deltas_and_are_not_duplicated(self):
+        def stage(payload):
+            if len(self.streams) == 2:
+                self.assertEqual(payload["input"][-2]["content"], "Раздел 1.\nРаздел 2.")
+                yield event("response.output_text.delta", delta="Раздел 3.")
+                yield event("response.completed")
+                return
+            yield event("response.output_text.delta", item_id="a", content_index=0, delta="Раздел")
+            yield event("response.output_text.done", item_id="a", content_index=0, text="Раздел 1.")
+            yield event("response.content_part.done", item_id="a", content_index=1,
+                        part={"type":"output_text", "text":"Раздел 2."})
+            raise self.reset()
+        self.assertEqual(self.compose("Напиши разбор", stage).text, "Раздел 1.\nРаздел 2.\nРаздел 3.")
+
+    def test_incomplete_dispatch_restarts_without_exposing_its_payload(self):
+        for short_marker in ("PSY_T", 'PSY_TASK {"public_topic":"служебный черновик'):
+            with self.subTest(marker=short_marker):
+                self.streams.clear()
+                def stage(payload):
+                    if len(self.streams) == 1:
+                        yield event("response.output_text.delta", delta=short_marker)
+                        raise self.timeout()
+                    self.assertIn(m.DISPATCH, payload["instructions"])
+                    self.assertEqual(payload["input"], [m._user("Напиши разбор")])
+                    yield event("response.output_text.delta", delta="Готовый ответ.")
+                    yield event("response.completed")
+                result = self.compose("Напиши разбор", stage)
+                self.assertEqual(result.text, "Готовый ответ.")
+                self.assertTrue(result.complete)
+                self.assertEqual(len(self.streams), 2)
+
+    def test_repeated_broken_dispatch_never_becomes_a_public_reply(self):
+        def stage(payload):
+            yield event("response.output_text.delta", delta='PSY_TASK {"minutes":')
+            raise self.timeout()
+        with self.assertRaises(m.ModelIssue) as error:
+            self.compose("Составь лекцию", stage)
+        self.assertNotIn("PSY_TASK", error.exception.public())
+        self.assertEqual(len(self.streams), 2)
