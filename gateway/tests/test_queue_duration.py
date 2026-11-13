@@ -22,6 +22,7 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         real_time = loop.time
         offset = 0
+        pending = iter([(7, "{}")])
         processing = asyncio.Event()
         finish = asyncio.Event()
         message = SimpleNamespace(is_topic_message=False, chat=SimpleNamespace(id=-202),
@@ -38,7 +39,7 @@ class QueueDuration(unittest.IsolatedAsyncioTestCase):
             patch.object(loop, "slow_callback_duration", float("inf")),
             patch.object(loop, "time", lambda: real_time() + offset),
             patch.object(queue.Update, "de_json", return_value=SimpleNamespace(message=message)),
-            patch.object(queue.store, "claim_next", side_effect=[(7, "{}"), None]),
+            patch.object(queue.store, "claim_next", side_effect=lambda **_: next(pending, None)),
             patch.object(queue.store, "next_retry_delay", return_value=None),
             patch.object(queue.store.Checkpoints, "get", return_value=None),
             patch.object(queue.store, "begin_delivery", return_value=("send", None)) as begin_send,

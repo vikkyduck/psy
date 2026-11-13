@@ -1,4 +1,4 @@
-"""One durable group worker with bounded admission and independent Telegram dispatch."""
+"""Run independent Telegram jobs concurrently under one durable queue lease."""
 import asyncio
 from datetime import timedelta
 import hashlib
@@ -13,10 +13,22 @@ from telegram import Update
 from . import psy_group_store as store
 
 log = logging.getLogger("psy.group")
+MAX_ACTIVE_JOBS = 3
 
 
 class DeliveryUncertain(Exception):
     pass
+
+
+async def committed_call(func, *args, **kwargs):
+    # Stop may cancel the awaiting coroutine while SQLite is still committing.
+    # Keep this drain's lease until the short transaction has really finished.
+    operation = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await asyncio.gather(operation, return_exceptions=True)
+        raise
 
 
 def retry_seconds(exc):
@@ -27,11 +39,25 @@ def retry_seconds(exc):
     return max(1.0, delay.total_seconds() if isinstance(delay, timedelta) else float(delay))
 
 
+class _ScheduledCheckpoints(store.Checkpoints):
+    def __init__(self, ident, wake):
+        super().__init__(ident)
+        self.loop = asyncio.get_running_loop()
+        self.wake = wake
+
+    def put(self, key, value):
+        super().put(key, value)
+        if key == "route:input:v1":
+            # The next question from this member can now read the chosen source.
+            # Stage writes run in worker threads, while wake belongs to the event loop.
+            self.loop.call_soon_threadsafe(self.wake.set)
+
+
 class Outbound:
     """Send each numbered part once, retrying only when Telegram explicitly refused it."""
-    def __init__(self, msg, ident):
+    def __init__(self, msg, ident, wake=None):
         self.msg, self.ident = msg, ident
-        self.checkpoints = store.Checkpoints(ident)
+        self.checkpoints = store.Checkpoints(ident) if wake is None else _ScheduledCheckpoints(ident, wake)
         self.part = 0
         self._model = False
 
@@ -68,7 +94,7 @@ class Outbound:
             # Commands like /files or an error reply can change after a restart.
             # Persist the exact one-part response before contacting Telegram.
             try:
-                await asyncio.to_thread(self.checkpoints.put, "outbound.single_text", saved)
+                await committed_call(self.checkpoints.put, "outbound.single_text", saved)
             except Exception:
                 raise DeliveryUncertain() from None
         return await self._send_saved_text(saved)
@@ -99,7 +125,7 @@ class Outbound:
                                                 separators=(",", ":")).encode()).hexdigest()
         try:
             while True:
-                action, value = await asyncio.to_thread(store.begin_delivery, self.ident, part, fingerprint)
+                action, value = await committed_call(store.begin_delivery, self.ident, part, fingerprint)
                 if action == "confirmed":
                     return SimpleNamespace(message_id=value)
                 if action == "wait":
@@ -113,11 +139,11 @@ class Outbound:
                     delay = retry_seconds(exc)
                     if delay is None:
                         raise DeliveryUncertain() from None
-                    await asyncio.to_thread(store.retry_delivery, self.ident, part, time.time() + delay)
+                    await committed_call(store.retry_delivery, self.ident, part, time.time() + delay)
                     continue
                 if type(sent.message_id) is not int or sent.message_id <= 0:
                     raise DeliveryUncertain()
-                await asyncio.to_thread(store.confirm_delivery, self.ident, part, sent.message_id)
+                await committed_call(store.confirm_delivery, self.ident, part, sent.message_id)
                 return sent
         except Exception:
             # A receipt write can fail after Telegram accepted an answer. The route must
@@ -143,10 +169,10 @@ async def typing(bot, msg, finished):
 
 async def drain(app, wake):
     while app.running:
-        lease = await asyncio.to_thread(store.lease)
+        lease = store.lease()  # LOCK_NB on a local file, acquired and closed by this task.
         if lease is not None:
             try:
-                await asyncio.to_thread(store.recover)
+                await committed_call(store.recover)
                 await work(app, wake)
             finally:
                 os.close(lease)
@@ -154,43 +180,74 @@ async def drain(app, wake):
         await asyncio.sleep(1)
 
 
-async def work(app, wake):
+async def run_job(app, wake, ident, body):
     from .psy_group_route import process_group
-    while app.running:
-        wake.clear()
-        item = await asyncio.to_thread(store.claim_next)
-        if not item:
-            delay = await asyncio.to_thread(store.next_retry_delay)
+    try:
+        update = Update.de_json(json.loads(body), app.bot)
+        finished = asyncio.Event()
+        hint = asyncio.create_task(typing(app.bot, update.message, finished), name="psy-group-typing")
+        try:
+            outbound = Outbound(update.message, ident, wake)
+            if not await outbound.resume_saved_text():
+                await process_group(outbound)
+        finally:
+            finished.set()
+            hint.cancel()
+            await asyncio.gather(hint, return_exceptions=True)
+    except store.GroupJobParked:
+        # Its checkpoints and queued state are already committed for the next slot.
+        return
+    except asyncio.CancelledError:
+        # Startup restores pre-send work and quarantines possible duplicate deliveries.
+        raise
+    except Exception as exc:
+        log.warning("group job stopped: %s", type(exc).__name__)
+        await committed_call(store.settle, ident, False)
+    else:
+        await committed_call(store.settle, ident, True)
+
+
+async def work(app, wake):
+    active = set()
+    try:
+        while app.running or active:
+            wake.clear()
+            for task in tuple(active):
+                if task.done():
+                    active.remove(task)
+                    task.result()
+            # Use the same clock edge for both queries: a last 429 can become due
+            # between an empty claim and the read of its timer.
+            now = time.time()
+            while app.running and len(active) < MAX_ACTIVE_JOBS:
+                item = await committed_call(store.claim_next, now=now)
+                if item is None:
+                    break
+                task = asyncio.create_task(run_job(app, wake, *item), name="psy-group-job")
+                task.add_done_callback(lambda _: wake.set())
+                active.add(task)
+            # A new update, completed job or committed source selection can unblock a
+            # different member/question. A durable Telegram retry also has its own due time.
+            delay = None
+            if app.running and len(active) < MAX_ACTIVE_JOBS:
+                delay = await asyncio.to_thread(store.next_retry_delay, now=now)
             if wake.is_set():
                 continue
             if delay is None:
-                return
-            try:
-                await asyncio.wait_for(wake.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
-            continue
-        ident, body = item
-        try:
-            update=Update.de_json(json.loads(body),app.bot)
-            finished = asyncio.Event()
-            hint = asyncio.create_task(typing(app.bot, update.message, finished), name="psy-group-typing")
-            try:
-                outbound = Outbound(update.message, ident)
-                if not await outbound.resume_saved_text():
-                    await process_group(outbound)
-            finally:
-                finished.set()
-                hint.cancel()
-                await asyncio.gather(hint, return_exceptions=True)
-        except asyncio.CancelledError:
-            # Startup restores pre-send work and quarantines possible duplicate deliveries.
-            raise
-        except Exception as exc:
-            log.warning("group job stopped: %s", type(exc).__name__)
-            await asyncio.to_thread(store.settle,ident,False)
-        else:
-            await asyncio.to_thread(store.settle,ident,True)
+                if not active:
+                    return
+                await wake.wait()
+            else:
+                try:
+                    await asyncio.wait_for(wake.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+    finally:
+        # No child may deliver after the process-wide lease is handed to another drain.
+        for task in active:
+            task.cancel()
+        if active:
+            await asyncio.gather(*active, return_exceptions=True)
 
 
 def schedule(app):

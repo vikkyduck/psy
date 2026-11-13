@@ -144,6 +144,21 @@ class SourceContext(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.input()[1]["text"], "Материал: legacy.txt\nold")
         sent.document.get_file.assert_not_awaited()
 
+    async def test_reply_to_own_pending_request_uses_specific_completed_answer(self):
+        parent = self.msg("Разбери первый текст")
+        self.response.return_value.text = "Итог первой работы"
+        await route.group_message(parent)
+        self.response.return_value.text = "Ответ на независимый вопрос"
+        await route.group_message(self.msg("Независимый вопрос"))
+        await route.group_message(self.msg("Разверни именно первый вывод", quoted=parent))
+        quoted_input = self.input()[0]["text"]
+        self.assertIn("Разбери первый текст", quoted_input)
+        self.assertIn("Итог первой работы", quoted_input)
+        self.assertNotIn("Ответ на независимый вопрос", quoted_input)
+        different = self.msg("Что имеется в виду?", uid=12, quoted=parent)
+        await route.group_message(different)
+        self.assertNotIn("Итог первой работы", repr(self.response.call_args.args[0]))
+
     async def test_direct_source_overrides_previous_binding_and_preserves_on_failed_analysis(self):
         await route.group_message(self.msg("Первый", file("one.txt", b"111")))
         self.response.side_effect = RuntimeError("synthetic failure")

@@ -10,6 +10,7 @@ from pathlib import Path
 ROOT = Path("/home/hermes/.hermes/vault/group-psy")
 MEMBER_LIMIT = 128 * 1024**2
 TOTAL_LIMIT = 512 * 1024**2
+MAX_LONG_JOBS = 2
 
 
 @contextlib.contextmanager
@@ -24,6 +25,15 @@ def database(root=ROOT):
         con.executescript("""
             CREATE TABLE IF NOT EXISTS requests (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL,
               body TEXT NOT NULL, state TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS schedule (
+              request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+              topic INTEGER NOT NULL, message_id INTEGER, reply_id INTEGER,
+              long_job INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE IF NOT EXISTS source_events (
+              uid INTEGER NOT NULL, topic INTEGER NOT NULL, message_id INTEGER NOT NULL, doc_id INTEGER,
+              PRIMARY KEY(uid,topic,message_id));
+            CREATE TABLE IF NOT EXISTS turn_order (
+              turn_id INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE, message_id INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS checkpoints (
               request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
               key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(request_id,key));
@@ -147,15 +157,38 @@ def document(uid, topic, ident, *, root=ROOT):
 
 def set_current(uid, topic, doc_id, message_id, *, root=ROOT):
     with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        if type(message_id) is int and message_id > 0:
+            # Preserve the source selected before this migration as the timeline baseline.
+            con.execute("""INSERT OR IGNORE INTO source_events
+                           SELECT uid,topic,0,doc_id FROM current_sources WHERE uid=? AND topic=?
+                           AND NOT EXISTS (SELECT 1 FROM source_events WHERE uid=? AND topic=?)""",
+                        (uid, topic, uid, topic))
+            con.execute("INSERT OR REPLACE INTO source_events VALUES (?,?,?,?)", (uid, topic, message_id, doc_id))
         con.execute("""INSERT INTO current_sources(uid,topic,doc_id) VALUES (?,?,?)
-                       ON CONFLICT(uid,topic) DO UPDATE SET doc_id=excluded.doc_id""", (uid, topic, doc_id))
+                       ON CONFLICT(uid,topic) DO UPDATE SET doc_id=excluded.doc_id
+                       WHERE NOT EXISTS (SELECT 1 FROM source_events WHERE uid=? AND topic=? AND message_id>?)""",
+                    (uid, topic, doc_id, uid, topic, message_id))
         _bind(con, uid, topic, message_id, doc_id, None)
 
 
-def choices(uid, topic, include_library=False, *, root=ROOT):
-    """Return only the member's source labels and discussion cues, never document bodies."""
+# Older turns predate turn_order but many retain both their incoming and outgoing bindings.
+# Telegram numbers every message in a chat in sequence, so the first binding is the incoming one.
+_TURN_ORIGIN = """coalesce(o.message_id, (SELECT min(ms.message_id) FROM message_sources ms
+                 WHERE ms.uid=t.uid AND ms.topic=t.topic AND ms.turn_id=t.id), 0)"""
+
+
+def choices(uid, topic, include_library=False, *, root=ROOT, before_message_id=None):
+    """Return source labels and discussion cues visible before this incoming message."""
     with database(root) as con:
+        con.execute("BEGIN")
         current = con.execute("SELECT doc_id FROM current_sources WHERE uid=? AND topic=?", (uid, topic)).fetchone()
+        if before_message_id is not None:
+            event = con.execute("""SELECT doc_id FROM source_events WHERE uid=? AND topic=? AND message_id<?
+                                   ORDER BY message_id DESC LIMIT 1""", (uid, topic, before_message_id)).fetchone()
+            if event is not None or con.execute("SELECT 1 FROM source_events WHERE uid=? AND topic=? LIMIT 1",
+                                                (uid, topic)).fetchone():
+                current = event
         active_id = current[0] if current else None
         if active_id is None and not include_library:
             return None, []
@@ -164,30 +197,35 @@ def choices(uid, topic, include_library=False, *, root=ROOT):
                                 d.id=? OR EXISTS(SELECT 1 FROM message_sources s WHERE
                                   s.uid=d.uid AND s.topic=d.topic AND s.doc_id=d.id)
                                 OR (? AND d.kind='text' AND d.name!='Ответ PSY.txt'))
+                              AND (? IS NULL OR coalesce((SELECT min(s.message_id) FROM message_sources s
+                                   WHERE s.uid=d.uid AND s.topic=d.topic AND s.doc_id=d.id),0) < ?)
                               ORDER BY (d.id IS ?) DESC,d.id DESC LIMIT 16""",
-                           (uid, topic, active_id, include_library, active_id)).fetchall()
+                           (uid, topic, active_id, include_library, before_message_id, before_message_id, active_id)).fetchall()
         options = []
         for doc_id, name in docs:
-            related = """FROM turns t JOIN turn_sources s ON s.turn_id=t.id
-                         WHERE t.uid=? AND t.topic=? AND s.doc_id=?"""
-            args = (uid, topic, doc_id)
-            first = con.execute("SELECT substr(t.prompt,1,320) " + related + " ORDER BY t.id LIMIT 1", args).fetchone()
-            last = con.execute("SELECT substr(t.prompt,1,320), substr(t.answer,1,600) " + related
-                               + " ORDER BY t.id DESC LIMIT 1", args).fetchone()
+            related = f"""FROM turns t JOIN turn_sources s ON s.turn_id=t.id
+                          LEFT JOIN turn_order o ON o.turn_id=t.id WHERE t.uid=? AND t.topic=? AND s.doc_id=?
+                          AND (? IS NULL OR {_TURN_ORIGIN} < ?)"""
+            args = (uid, topic, doc_id, before_message_id, before_message_id)
+            first = con.execute(f"SELECT substr(t.prompt,1,320) {related} ORDER BY {_TURN_ORIGIN},t.id LIMIT 1",
+                                args).fetchone()
+            last = con.execute(f"""SELECT substr(t.prompt,1,320),substr(t.answer,1,600) {related}
+                                   ORDER BY {_TURN_ORIGIN} DESC,t.id DESC LIMIT 1""", args).fetchone()
             options.append(dict(id=doc_id, name=name, first_question=first[0] if first else "",
                                 last_question=last[0] if last else "", last_answer=last[1] if last else ""))
         return active_id, options
 
 
-def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT):
+def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT, before_message_id=None):
     with database(root) as con:
-        if source_id is Ellipsis:
-            rows = con.execute("SELECT prompt,answer FROM turns WHERE uid=? AND topic=? ORDER BY id DESC LIMIT 6",
-                               (uid, topic)).fetchall()
-        else:
-            rows = con.execute("""SELECT prompt,answer FROM turns JOIN turn_sources ON turn_id=id
-                                  WHERE uid=? AND topic=? AND doc_id IS ? AND id IS NOT ?
-                                  ORDER BY id DESC LIMIT 6""", (uid, topic, source_id, exclude_turn)).fetchall()
+        query = f"""SELECT prompt,answer FROM turns t LEFT JOIN turn_order o ON o.turn_id=t.id
+                    WHERE t.uid=? AND t.topic=? AND (? IS NULL OR {_TURN_ORIGIN} < ?)"""
+        args = (uid, topic, before_message_id, before_message_id)
+        if source_id is not Ellipsis:
+            query += """ AND t.id IS NOT ? AND EXISTS (SELECT 1 FROM turn_sources s
+                         WHERE s.turn_id=t.id AND s.doc_id IS ?)"""
+            args += (exclude_turn, source_id)
+        rows = con.execute(query + f" ORDER BY {_TURN_ORIGIN} DESC,t.id DESC LIMIT 6", args).fetchall()
     turns = []
     for i, (prompt, answer) in enumerate(reversed(rows)):
         turns.append({"role": "user", "content": prompt[:3000]})
@@ -206,10 +244,16 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         row = con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
                           (uid, topic, question[:5000], answer))
         turn_id = row.lastrowid
+        if type(message_id) is int and message_id > 0:
+            con.execute("INSERT INTO turn_order VALUES (?,?)", (turn_id, message_id))
         con.execute("INSERT INTO turn_sources(turn_id,doc_id) VALUES (?,?)", (turn_id, source_id))
         _bind(con, uid, topic, message_id, source_id, turn_id)
         _record_write(con, request_key, topic, "turn", turn_id)
         return turn_id
+
+
+class GroupJobParked(Exception):
+    """Durably queued to resume when a long-work slot becomes available."""
 
 
 class Checkpoints:
@@ -218,6 +262,10 @@ class Checkpoints:
     def __init__(self, ident, *, root=ROOT):
         self.ident = ident
         self.root = root
+
+    def admit_long(self):
+        if not admit_long(self.ident, root=self.root):
+            raise GroupJobParked()
 
     def get(self, key):
         with database(self.root) as con:
@@ -231,6 +279,25 @@ class Checkpoints:
             con.execute("""INSERT INTO checkpoints(request_id,key,value) VALUES(?,?,?)
                            ON CONFLICT(request_id,key) DO UPDATE SET value=excluded.value""",
                         (self.ident, key, encoded))
+
+
+def _schedule_request(con, ident, payload):
+    # Legacy rows can be non-JSON. Their existing FIFO semantics are preserved.
+    try:
+        obj = json.loads(payload)
+        msg = obj.get("message", {}) if isinstance(obj, dict) else {}
+        mid = msg.get("message_id")
+        topic = msg.get("message_thread_id", 0) if msg.get("is_topic_message") else 0
+        reply = msg.get("reply_to_message") or {}
+        reply_id = None
+        chat_id = msg.get("chat", {}).get("id")
+        if chat_id is not None and reply.get("chat", {}).get("id") == chat_id:
+            reply_id = reply.get("message_id")
+    except (ValueError, TypeError, AttributeError):
+        mid, topic, reply_id = None, 0, None
+    con.execute("INSERT INTO schedule(request_id,topic,message_id,reply_id) VALUES (?,?,?,?)",
+                (ident, topic if type(topic) is int else 0, mid if type(mid) is int else None,
+                 reply_id if type(reply_id) is int else None))
 
 
 def pending(uid, ident, payload, *, root=ROOT):
@@ -248,27 +315,71 @@ def pending(uid, ident, payload, *, root=ROOT):
         if count>=12 or own>=4 or len(payload)>300000:
             return "full"
         con.execute("INSERT INTO requests(id,uid,body,state) VALUES(?,?,?,'queued')",(ident,uid,payload))
+        _schedule_request(con, ident, payload)
         return "queued"
+
+
+# Exclude jobs waiting on a full long-work lane, their own explicit Telegram reply
+# target, or an earlier active source-selection step in this member and topic.
+# An independent question may overtake a queued follow-up that is itself waiting.
+_CLAIMABLE = """(s.long_job=0 OR (SELECT count(*) FROM requests a JOIN schedule b ON b.request_id=a.id
+                     WHERE a.state IN ('running','sending') AND b.long_job=1) < ?)
+                AND NOT EXISTS (SELECT 1 FROM requests a JOIN schedule b ON b.request_id=a.id
+                    WHERE a.uid=r.uid AND b.topic=s.topic AND b.message_id<s.message_id
+                      AND a.state IN ('running','sending','queued') AND (
+                        s.reply_id=b.message_id OR EXISTS (SELECT 1 FROM delivery_parts p WHERE
+                          p.request_id=a.id AND p.message_id=s.reply_id)
+                        OR (s.reply_id IS NOT NULL AND a.state='sending')
+                        OR (a.state IN ('running','sending') AND NOT EXISTS (SELECT 1 FROM checkpoints c WHERE c.request_id=a.id
+                                AND c.key IN ('route:input:v1','outbound.single_text'))
+                            AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.request_id=a.id))))"""
 
 
 def claim_next(*, root=ROOT, now=None):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
-        record = con.execute("""SELECT id,body FROM requests r WHERE state='queued'
-                                AND NOT EXISTS(SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
-                                               AND p.state='retry' AND p.retry_at>?)
-                                ORDER BY r.rowid LIMIT 1""",
-                             (time.time() if now is None else now,)).fetchone()
+        # A pre-upgrade live queue has no schedule rows yet. At most 12 jobs can be admitted.
+        for ident, body in con.execute("""SELECT r.id,r.body FROM requests r LEFT JOIN schedule s
+                                          ON s.request_id=r.id WHERE s.request_id IS NULL AND
+                                          r.state IN ('queued','running','sending')""").fetchall():
+            _schedule_request(con, ident, body)
+        record = con.execute(f"""SELECT r.id,r.body FROM requests r JOIN schedule s ON s.request_id=r.id
+              WHERE r.state='queued' AND {_CLAIMABLE}
+                AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
+                                AND p.state='retry' AND p.retry_at>?)
+              ORDER BY (SELECT count(*) FROM requests a WHERE a.uid=r.uid AND a.state IN ('running','sending')),
+                       r.rowid LIMIT 1""", (MAX_LONG_JOBS, time.time() if now is None else now)).fetchone()
         if record:
             con.execute("UPDATE requests SET state='running' WHERE id=?", (record[0],))
         return record
 
 
-def next_retry_delay(*, root=ROOT, now=None):
+def admit_long(ident, *, root=ROOT):
+    """Reserve one of the long-job slots or requeue a newly classified job atomically."""
     with database(root) as con:
-        due = con.execute("""SELECT min(p.retry_at) FROM delivery_parts p JOIN requests r ON r.id=p.request_id
-                             WHERE r.state='queued' AND p.state='retry'""").fetchone()[0]
-    return None if due is None else max(0, due - (time.time() if now is None else now))
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("""SELECT s.long_job FROM schedule s JOIN requests r ON r.id=s.request_id
+                             WHERE r.id=? AND r.state='running'""", (ident,)).fetchone()
+        if row is None:
+            raise RuntimeError("Group request is not running")
+        if row[0]:
+            return True
+        busy = con.execute("""SELECT count(*) FROM schedule s JOIN requests r ON r.id=s.request_id
+                              WHERE s.long_job=1 AND r.state IN ('running','sending')""").fetchone()[0]
+        con.execute("UPDATE schedule SET long_job=1 WHERE request_id=?", (ident,))
+        if busy >= MAX_LONG_JOBS:
+            con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+            return False
+        return True
+
+
+def next_retry_delay(*, root=ROOT, now=None):
+    now = time.time() if now is None else now
+    with database(root) as con:
+        due = con.execute(f"""SELECT min(p.retry_at) FROM delivery_parts p JOIN requests r ON r.id=p.request_id
+                    JOIN schedule s ON s.request_id=r.id WHERE r.state='queued' AND p.state='retry'
+                    AND {_CLAIMABLE}""", (MAX_LONG_JOBS,)).fetchone()[0]
+    return None if due is None else max(0, due - now)
 
 
 def begin_delivery(ident, part, fingerprint, *, root=ROOT, now=None):

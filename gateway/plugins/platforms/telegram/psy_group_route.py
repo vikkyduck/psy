@@ -143,7 +143,8 @@ async def quoted_material(uid, topic, quoted):
     mid = getattr(quoted, "message_id", None)
     saved = await asyncio.to_thread(store.message_source, uid, topic, mid)
     sender = getattr(quoted, "from_user", None)
-    bot_reply = getattr(sender, "id", None) == BOT
+    sender_id = getattr(sender, "id", None)
+    bot_reply = sender_id == BOT
     quote = quoted.text or quoted.caption or ""
     if saved:
         doc_id, answer, turn_id = saved
@@ -151,7 +152,11 @@ async def quoted_material(uid, topic, quoted):
         # A long Telegram answer is a document with no text in its envelope.
         if bot_reply and answer:
             quote = answer
-        return doc_id, doc, quote, turn_id if bot_reply else None
+        elif sender_id == uid and answer:
+            # A reply to the user's own original request can arrive while its analysis
+            # is writing. The queue waits for the parent, so include its finished answer.
+            quote = f"{quote}\n\nОтвет ПСИ на это сообщение:\n{answer}"
+        return doc_id, doc, quote, turn_id if sender_id in (BOT, uid) else None
     if bot_reply:
         # Mini App delivery is an original group-visible transcript. Unknown bot answers,
         # exported cabinet documents and other members' reply IDs never rebuild a binding.
@@ -176,7 +181,8 @@ async def group_message(msg):
         return
     uid = user.id
     topic = message_topic(msg)
-    destination = [msg.chat.id, uid, topic, getattr(msg, "message_id", None)]
+    mid = getattr(msg, "message_id", None)
+    destination = [msg.chat.id, uid, topic, mid]
     checkpoints = getattr(msg, "checkpoints", None)
     if checkpoints is not None:
         job = await asyncio.to_thread(checkpoints.get, "route:input:v1")
@@ -260,7 +266,8 @@ async def group_message(msg):
     if model["provider"] != "openai-codex":
         raise RuntimeError("wrong provider")
     if not source and not quoted:
-        active_id, options = await asyncio.to_thread(store.choices, uid, topic, mentions_material(question))
+        active_id, options = await asyncio.to_thread(store.choices, uid, topic, mentions_material(question),
+                                                     before_message_id=mid)
         if options:
             selected = await asyncio.to_thread(choose_source, question, options, active_id, model=model["default"])
             if selected == "clarify" or (selected is not None and
@@ -273,9 +280,9 @@ async def group_message(msg):
                 if source is None:
                     await msg.reply_text(choice_help(options))
                     return
-    mid = getattr(msg, "message_id", None)
     await asyncio.to_thread(store.set_current, uid, topic, doc_id, mid)
-    history = await asyncio.to_thread(store.history, uid, topic, source_id=doc_id, exclude_turn=quoted_turn)
+    history = await asyncio.to_thread(store.history, uid, topic, source_id=doc_id, exclude_turn=quoted_turn,
+                                      before_message_id=mid)
     research = command == "/research" or research_requested(question)
     draw = command == "/image" or bool(re.search(r"(?:нарисуй|сгенерируй\s+(?:изображение|картин\w*)|создай\s+(?:изображение|картин\w*))", question, re.I))
     job = dict(destination=destination, question=question, doc_id=doc_id, quote=quote, history=history,
@@ -307,8 +314,16 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
                 raise ValueError(UNLINKED_REPLY)
         sessions = [*job["history"], {"role": "user", "content": content(question, source, job["quote"])}]
         options = {"checkpoints": checkpoints} if checkpoints is not None else {}
-        result = await asyncio.to_thread(respond, sessions, research=job["research"], draw=job["draw"],
-                                         model=job["model"], question=question, **options)
+        generation = asyncio.create_task(asyncio.to_thread(
+            respond, sessions, research=job["research"], draw=job["draw"],
+            model=job["model"], question=question, **options))
+        try:
+            result = await asyncio.shield(generation)
+        except asyncio.CancelledError:
+            # A cancelled asyncio waiter cannot stop a thread writing checkpoints.
+            # Hold the worker lease until it finishes, then exit before delivery.
+            await asyncio.gather(generation, return_exceptions=True)
+            raise
         text, images = result.text, result.images
         if checkpoints is not None:
             final = {"text": text, "images": [base64.b64encode(img).decode("ascii") for img in images]}
@@ -366,6 +381,8 @@ async def process_group(msg):
     try:
         await group_message(msg)
         log.info("group action finished elapsed=%.1fs", time.monotonic() - start)
+    except store.GroupJobParked:
+        raise
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
         await error_reply(msg, exc.public())

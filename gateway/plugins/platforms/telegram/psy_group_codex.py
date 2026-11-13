@@ -32,7 +32,7 @@ SYSTEM = """Ты PSY, ассистент закрытой группы. Пиши
 # public research or assemble a book-length manuscript. No separate classifier
 # is needed for an ordinary answer, analytical questions included.
 DISPATCH = """
-Есть два специальных случая. Только в этих случаях вместо ответа верни одну строку PSY_TASK и JSON.
+В следующих случаях сначала верни одну строку PSY_TASK и JSON.
 1. Для полного текста лекции, выступления или занятия длительностью от 30 минут и особенно многочасовой лекции
 укажи {"minutes":180,"public_topic":"..."}. Подставь длительность из задачи в минутах, включая пересчет
 академических часов по 45 минут, если они явно академические. Для плана, краткого пересказа или отдельного
@@ -40,6 +40,9 @@ DISPATCH = """
 2. Для любого изложения тезисов конкретного автора, его исторических или научных понятий, публикации,
 научной дискуссии, сравнения школ, актуальных данных или явной просьбы о поиске, даже если речь
 идет о кратком ответе, укажи PSY_TASK {"public_topic":"..."}.
+3. Для глубокого разбора, который требует нескольких этапов или работы с большим материалом,
+укажи PSY_TASK {"analysis":true,"public_topic":""}. Если нужен также поиск, укажи публичную тему по правилу 2.
+На самостоятельный короткий вопрос отвечай сразу, даже если до этого в истории обсуждали лекцию.
 Для анализа личной записи достаточно самого материала, если не заказана сверка с внешними источниками.
 В public_topic сохрани наименования всех запрошенных направлений, авторов и произведений. Если
 темой служит конкретная статья, книга, доклад или исследование, добавь в JSON "read_main":true.
@@ -335,6 +338,14 @@ def respond(turns, *, research=False, draw=False, model, question=None, checkpoi
                         checkpoints=checkpoints)
 
 
+def _admit_long(checkpoints):
+    # Admission is attached only to durable group jobs. Direct CLI uses and isolated
+    # composition remain synchronous and have no shared group queue to reserve.
+    admit = getattr(checkpoints, "admit_long", None)
+    if admit is not None:
+        admit()
+
+
 def _respond(turns, *, research=False, draw=False, model, question=None, checkpoints=None):
     import httpx
     from agent.process_bootstrap import enable_happy_eyeballs_on_client
@@ -346,6 +357,7 @@ def _respond(turns, *, research=False, draw=False, model, question=None, checkpo
     if draw:
         # Invoke only the native image endpoint. All reference images are bytes from this
         # group's Telegram message, never arbitrary URLs, local paths or owner assets.
+        _admit_long(checkpoints)
         token, _ = _connection()
         plugin = importlib.import_module("plugins.image_gen.openai-codex")
         _, tier = plugin._resolve_model()
@@ -778,6 +790,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     write_prose = partial(call, prose=True)
     dispatch = SYSTEM + DISPATCH
     if research:
+        _admit_long(checkpoints)
         dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
                      "публичной темой. Если искать приватно нельзя, верни пустую public_topic.")
     try:
@@ -785,6 +798,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     except ModelIssue as exc:
         if exc.kind != "context":
             raise
+        _admit_long(checkpoints)
         turns = _map_source(call, turns, question)
         initial = call(turns, dispatch, prose=not research)
 
@@ -793,11 +807,15 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     if not isinstance(task, dict):
         if research:
             raise ModelIssue("unavailable", "research_dispatch")
+        if not initial.complete:
+            _admit_long(checkpoints)
         result = _complete(write_prose, turns, SYSTEM, initial=initial)
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
         return result
 
+    # Dispatch is already checkpointed. A parked job can resume at this point.
+    _admit_long(checkpoints)
     minutes = task.get("minutes")
     long_form = type(minutes) is int and minutes >= 30
     topic = task.get("public_topic")
