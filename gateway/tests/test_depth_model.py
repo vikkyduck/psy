@@ -33,6 +33,9 @@ class Depth(unittest.TestCase):
         bootstrap = types.ModuleType("agent.process_bootstrap")
         bootstrap.enable_happy_eyeballs_on_client = lambda client: None
         mods = patch.dict(sys.modules, {"httpx": httpx, "agent.process_bootstrap": bootstrap})
+        auth = patch.object(m, "_connection", return_value=("fixture", {}))
+        auth.start()
+        self.addCleanup(auth.stop)
         mods.start()
         self.addCleanup(mods.stop)
 
@@ -40,7 +43,7 @@ class Depth(unittest.TestCase):
         for q in ("merci", "Qu'est-ce qui laisse penser que sa position a changé ?"):
             result = m.Result("réponse", [], 0)
             with patch.object(m, "_stream", return_value=result) as stream:
-                self.assertEqual(m._compose(None, {}, [m._user(q)], False, "fake", q).text, "réponse")
+                self.assertEqual(m._compose(None, [m._user(q)], False, "fake", q).text, "réponse")
                 self.assertEqual(stream.call_count, 1)
                 self.assertFalse(stream.call_args.args[3])
                 self.assertIn("по умолчанию разбирай глубоко", stream.call_args.kwargs["instructions"])
@@ -51,7 +54,7 @@ class Depth(unittest.TestCase):
         turns = [m._user("secret-history"), {"role":"user", "content":[
             {"type":"input_text","text":q+"\n\nЦитата из этого чата:\nsecret-quote"},
             {"type":"input_text","text":"Материал: secret-name\nsecret-transcript"}]}]
-        def run(client, headers, messages, web, model, absolute, *, instructions):
+        def run(client, headers, messages, web, model, *, instructions):
             if m.DISPATCH in instructions:
                 return m.Result('PSY_TASK {"public_topic":"secret-private-topic"}', [], 0)
             if "Выдели только" in instructions:
@@ -71,7 +74,7 @@ class Depth(unittest.TestCase):
             self.assertIn("https://example.org", str(messages))
             return m.Result("Готово", [], 0)
         with patch.object(m, "_stream", side_effect=run):
-            result = m._compose(None, {}, turns, False, "fake", q)
+            result = m._compose(None, turns, False, "fake", q)
         self.assertEqual(result.searches, 2)
 
     def test_untraceable_sources_are_not_released_as_confirmed(self):
@@ -132,7 +135,7 @@ class Depth(unittest.TestCase):
         response.iter_lines.return_value = ["data: "+json.dumps(x) for x in events]
         client = Mock()
         client.stream.return_value = nullcontext(response)
-        res = m._stream(client, {}, [], research, "model", 180)
+        res = m._stream(client, {}, [], research, "model")
         payload = client.stream.call_args.kwargs["json"]
         self.assertNotIn("verbosity", str(payload))
         self.assertNotIn("max_output_tokens", payload)
@@ -173,7 +176,7 @@ class Depth(unittest.TestCase):
     def test_resume_waits_for_terminal_event_and_preserves_earlier_text(self):
         parts = [m.Result("first", [], 0, False),m.Result("last", [], 0, True)]
         with patch.object(m, "_stream", side_effect=parts) as stream:
-            r = m._compose(None, {}, [m._user("question")], False, "fake", "question")
+            r = m._compose(None, [m._user("question")], False, "fake", "question")
             self.assertEqual((r.text,r.complete),("first\nlast",True))
             self.assertIn("first", str(stream.call_args.args[2]))
         call = Mock(side_effect=m.ModelIssue("timeout","upstream"))

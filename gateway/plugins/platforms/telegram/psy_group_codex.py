@@ -111,8 +111,7 @@ ATTRIBUTION = """В излагаемых авторских позициях с�
 с повторной проверкой явно объясни, как положение подтверждается текстом и где граница проверки.
 Отличай свое сопоставление от прямого утверждения автора. Для позиций разных периодов указывай
 дату и работу. Если опоры недостаточно, прямо укажи границу проверки."""
-CUT_NOTE = "\n\n[Сохранена часть ответа. Модель не завершила его в доступное время.]"
-LONG_BUDGET = 1550
+CUT_NOTE = "\n\n[Сохранена часть ответа. Codex не продолжил текст с места обрыва.]"
 
 
 @dataclass
@@ -128,9 +127,9 @@ class Result:
         return self.searches > 0
 
 
-# Distinct idle/read and absolute budgets: keep a healthy long answer alive, but
-# do not let heartbeats or a broken upstream monopolize the durable FIFO forever.
-LIMITS = {False: (90, 360), True: (160, 690)}
+# HTTPX measures read timeouts between received bytes, including before the
+# first response. A lecture or research job has no deadline across reads/calls.
+READ_IDLE_SECONDS = {False: 90, True: 160}
 
 
 class ModelIssue(Exception):
@@ -140,7 +139,7 @@ class ModelIssue(Exception):
         "busy": "Codex временно ограничил частоту запросов. Попробуйте через минуту.",
         "signin": "Codex отклонил вход PSY. Владельцу бота нужно проверить подключение к подписке.",
         "access_wait": "PSY не успел получить доступ к Codex. Попробуйте через минуту.",
-        "timeout": "Codex не успел закончить ответ. Повторите запрос или разбейте его на части.",
+        "timeout": "От Codex перестали поступать данные. Повторите запрос.",
         "connection": "Соединение PSY с Codex прервалось до завершения ответа. Повторите запрос.",
         "unavailable": "Codex не завершил ответ. Попробуйте еще раз чуть позже.",
     }
@@ -337,14 +336,14 @@ def _respond(turns, *, research=False, draw=False, model, question=None):
     import httpx
     from agent.process_bootstrap import enable_happy_eyeballs_on_client
 
-    token, headers = _connection()
     if not draw:
         with httpx.Client(timeout=httpx.Timeout(120, connect=10), trust_env=False) as client:
             enable_happy_eyeballs_on_client(client)
-            return _compose(client, headers, turns, research, model, question)
+            return _compose(client, turns, research, model, question)
     if draw:
         # Invoke only the native image endpoint. All reference images are bytes from this
         # group's Telegram message, never arbitrary URLs, local paths or owner assets.
+        token, _ = _connection()
         plugin = importlib.import_module("plugins.image_gen.openai-codex")
         _, tier = plugin._resolve_model()
         current = turns[-1]["content"]
@@ -359,10 +358,9 @@ def _respond(turns, *, research=False, draw=False, model, question=None):
         return Result("", [base64.b64decode(encoded, validate=True)], False)
 
 
-def _stream(client, headers, turns, research, model, absolute, *, instructions=SYSTEM):
-    if absolute <= 0:
-        raise ModelIssue("timeout", "stream_deadline")
-    deadline = time.monotonic() + absolute
+def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None):
+    if read_idle is None:
+        read_idle = READ_IDLE_SECONDS[bool(research)]
     tools = [{"type": "web_search"}] if research else []
     payload = dict(model=model, instructions=instructions, input=turns, tools=tools,
                    store=False, stream=True,
@@ -370,7 +368,7 @@ def _stream(client, headers, turns, research, model, absolute, *, instructions=S
     if research:
         payload["include"] = ["web_search_call.action.sources"]
     with client.stream("POST", ENDPOINT + "/responses", headers=headers, json=payload,
-                       timeout=(min(10, absolute), min(LIMITS[bool(research)][0], absolute), min(60, absolute), min(10, absolute))) as response:
+                       timeout=(10, read_idle, 60, 10)) as response:
         if response.status_code != 200:
             try:
                 # Bound the error body and never log it or show it to a chat.
@@ -390,11 +388,11 @@ def _stream(client, headers, turns, research, model, absolute, *, instructions=S
         images = []
         written = {}
         for line in _lines(response):
-            if line is None or time.monotonic() > deadline:
+            if line is None:
                 partial = _written(written, commentary)
                 if partial and (not research or searches):
                     return Result(partial, images, searches, False)
-                raise ModelIssue("timeout", "stream_deadline")
+                raise ModelIssue("timeout", "stream_idle")
             if not line.startswith("data: ") or line == "data: [DONE]":
                 continue
             try:
@@ -699,7 +697,7 @@ def _verify_draft(call, result, evidence):
 
 
 def _complete(call, turns, instructions, *, initial=None):
-    """Resume documented output truncation. Keep prior work on an exhausted deadline."""
+    """Continue while the provider produces new text and preserve the draft on failure."""
     part = initial if initial is not None else call(turns, instructions)
     pieces = [part.text]
     while not part.complete:
@@ -709,6 +707,8 @@ def _complete(call, turns, instructions, *, initial=None):
                          _user("Продолжи точно с места обрыва, сохрани прежний жанр и задачу. "
                                "Не повторяй написанное, заверши оставшуюся работу.")], instructions)
         except ModelIssue as exc:
+            if exc.stage == "stream_empty":
+                return Result(prior, [], 0, False)
             if exc.kind not in ("timeout", "context", "connection", "busy", "quota", "signin", "access_wait"):
                 raise
             return Result(prior + "\n\n[Продолжение не завершено. " + exc.public() + "]", [], 0, False)
@@ -718,15 +718,13 @@ def _complete(call, turns, instructions, *, initial=None):
     return Result("\n".join(pieces), [], 0, part.complete and len(pieces) > 0)
 
 
-def _compose(client, headers, turns, research, model, question):
-    started = time.monotonic()
-    deadline = started + LIMITS[research][1]
-
+def _compose(client, turns, research, model, question):
     def call(messages, instructions, *, web=False):
-        # Each operation sees the same overall deadline, including retries and
-        # synthesis. A request that starts near the deadline gets a smaller idle timeout.
+        # The next stage may start after the original access token has expired.
+        # Resolve the same group's subscription again, using its locked refresh.
         with _transport():
-            return _stream(client, headers, messages, web, model, deadline - time.monotonic(), instructions=instructions)
+            _, headers = _connection()
+            return _stream(client, headers, messages, web, model, instructions=instructions)
 
     dispatch = SYSTEM + DISPATCH
     if research:
@@ -737,7 +735,6 @@ def _compose(client, headers, turns, research, model, question):
     except ModelIssue as exc:
         if exc.kind != "context":
             raise
-        deadline = started + LONG_BUDGET
         turns = _map_source(call, turns, question)
         initial = call(turns, dispatch)
 
@@ -753,10 +750,6 @@ def _compose(client, headers, turns, research, model, question):
 
     minutes = task.get("minutes")
     long_form = type(minutes) is int and minutes >= 30
-    if long_form:
-        deadline = started + LONG_BUDGET
-    else:
-        deadline = max(deadline, started + LIMITS[True][1])
     topic = task.get("public_topic")
     topic = topic.strip() if isinstance(topic, str) else ""
     if topic and _has_private_context(turns, question):
@@ -897,7 +890,7 @@ def choose_source(question, options, active_id, *, model):
         with httpx.Client(timeout=45, trust_env=False) as client:
             enable_happy_eyeballs_on_client(client)
             payload = {"question": question, "active": active_id, "options": options}
-            r = _stream(client, headers, [_user(json.dumps(payload, ensure_ascii=False))], False, model, 45, instructions=instructions)
+            r = _stream(client, headers, [_user(json.dumps(payload, ensure_ascii=False))], False, model, instructions=instructions, read_idle=45)
     data = _json_value(r.text) if r.complete else None
     if not isinstance(data, dict) or "source" not in data:
         return "clarify"

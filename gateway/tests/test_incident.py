@@ -42,18 +42,8 @@ class Incident(unittest.TestCase):
             client.stream.return_value=nullcontext(resp)
             resp.iter_bytes.return_value=[json.dumps({"error":err}).encode()]
             resp.iter_lines.return_value=['data: '+json.dumps({"type":"response.failed","response":{"error":err}})]
-            with self.assertRaises(m.ModelIssue) as caught:m._stream(client,{},[],False,"m",360)
+            with self.assertRaises(m.ModelIssue) as caught:m._stream(client,{},[],False,"m")
             self.assertEqual(caught.exception.kind,"quota")
             self.assertNotIn("sensitive",caught.exception.public())
         self.assertEqual(m._failure(429,{},"http").kind,"busy")
         self.assertEqual(m._failure(401,{},"http").kind,"signin")
-    def test_work_survives_old_deadline(self):
-        resp=Mock(status_code=200)
-        resp.iter_lines.return_value=['data: '+json.dumps({"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}),'data: {"type":"response.completed"}']
-        client=Mock()
-        client.stream.return_value=nullcontext(resp)
-        with patch.object(m.time,"monotonic",side_effect=[0,170,175]):
-            self.assertEqual(m._stream(client,{},[],False,"m",m.LIMITS[False][1]).text,"ok")
-        with patch.object(m.time,"monotonic",side_effect=[0,999]):
-            with self.assertRaises(m.ModelIssue) as caught:m._stream(client,{},[],False,"m",m.LIMITS[False][1])
-        self.assertEqual(caught.exception.stage,"stream_deadline")

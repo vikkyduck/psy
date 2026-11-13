@@ -1,4 +1,4 @@
-"""One bounded durable group worker. PTB can immediately dispatch the owner's next update."""
+"""One durable group worker with bounded admission and independent Telegram dispatch."""
 import asyncio
 import json
 import logging
@@ -37,18 +37,18 @@ class Outbound:
             raise DeliveryUncertain() from None
 
 
-async def typing(bot,msg):
+async def typing(bot, msg, finished):
     """Show "typing" in the group while a job runs. Idempotent: a failure never touches the job or its delivery state."""
     thread=msg.message_thread_id if msg.is_topic_message else None
     await asyncio.sleep(0.5)  # Fixed replies finish first and need no indicator.
-    for _ in range(463):  # The outer job deadline also cancels the typing indicator.
+    while not finished.is_set():
         try:
             await bot.send_chat_action(chat_id=msg.chat.id,action="typing",message_thread_id=thread,
                                        read_timeout=8,write_timeout=8,connect_timeout=8,pool_timeout=3)
         except Exception as exc:
             if getattr(exc,"retry_after",None) is not None:
                 return  # Flood control: stop the indicator for this job, the answer matters more.
-        if asyncio.current_task().cancelling():
+        if finished.is_set():
             return
         await asyncio.sleep(4.0)
 
@@ -78,21 +78,14 @@ async def work(app, wake):
         ident, body = item
         try:
             update=Update.de_json(json.loads(body),app.bot)
-            hint=asyncio.create_task(typing(app.bot,update.message),name="psy-group-typing")
+            finished = asyncio.Event()
+            hint = asyncio.create_task(typing(app.bot, update.message, finished), name="psy-group-typing")
             try:
-                await asyncio.wait_for(process_group(Outbound(update.message,ident)),timeout=1850)
+                await process_group(Outbound(update.message, ident))
             finally:
+                finished.set()
                 hint.cancel()
-        except TimeoutError:
-            if await asyncio.to_thread(store.state,ident) == "running":
-                try:
-                    await Outbound(update.message,ident).reply_text("Запрос занял слишком много времени. Повторите его с более узкой темой.")
-                except Exception:
-                    await asyncio.to_thread(store.settle,ident,False)
-                else:
-                    await asyncio.to_thread(store.settle,ident,True)
-            else:
-                await asyncio.to_thread(store.settle,ident,False)
+                await asyncio.gather(hint, return_exceptions=True)
         except asyncio.CancelledError:
             # Startup restores pre-send work and quarantines possible duplicate deliveries.
             raise
