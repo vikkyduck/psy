@@ -655,21 +655,25 @@ def _lecture(call, turns, minutes):
 Учебные случаи помечай как вымышленные. Различай работу самого автора и позднейшие интерпретации.
 Не утверждай, что материал занимает заказанное время, лишь на основании таймкодов плана."""
         result = _complete(call, draft_turns, instruction)
-        # If the model returned a short digest for a scheduled teaching block,
-        # expand it in-place once. If it still falls short, declare the actual
-        # coverage at delivery rather than claiming the duration of the plan.
-        if result.complete and _word_count(result.text) < words * 0.80:
+        # Keep the material already written. Rewriting an entire section to add
+        # its last few paragraphs often produces another equally short draft.
+        for _ in range(2):
+            missing = words - _word_count(result.text)
+            if not result.complete or missing <= max(30, words * .025):
+                break
             try:
                 revision = [*draft_turns, {"role": "assistant", "content": result.text},
-                            _user(f"Это пока {_word_count(result.text)} слов. Замени черновик полным текстом раздела, "
-                                  f"ориентир {words} произносимых слов. Разверни назначенный пример шаг за шагом. "
-                                  "Добавь разбор возможной ошибки слушателя и основания исправления. "
-                                  "Дай весь раздел, включая уже раскрытые части.")]
-                expanded = _complete(call, revision, instruction)
+                            _user(f"Напиши дополнительный фрагмент примерно на {missing + 40} произносимых слов "
+                                  "для чтения сразу после предыдущего фрагмента этого раздела. Дай конкретный новый "
+                                  "эпизод, альтернативную трактовку или разъяснение трудности по теме. "
+                                  "Верни только добавляемый текст, без повторного введения, пересказа и новой шапки.")]
+                expanded = _complete(call, revision, SYSTEM)
             except ModelIssue:
-                return result
-            if expanded.complete and _word_count(expanded.text) > _word_count(result.text):
-                result = expanded
+                break
+            addition = expanded.text.strip()
+            if not expanded.complete or not addition or addition in result.text:
+                break
+            result.text += "\n\n" + addition
         return result
 
     parts = []
@@ -706,7 +710,7 @@ def _lecture(call, turns, minutes):
                f"Время на работу слушателей по плану - {practice} мин.")
     if not complete:
         out.append("Сформирована часть рукописи. " + (first_failure.public() if first_failure else "Генерация прервалась."))
-    elif speech < (minutes - practice) * SPEECH_WORDS_PER_MINUTE * .90:
+    elif speech < (minutes - practice) * SPEECH_WORDS_PER_MINUTE * .95:
         out.append("Оценка по объему текста ниже времени речи, заложенного в план. "
                    "Для проведения занятия в полном объеме понадобится дополнительный материал.")
         complete = False

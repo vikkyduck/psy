@@ -146,6 +146,21 @@ class Depth(unittest.TestCase):
         self.assertIn("Материал Материал",r.text)
         self.assertIn("лимита",r.text)
 
+    def test_lecture_appends_missing_speech_without_replacing_the_draft(self):
+        plan = {"title":"Чтение", "sections":[
+            {"title":"Текст", "minutes":30, "activity_minutes":10, "brief":"пример"}]}
+        def call(turns, instructions):
+            if "редакционный" in instructions:
+                return m.Result(json.dumps(plan, ensure_ascii=False), [], 0)
+            if "только раздел 1" in instructions:
+                return m.Result("основа " * 1700, [], 0)
+            self.assertIn("только добавляемый текст", turns[-1]["content"])
+            return m.Result("продолжение " * 300, [], 0)
+        r = m._lecture(call, [m._user("рукопись")], 30)
+        self.assertTrue(r.complete)
+        self.assertEqual(r.text.count("основа"), 1700)
+        self.assertEqual(r.text.count("продолжение"), 300)
+
     def test_selector_is_toolless_and_rejects_unscoped_ids(self):
         opts=[{"id":16,"name":"пример"}]
         for value, expected in ((16,16),(17,"clarify"),(None,None),(True,"clarify")):
