@@ -154,7 +154,9 @@ class ModelRestart(unittest.TestCase):
             raise Interrupted()
         def restored(*args, instructions, **kwargs):
             inputs = args[2]
-            self.assertEqual(inputs[-2], {"role": "assistant", "content": kept.strip()})
+            expected_tail = kept.strip()[-model.CONTINUATION_TAIL_CHARS:]
+            self.assertEqual(inputs[-2], {"role": "assistant", "content": expected_tail})
+            self.assertNotIn(hidden.strip(), str(inputs))
             return model.Result("Restored ending.", [], 0)
         client = Mock()
         client.stream.return_value = nullcontext(Mock(status_code=200, iter_lines=events))

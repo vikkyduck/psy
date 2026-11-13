@@ -7,7 +7,7 @@
   "hermes_cli/psy_codex_incident.py": "ca64f2656d2767210a1ab78a1112c917f58f92f3a194d2d834f1150de8351350",
   "hermes_cli/psy_codex_policy.py": "bd8c030a836c2346a1256e824ecc5496be2e401a0f09ef44142f41f968ba4102",
   "psy_group_audio.py": "942c7a4dadae91727107afa8c73e2343e43df5add39298411d8586ef9ced0af0",
-  "psy_group_codex.py": "8893b8312eeae95fbbf1766d801b88ac3b0051da1d9b35122aae82e2833eb735",
+  "psy_group_codex.py": "0dc7aa42134afde7c0df322d3a8691a36f305aeb0a40c10a1ed45c39db0dbd2a",
   "psy_group_queue.py": "4c7800528ee7d467e5c1f0792a03a94458d19b02b2543d6cfa36a2e8e95bc6ac",
   "psy_group_route.py": "b7e341629f573556e4839e9fe3f265f3fb914f58eebba4adc4df1818d3943f3a",
   "psy_group_store.py": "2c33599f0e1ee5f0007ccba52867dd76b21c26d37d405285212b2468dbd467e2",

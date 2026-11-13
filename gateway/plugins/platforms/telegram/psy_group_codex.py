@@ -704,40 +704,120 @@ def _verify_draft(call, result, evidence):
     raise ModelIssue("unavailable", "source_edits")
 
 
-def _complete(call, turns, instructions, *, initial=None):
-    """Continue while the provider produces new text and preserve the draft on failure."""
-    part = initial if initial is not None else call(turns, instructions)
+CONTINUATION_TAIL_CHARS = 2048
+_CONTINUE = ("Продолжи точно с места обрыва, сохрани прежний жанр и задачу. "
+             "Не повторяй написанное, заверши оставшуюся работу.")
+
+
+def _stage_key(model, messages, instructions, web=False, prose=True):
+    request = json.dumps([model, web, prose, instructions, messages], ensure_ascii=False,
+                         sort_keys=True, separators=(",", ":")).encode()
+    return "model:v1:" + hashlib.sha256(request).hexdigest()
+
+
+def _overlap(tail, text):
+    """Longest suffix/prefix shared at the join, in linear time within the context window."""
+    prefix = text[:len(tail)]
+    if not prefix:
+        return 0
+    # None separates the two strings even if either contains arbitrary Unicode.
+    sequence = [*prefix, None, *tail]
+    lengths = [0] * len(sequence)
+    for i in range(1, len(sequence)):
+        matched = lengths[i - 1]
+        while matched and sequence[i] != sequence[matched]:
+            matched = lengths[matched - 1]
+        lengths[i] = matched + (sequence[i] == sequence[matched])
+    return lengths[-1]
+
+
+def _complete(call, turns, instructions, *, initial=None, continuation_call=None,
+              model=None, previous_chapter=None):
+    """Keep the full text locally. Each continuation sees only the current prose tail."""
+    if previous_chapter is not None:
+        # For a supplement the last turn is the missing obligation from editorial review.
+        full_chapter = {"role": "assistant", "content": previous_chapter}
+        tail = previous_chapter[-CONTINUATION_TAIL_CHARS:]
+        first_turns = [*turns[:-1], {"role": "assistant", "content": tail}, turns[-1]]
+        old_base = [*turns[:-1], full_chapter, turns[-1]]
+    else:
+        tail = ""
+        first_turns = old_base = turns
+
+    # The compact prompt can recur at different positions or after different chapters.
+    # Bind each durable block to the original stage and to all preceding local output.
+    if continuation_call is not None:
+        chain = hashlib.sha256(_stage_key(model, old_base, instructions).encode())
+    look_up_legacy = True
+
+    if initial is not None:
+        part = initial
+    elif previous_chapter is not None and continuation_call is not None:
+        part, look_up_legacy = continuation_call(first_turns, instructions, chain.hexdigest(),
+                                                 lambda: old_base)
+    else:
+        part = call(first_turns, instructions)
+
     pieces = [part.text]
+    separator = "\n" if tail else ""
+    seen = {hashlib.sha256(part.text.strip().encode()).digest()}
     while not part.complete:
-        prior = "\n".join(pieces)
+        # Limit each operand before concatenating. Only local assembly uses full pieces.
+        tail = (tail + separator + pieces[-1][-CONTINUATION_TAIL_CHARS:])[-CONTINUATION_TAIL_CHARS:]
+        continuation = [*turns, {"role": "assistant", "content": tail}, _user(_CONTINUE)]
+        legacy_hit = False
         try:
-            part = call([*turns, {"role": "assistant", "content": prior},
-                         _user("Продолжи точно с места обрыва, сохрани прежний жанр и задачу. "
-                               "Не повторяй написанное, заверши оставшуюся работу.")], instructions)
+            if continuation_call is None:
+                part = call(continuation, instructions)
+            else:
+                data = part.text.encode()
+                chain.update(len(data).to_bytes(8, "big"))
+                chain.update(data)
+
+                def legacy_prompt():
+                    return [*old_base, {"role": "assistant", "content": "".join(pieces)}, _user(_CONTINUE)]
+
+                part, legacy_hit = continuation_call(continuation, instructions, chain.hexdigest(),
+                                                     legacy_prompt if look_up_legacy else None)
+                look_up_legacy = legacy_hit
         except ModelIssue as exc:
+            prior = "".join(pieces)
             if exc.stage == "stream_empty":
                 return Result(prior, [], 0, False)
             if exc.kind not in ("timeout", "context", "connection", "busy", "quota", "signin", "access_wait"):
                 raise
             return Result(prior + "\n\n[Продолжение не завершено. " + exc.public() + "]", [], 0, False)
-        if not part.text.strip() or part.text.strip() in prior:
-            return Result(prior, [], 0, False)
-        pieces.append(part.text)
-    return Result("\n".join(pieces), [], 0, part.complete and len(pieces) > 0)
+
+        text = part.text
+        stripped = text.strip()
+        signature = hashlib.sha256(stripped.encode()).digest()
+        if not stripped or signature in seen or stripped in tail:
+            return Result("".join(pieces), [], 0, False)
+        seen.add(signature)
+        overlap = _overlap(tail, text)
+        separator = "\n"
+        if not legacy_hit and overlap >= 32:
+            separator = ""
+            text = text[overlap:]
+            if not text.strip():
+                return Result("".join(pieces), [], 0, False)
+        pieces.extend((separator, text))
+    return Result("".join(pieces), [], 0, True)
 
 
 def _compose(client, turns, research, model, question, *, checkpoints=None):
-    def call(messages, instructions, *, web=False, prose=False):
-        # All expensive stages go through this boundary, including parallel chapters.
-        # Replaying completed calls reconstructs the validated plan, ordered sections,
-        # source cards and edits without querying the model or repeating web searches.
-        if checkpoints is not None:
-            request = json.dumps([model, web, prose, instructions, messages], ensure_ascii=False,
-                                 sort_keys=True, separators=(",", ":")).encode()
-            key = "model:v1:" + hashlib.sha256(request).hexdigest()
-            saved = checkpoints.get(key)
+    def cached(key):
+        saved = checkpoints.get(key)
+        if saved is not None:
+            return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]))
+
+    def call(messages, instructions, *, web=False, prose=False, key=None):
+        # Replaying completed stages reconstructs the plan, source cards and edits locally.
+        if checkpoints is not None and key is None:
+            key = _stage_key(model, messages, instructions, web, prose)
+            saved = cached(key)
             if saved is not None:
-                return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]))
+                return saved
 
         def save(result):
             checkpoints.put(key, {"text": result.text, "searches": result.searches,
@@ -768,7 +848,20 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
             save(result)
         return result
 
-    write_prose = partial(call, prose=True)
+    def continuation_call(messages, instructions, digest, legacy_prompt):
+        key = "prose:v2:" + digest
+        saved = cached(key)
+        if saved is not None:
+            # Legacy results are left under their v1 keys, so a v2 hit is always new.
+            return saved, False
+        if legacy_prompt is not None:
+            saved = cached(_stage_key(model, legacy_prompt(), instructions))
+            if saved is not None:
+                return saved, True
+        return call(messages, instructions, prose=True, key=key), False
+
+    write_prose = partial(_complete, partial(call, prose=True), model=model,
+                          continuation_call=continuation_call if checkpoints is not None else None)
     dispatch = SYSTEM + DISPATCH
     if research:
         _admit_long(checkpoints)
@@ -802,7 +895,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
             raise ModelIssue("unavailable", "research_dispatch")
         if not initial.complete:
             _admit_long(checkpoints)
-        result = _complete(write_prose, turns, SYSTEM, initial=initial)
+        result = write_prose(turns, SYSTEM, initial=initial)
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
         return result
@@ -828,7 +921,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     if long_form:
         result = _lecture(call, turns, minutes, write_prose=write_prose)
     else:
-        result = _complete(write_prose, turns, SYSTEM + "\nВыполни исходный запрос целиком по доступным материалам."
+        result = write_prose(turns, SYSTEM + "\nВыполни исходный запрос целиком по доступным материалам."
                            + ("\n" + ATTRIBUTION if sources else ""))
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
@@ -956,7 +1049,7 @@ def _lecture(call, turns, minutes, *, write_prose=None):
 авторов понятия, атрибуцию и учебную цель. Если участник сам задал объем всей рукописи, распредели его
 между разделами в плане. В остальных случаях планируй по содержанию. Ссылки должны быть из проверенных материалов."""
     if write_prose is None:
-        write_prose = call
+        write_prose = partial(_complete, call)
     plan = None
     for attempt in range(2):
         response = call(turns, planning)
@@ -986,7 +1079,7 @@ def _lecture(call, turns, minutes, *, write_prose=None):
 При нуле минут на практику такие вставки не нужны. Ссылки у соответствующих тезисов.
 Различай работу самого автора и позднейшие интерпретации.
 Не утверждай, что материал занимает заказанное время, лишь на основании таймкодов плана."""
-        result = _complete(write_prose, draft_turns, instruction)
+        result = write_prose(draft_turns, instruction)
         if not result.complete:
             return result
         # Review the actual manuscript in the context of the original request.
@@ -1004,10 +1097,10 @@ def _lecture(call, turns, minutes, *, write_prose=None):
                 raise ModelIssue("unavailable", "lecture_review")
             missing = verdict["missing"].strip()
             if missing:
-                supplement = _complete(write_prose, [*review_turns, _user(
+                supplement = write_prose([*draft_turns, _user(
                     "Напиши только недостающий фрагмент в форме речи преподавателя. "
                     "Дополнение должно читаться сразу после готового текста, без повтора и служебных отметок. "
-                    "Вопрос для раскрытия:\n" + missing)], SYSTEM + "\n" + ATTRIBUTION)
+                    "Вопрос для раскрытия:\n" + missing)], SYSTEM + "\n" + ATTRIBUTION, previous_chapter=result.text)
                 addition = supplement.text.strip()
                 if not addition or addition in result.text:
                     raise ModelIssue("unavailable", "lecture_supplement")
