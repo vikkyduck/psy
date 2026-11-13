@@ -8,8 +8,8 @@ DEPLOY = Path("/usr/local/lib/psy-group")
 PLATFORM = Path("/home/hermes/.hermes/hermes-agent/plugins/platforms/telegram")
 EXPECTED = {
     "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py",
-    "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py",
-    "psy_group_queue.py", "psy_local_media.py", "psy_upload_handoff.py",
+    "psy_source_evidence.py", "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py",
+    "psy_group_queue.py", "psy_local_media.py", "psy_upload_handoff.py", "hermes_cli/psy_codex_policy.py",
 }
 
 def verify():
@@ -17,7 +17,8 @@ def verify():
     if set(manifest) != EXPECTED:
         raise ValueError()
     for name in EXPECTED:
-        if hashlib.sha256((PLATFORM/name).read_bytes()).hexdigest() != manifest[name]:
+        path = PLATFORM.parents[2]/name if name == "hermes_cli/psy_codex_policy.py" else PLATFORM/name
+        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest[name]:
             raise ValueError()
     source = (PLATFORM/"adapter.py").read_text()
     flow = ('builder.application_class(TelegramApplication, {"adapter": self})',

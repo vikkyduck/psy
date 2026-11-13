@@ -9,12 +9,15 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "gateway"))
+from hermes_cli import psy_codex_policy as policy
 import psy_codex_auth as guard
 
 
 class ProviderError(Exception):
     def __init__(self, code):
         self.code = code
+        self.oauth_refresh_status = 400 if code == "invalid_grant" else None
         self.relogin_required = code in {"invalid_grant", "refresh_token_expired"}
 
 
@@ -61,6 +64,9 @@ class TestCodexMaintenance(unittest.TestCase):
         modules = {key: ModuleType(key) for key in (
             "hermes_cli", "hermes_cli.auth", "hermes_cli.auth_constants", "hermes_cli.auth_codex",
         )}
+        modules["hermes_cli"].psy_codex_policy = policy
+        modules["hermes_cli.auth_codex"]._codex_pool_route_base_url = lambda base: base
+        modules["hermes_cli.auth_constants"].httpx = SimpleNamespace(RequestError=ConnectionError)
         modules["hermes_cli.auth"]._auth_store_lock = lock
         modules["hermes_cli.auth"]._load_auth_store = lambda: copy.deepcopy(self.store)
         modules["hermes_cli.auth"]._save_auth_store = self.save
@@ -113,9 +119,10 @@ class TestCodexMaintenance(unittest.TestCase):
             with self.assertRaisesRegex(guard.CheckError, "owner login required"):
                 guard.maintain()
         self.refresh.assert_called_once()
-        self.save.assert_not_called()
-        self.assertEqual(self.store, before)
-        self.assertNotIn("first-grant", guard.REJECTED.read_text())
+        self.save.assert_called_once()
+        rows = self.store["credential_pool"][guard.PROVIDER]
+        self.assertEqual(rows[0], before["credential_pool"][guard.PROVIDER][0])
+        self.assertEqual(rows[1]["last_status"], "dead")
 
     def test_transient_failure_preserves_grant_for_next_run(self):
         self.due()
@@ -144,6 +151,27 @@ class TestCodexMaintenance(unittest.TestCase):
         self.assertNotIn("untrusted", str(caught.exception))
         error.oauth_refresh_category = "http_error"
         self.assertEqual(guard.renewal_detail(error), " (HTTP 503, http_error)")
+
+    def test_scheduled_renewal_updates_exact_alias_but_not_independent_login(self):
+        self.store["credential_pool"][guard.PROVIDER].append(dict(self.primary, id="legacy", priority=2))
+        self.due()
+        guard.maintain()
+        rows = self.store["credential_pool"][guard.PROVIDER]
+        self.assertEqual(rows[0]["refresh_token"], "other-grant")
+        self.assertEqual([r["refresh_token"] for r in rows[1:]], ["next-grant", "next-grant"])
+        self.refresh.assert_called_once()
+        self.save.assert_called_once()
+
+    def test_monitor_rejects_ambiguous_priorities_and_overridden_route(self):
+        self.store["credential_pool"][guard.PROVIDER][0]["priority"] = 0
+        with self.assertRaisesRegex(guard.CheckError, "ambiguous"):
+            guard.maintain()
+        self.store["credential_pool"][guard.PROVIDER][0]["priority"] = 1
+        with patch.object(sys.modules["hermes_cli.auth_codex"], "_codex_pool_route_base_url", return_value="http://example.invalid"):
+            with self.assertRaisesRegex(guard.CheckError, "owner login required"):
+                guard.maintain()
+        self.probe.assert_not_called()
+        self.refresh.assert_not_called()
 
     def test_server_error_cannot_quarantine_a_renewable_grant(self):
         self.due()

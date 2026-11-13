@@ -13,6 +13,11 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 from urllib.parse import urlsplit, urlunsplit
 
+if __package__:
+    from .psy_source_evidence import EvidenceReader, public_topic
+else:
+    from psy_source_evidence import EvidenceReader, public_topic
+
 ENDPOINT = "https://chatgpt.com/backend-api/codex"
 SYSTEM = """Ты PSY, ассистент закрытой группы. Пиши по-русски, если участник не просил другой язык.
 Определяй по смыслу, какую работу заказал участник, включая косвенные формулировки и уточнения на других языках.
@@ -76,6 +81,7 @@ CENTRAL_READING = """Прочитай через веб только основ�
 связью действующих факторов, результатом, оговоркой и локатором. В группе записей укажи одно и
 то же название серии, порядковый номер (от 1) и полное число элементов. Для самостоятельного
 тезиса number=total=1. Не используй заголовки поисковой выдачи как структуру оригинала.
+Для support выпиши 4-25 смежных слов на языке оригинала дословно, без многоточий.
 Верни JSON {"scope":"автор, работа, год, какие страницы удалось прочитать",
 "items":[{"name":"конкретное название элемента","series":"серия или тема тезиса",
 "number":1,"total":1,"author":"...","work":"...","date":"...","url":"https://...",
@@ -88,6 +94,7 @@ SOURCE_CHECK = """Независимо перепроверь библиогра
 Открой конкретные авторские тексты, проверь формулировку в контексте, исправь или исключи ошибки
 первой подборки. Ищи недостающие первичные публикации и подходящие издания. Сохрани существенные
 особенности каждого авторского примера, хронологию и точное отношение понятий, в том числе исключения.
+Для support выпиши 4-25 смежных слов на языке оригинала дословно, без многоточий.
 Верни JSON {"claims":[{"author":"...","work":"...","date":"...","url":"https://...",
 "location":"страница или иной точный ориентир","support":"короткая цитата из оригинала",
 "claim":"проверенное положение и его границы","access":"full_text или excerpt"}],
@@ -181,25 +188,10 @@ def _failure(status, detail, stage):
     return ModelIssue("unavailable", "upstream" if type(status) is int and 500 <= status < 600 else stage)
 
 
-class CredentialIssue(Exception):
-    def __init__(self, kind):
-        super().__init__(kind)
-        self.kind = kind
+from hermes_cli import psy_codex_policy as codex_policy
 
-
-_GROUP_CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+CredentialIssue = codex_policy.CredentialIssue
 _GROUP_AUTH_MARKERS = "/var/lib/psy-codex-auth"
-
-
-def _group_grant_rejected(name, value):
-    from hashlib import sha256
-    from pathlib import Path
-
-    try:
-        saved = (Path(_GROUP_AUTH_MARKERS) / name).read_text().strip()
-    except FileNotFoundError:
-        return False
-    return saved == sha256(value.encode()).hexdigest()
 
 
 def _group_subscription_cooldown(row):
@@ -230,105 +222,54 @@ def _group_subscription_cooldown(row):
             and reset - started >= 3600 and started + 300 <= time.time() < reset)
 
 
-def _group_auth_recovery(row, token):
-    recovery = row.get("psy_model_auth_recovery")
-    if (isinstance(recovery, dict) and isinstance(recovery.get("retry_at"), (float, int))
-            and recovery["retry_at"] > time.time() and recovery.get("bearer") == hashlib.sha256(token.encode()).hexdigest()):
-        return recovery.get("kind")
-
-
-def _record_group_auth_recovery(row, kind, seconds):
-    row["psy_model_auth_recovery"] = {
-        "kind": kind, "bearer": hashlib.sha256(row["access_token"].encode()).hexdigest(),
-        "retry_at": time.time() + seconds,
-    }
-
-
-def _group_primary(store):
-    import math
-    from hermes_cli.auth_codex import _codex_pool_row_available, _codex_pool_route_base_url
-    from hermes_cli.auth_constants import _decode_jwt_claims
-
-    provider = "openai-codex"
-    rows = (store.get("credential_pool") or {}).get(provider) or []
-    preferred = [r for r in rows if isinstance(r, dict) and type(r.get("priority")) is int and r["priority"] == 0]
-    if len(preferred) != 1 or ((store.get("providers") or {}).get(provider) or {}).get("tokens"):
-        raise CredentialIssue("signin")
-    row = preferred[0]
-    token, grant = row.get("access_token"), row.get("refresh_token")
-    base = row.get("base_url") or _GROUP_CODEX_BASE
-    if (not row.get("id") or row.get("source") != "manual:device_code" or row.get("auth_type") != "oauth"
-            or base.rstrip("/") != _GROUP_CODEX_BASE or _codex_pool_route_base_url(base).rstrip("/") != _GROUP_CODEX_BASE
-            or row.get("last_status") == "dead" or not isinstance(token, str) or not token
-            or not isinstance(grant, str) or not grant):
-        raise CredentialIssue("signin")
-    if _group_grant_rejected("rejected", grant) or _group_grant_rejected("account-denied", token):
-        raise CredentialIssue("signin")
-    if _group_auth_recovery(row, token) == "access_wait":
-        raise CredentialIssue("access_wait")
-    sole = sum(isinstance(r, dict) and r.get("last_status") != "dead" for r in rows) <= 1
-    if not _codex_pool_row_available(row, sole) and not _group_subscription_cooldown(row):
-        raise CredentialIssue("access_wait")
-    expiry = _decode_jwt_claims(token).get("exp")
-    if type(expiry) not in (int, float) or not math.isfinite(expiry) or expiry <= 0:
-        raise CredentialIssue("signin")
-    return row, expiry
-
-
 def get_credentials(rejected_bearer=None):
-    import time
+    from pathlib import Path
     import httpx
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
-    from hermes_cli.auth_codex import refresh_codex_oauth_pure
-    from hermes_cli.auth_constants import AuthError
+    from hermes_cli.auth import _load_auth_store
+    from hermes_cli.auth_codex import _codex_pool_row_available
+
+    markers = Path(_GROUP_AUTH_MARKERS)
+    def admit(store, row, _expiry):
+        if (codex_policy.legacy_marker(markers / "rejected", row["refresh_token"])
+                or codex_policy.legacy_marker(markers / "account-denied", row["access_token"])):
+            raise CredentialIssue("signin", "preferred login refused")
+        recovery = codex_policy.group_recovery(row)
+        if recovery in ("access_wait", "signin"):
+            raise CredentialIssue(recovery, "model authorization recovery pending")
+        if rejected_bearer == row["access_token"] and recovery == "renewed":
+            raise CredentialIssue("signin", "model refused renewed bearer")
+        rows = store["credential_pool"][codex_policy.PROVIDER]
+        sole = sum(isinstance(r, dict) and r.get("last_status") != "dead" for r in rows) <= 1
+        if not _codex_pool_row_available(row, sole) and not _group_subscription_cooldown(row):
+            raise CredentialIssue("access_wait", "preferred login in cooldown")
 
     try:
-        observed, expiry = _group_primary(_load_auth_store())
-        row = observed
-        if expiry <= time.time() + 300 or observed["access_token"] == rejected_bearer:
-            with _auth_store_lock(timeout_seconds=35):
-                store = _load_auth_store()
-                row, expiry = _group_primary(store)
-                if row["id"] != observed["id"]:
-                    raise CredentialIssue("access_wait")
-                rejected = row["access_token"] == rejected_bearer
-                if expiry <= time.time() + 300 or rejected:
-                    if any(row[k] != observed[k] for k in ("access_token", "refresh_token")):
-                        raise CredentialIssue("access_wait")
-                    # Concurrent questions may also receive a 401 on the replacement
-                    # bearer. A model rejection alone cannot revoke a refresh grant.
-                    if rejected and _group_auth_recovery(row, rejected_bearer) == "renewed":
-                        raise CredentialIssue("signin")
-                    # This deployment has independent manual logins. A duplicated
-                    # single-use grant needs the Hermes alias-aware recovery path.
-                    if any(r is not row and isinstance(r, dict) and r.get("refresh_token") == row["refresh_token"]
-                           for r in store["credential_pool"]["openai-codex"]):
-                        raise CredentialIssue("access_wait")
-                    try:
-                        updated = refresh_codex_oauth_pure(row["access_token"], row["refresh_token"])
-                    except AuthError as exc:
-                        # A challenge or transport error can also set relogin_required.
-                        # Permanently quarantine only an explicit rejected grant.
-                        if (exc.relogin_required and getattr(exc, "oauth_refresh_status", None) in (400, 401, 403)
-                                and exc.code in {"invalid_grant", "invalid_token", "refresh_token_expired",
-                                                 "refresh_token_reused", "refresh_token_invalidated"}):
-                            row.update(last_status="dead", last_status_at=time.time(), last_error_reason=exc.code,
-                                       last_error_code=None, last_error_message="Codex OAuth grant rejected")
-                            _save_auth_store(store)
-                            raise CredentialIssue("signin") from None
-                        _record_group_auth_recovery(row, "access_wait", 60)
-                        _save_auth_store(store)
-                        raise CredentialIssue("access_wait") from None
-                    row.update({k: updated[k] for k in ("access_token", "refresh_token", "last_refresh")})
-                    if rejected:
-                        _record_group_auth_recovery(row, "renewed", 300)
-                    _save_auth_store(store)
-                    row, expiry = _group_primary(store)
-                    if expiry <= time.time():
-                        raise CredentialIssue("access_wait")
-        return {"provider": "openai-codex", "base_url": _GROUP_CODEX_BASE, "api_key": row["access_token"]}
+        store = _load_auth_store()
+        row, expiry = codex_policy.preferred(store)
+        admit(store, row, expiry)
+        rejected = rejected_bearer == row["access_token"]
+        if rejected or expiry <= time.time() + 300:
+            try:
+                row, expiry, changed = codex_policy.renew(
+                    row, check=admit, rejected_file=markers / "rejected", model_rejected=rejected)
+            except CredentialIssue as exc:
+                # A temporary proactive renewal failure need not interrupt a live bearer.
+                if rejected or expiry <= time.time() or not exc.may_use_current:
+                    raise
+            else:
+                if not changed:
+                    # Re-evaluate markers and admission when a peer supplied the generation.
+                    latest = _load_auth_store()
+                    current, expiry = codex_policy.preferred(latest)
+                    if current["id"] != row["id"]:
+                        raise CredentialIssue("access_wait", "preferred login changed")
+                    row = current
+                    admit(latest, row, expiry)
+                if expiry <= time.time():
+                    raise CredentialIssue("access_wait", "Codex login expired")
+        return {"provider": codex_policy.PROVIDER, "base_url": codex_policy.BASE, "api_key": row["access_token"]}
     except (OSError, httpx.RequestError):
-        raise CredentialIssue("access_wait") from None
+        raise CredentialIssue("access_wait", "credential store unavailable") from None
 
 
 def _credentials(rejected_bearer=None):
@@ -665,17 +606,22 @@ def _source_page(url):
         return None
 
 
-def _source_card(entry, pages):
+def _source_card(entry, pages, reader):
     fields = ("author", "work", "date", "location", "support", "claim", "url", "access")
     if not isinstance(entry, dict) or not all(isinstance(entry.get(k), str) and entry[k].strip() for k in fields):
         return None
     page = _source_page(entry["url"])
     if page and page in pages and entry["access"] in ("full_text", "excerpt"):
-        return {key: entry[key] for key in fields}
+        locator = reader.locate(entry["url"], entry["support"], entry["location"], entry["author"], entry["work"])
+        if locator:
+            # Only the located excerpt was checked. Bibliographic interpretation
+            # is still subject to the separate editorial review.
+            return dict({key: entry[key] for key in fields}, location=locator[0], context=locator[1], access="excerpt")
     return None
 
 
-def _read_central_work(call, subject):
+def _read_central_work(call, subject, reader=None):
+    reader = reader or EvidenceReader()
     messages = [_user(subject)]
     collected = {}
     series_sizes = {}
@@ -692,7 +638,7 @@ def _read_central_work(call, subject):
         gaps = [x for x in missing if isinstance(x, str) and x.strip()] if isinstance(missing, list) else []
         items = document.get("items")
         for entry in items if isinstance(items, list) else ():
-            card = _source_card(entry, pages)
+            card = _source_card(entry, pages, reader)
             if not card:
                 continue
             series, n, size = entry.get("series"), entry.get("number"), entry.get("total")
@@ -716,6 +662,7 @@ def _read_central_work(call, subject):
 
 
 def _primary_sources(call, topic, *, read_main=False):
+    reader = EvidenceReader()
     bibliography = reading_list(topic)
     central, central_gaps, searches = [], [], 0
     public = [_user(topic)]
@@ -725,7 +672,7 @@ def _primary_sources(call, topic, *, read_main=False):
         # Both readers start independently. Only the sanitised public topic or the
         # known primary title and its page locations reaches the dedicated reader.
         with ThreadPoolExecutor(max_workers=2) as pool:
-            original = pool.submit(_read_central_work, call, central_reading_subject(topic))
+            original = pool.submit(_read_central_work, call, central_reading_subject(topic), reader)
             notes = call(public, WEB_SYSTEM, web=True)
             central, central_gaps, searches = original.result()
     else:
@@ -749,7 +696,7 @@ def _primary_sources(call, topic, *, read_main=False):
             gaps = [x for x in missing if isinstance(x, str) and x.strip()]
         claims = verified.get("claims")
         for entry in claims if isinstance(claims, list) else ():
-            card = _source_card(entry, pages)
+            card = _source_card(entry, pages, reader)
             if card:
                 if card not in accepted:
                     accepted.append(card)
@@ -769,7 +716,7 @@ def _primary_sources(call, topic, *, read_main=False):
                   "не удалось. Можно повторить поиск или предоставить текст публикации.", [], searches, False)
 
 
-REVIEW = """Выполни независимую сверку готового текста с карточками первоисточников.
+REVIEW = """Выполни независимую сверку готового текста. В карточке support - дословный фрагмент, context - его проверенное окружение. Поле claim является предложенной интерпретацией. Для каждого вывода проверь, подтверждает ли фрагмент смысл, авторство и дату, сними необоснованную атрибуцию.
 Пройди ВЕСЬ текст, в том числе заголовки и последние выводы. Для каждой атрибуции сравни автора,
 дату, оба связанных термина, направление отношения, качество доступа, локатор. Проверь, совпадают
 ли формулировки в разных частях ответа. Сопоставь пересказ иллюстрации с ходом и результатом
@@ -928,28 +875,16 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     _admit_long(checkpoints)
     minutes = task.get("minutes")
     long_form = type(minutes) is int and minutes >= 30
-    topic = task.get("public_topic")
-    topic = topic.strip() if isinstance(topic, str) else ""
-    if topic and _has_private_context(turns, question):
-        # Discard the proposed topic derived from context. A fresh model sees
-        # the user's own current instruction ONLY. Never put a file name, quote,
-        # previous answer or transcript in the search-enabled model's input.
-        prompt = """Выдели только общеизвестное произведение, публичного автора или область научного
-исследования, которую участник явно поручил исследовать. Удали любые персональные или контактные данные,
-детали случая, цитаты, веб-адреса и приватные названия. Не угадывай тему по словам "он", "выше", "текст",
-"это", "этот случай". Если публичная тема не названа, верни пустую строку. Ответ строго JSON: {"topic":""}."""
-        safe = _json_value(call([_user(question)], prompt).text) if question else {}
-        topic = safe.get("topic") if isinstance(safe, dict) else ""
-    if not isinstance(topic, str) or re.search(r"[@:/\\\n\r]|\d[()\s-]*\d[()\s-]*\d[()\s-]*\d[()\s-]*\d", topic) or len(topic) > 350:
-        topic = ""
+    wants_sources = bool(task.get("public_topic")) or research
+    topic = public_topic(question) if wants_sources else ""
     sources = None
     if topic.strip():
         sources = _primary_sources(call, topic.strip(), read_main=long_form or task.get("read_main") is True)
         if not sources.complete:
             return sources
-    elif research:
-        return Result("Укажите публичную тему, автора или название работы для поиска. "
-                      "Детали личного материала останутся внутри разбора.", [], 0)
+    elif wants_sources:
+        return Result("Для проверки источников начните сообщение со строки 'Публичная тема: название работы или предмет поиска'. "
+                      "Только текст этой строки будет использован для внешнего поиска.", [], 0)
 
     if sources:
         # Source evidence is untrusted data, never privileged instructions.
@@ -967,6 +902,8 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
         except ModelIssue as exc:
             result = _recover_verified(call, result, sources, exc)
         result.searches = sources.searches
+    elif wants_sources:
+        result.text += "\n\nПоиск первоисточников не выполнялся. Для внешней сверки начните сообщение со строки Публичная тема: название работы или предмет поиска."
     return result
 
 
@@ -988,21 +925,10 @@ def _recover_verified(call, result, sources, issue):
             return Result(text, [], sources.searches, all_verified)
     cards = json.loads(sources.text)["claims"]
     output = ["Проверка готового ответа по первоисточникам не завершена. " + issue.public(),
-              "Подтвержденные положения из прочитанных источников:"]
+              "Найденные дословные фрагменты и их местоположение:"]
     for card in cards:
-        output.append(f"{card['claim']} ({card['author']}, {card['work']}, {card['date']}, "
-                      f"{card['location']}). {card['url']}")
+        output.append(f"{card['support']} ({card['location']}). {card['url']}")
     return Result("\n\n".join(output), [], sources.searches, False)
-
-
-def _has_private_context(turns, question):
-    if len(turns) != 1:
-        return True
-    content = turns[0].get("content")
-    if not isinstance(content, list):
-        return question is None or content != question
-    return (len(content) != 1 or content[0].get("type") != "input_text"
-            or content[0].get("text") != question)
 
 
 def _map_source(call, turns, question):
@@ -1212,11 +1138,12 @@ def _valid_plan(plan, minutes):
 
 def central_reading_subject(topic):
     if _repression_assignment(topic):
+        edition = "https://www.freudedition.net/en/werke/die-verdrangung/druckschrift"
         base = "https://www.psychanalyse.lu/Freud/FreudVerdrangung.pdf"
         pages = "\n".join(f"{base}#page={page}" for page in (1, 4, 6, 7, 8))
         return ("Sigmund Freud, Die Verdrängung (1915), весь текст, с. 1-8 PDF. "
                 "Проверь полную последовательность оригинала, включая все элементы ряда с. 6-8. "
-                "Открывай нужные страницы PDF в одном пакете, если инструмент допускает.\n" + pages)
+                "Открывай нужные страницы PDF в одном пакете, если инструмент допускает. При недоступном PDF открой полнотекстовое первое издание:\n" + edition + "\n" + pages)
     return topic
 
 
@@ -1231,6 +1158,7 @@ def reading_list(topic):
     if not _repression_assignment(topic):
         return ""
     sources = [
+        ("Sigmund Freud, Die Verdrängung. Erstveröffentlichung 1915, vollständige Transkription", "https://www.freudedition.net/en/werke/die-verdrangung/druckschrift"),
         ("Sigmund Freud, Die Verdrängung (1915), PDF pp. 1-8, pp. 6-8", "https://www.psychanalyse.lu/Freud/FreudVerdrangung.pdf#page=6"),
         ("Sigmund Freud, Hemmung, Symptom und Angst (1926), IV", "https://www.psychanalyse.lu/Freud/FreudHSA.pdf#page=14"),
     ]

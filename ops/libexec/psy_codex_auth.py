@@ -1,5 +1,4 @@
 """Check PSY's preferred Codex login. Never print credentials or response bodies."""
-import hashlib
 import logging
 import os
 import sys
@@ -18,10 +17,6 @@ class CheckError(Exception):
     """Only fixed operational messages may be put in this exception."""
 
 
-def fingerprint(value):
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
 def renewal_detail(error):
     status = getattr(error, "oauth_refresh_status", None)
     category = getattr(error, "oauth_refresh_category", None)
@@ -34,25 +29,6 @@ def renewal_detail(error):
                     "http_error", "invalid_response"):
         details.append(category)
     return " (" + ", ".join(details) + ")" if details else ""
-
-
-def primary(store):
-    from hermes_cli.auth_constants import _decode_jwt_claims
-    rows = store.get("credential_pool", {}).get(PROVIDER, [])
-    preferred = [r for r in rows if r.get("priority") == 0]
-    if len(preferred) != 1:
-        raise CheckError("preferred Codex credential missing or ambiguous")
-    row = preferred[0]
-    if (row.get("source") != "manual:device_code" or row.get("auth_type") != "oauth"
-            or (row.get("base_url") or BASE).rstrip("/") != BASE
-            or (store.get("providers", {}).get(PROVIDER) or {}).get("tokens")):
-        raise CheckError("credential layout changed; review before renewing")
-    if row.get("last_status") == "dead" or not row.get("refresh_token"):
-        raise CheckError("preferred login needs owner authorization")
-    expiry = _decode_jwt_claims(row.get("access_token")).get("exp")
-    if not isinstance(expiry, (int, float)) or expiry <= 0:
-        raise CheckError("preferred credential has no usable expiration")
-    return row, expiry
 
 
 class AccountCheck(NamedTuple):
@@ -133,60 +109,34 @@ def check_provider(access):
 
 
 def maintain(force=False):
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
-    from hermes_cli.auth_codex import _entry_is_rate_limit_exhausted, refresh_codex_oauth_pure
-    from hermes_cli.auth_constants import AuthError
+    from hermes_cli import psy_codex_policy as policy
+    from hermes_cli.auth import _load_auth_store
+    from hermes_cli.auth_codex import _entry_is_rate_limit_exhausted
 
-    row, expiry = primary(_load_auth_store())
-    observed = row["access_token"]
-    checked = observed
+    def admit(store, row, expiry):
+        if _entry_is_rate_limit_exhausted(row) and expiry <= time.time() + 120:
+            raise CheckError("preferred login expired in cooldown; inspect gateway")
+        if not due and policy.legacy_marker(denied_bearer, row["access_token"]):
+            raise CheckError("Codex account endpoint still returns HTTP 401 after renewal")
+
     denied_bearer = REJECTED.with_name("account-denied")
-    # When renewal is due it can proceed even if the account-status endpoint is down.
-    due = force or expiry - time.time() <= RENEW_BEFORE
-    account = None if due else check_provider(observed)
     renewed = False
-    if due or account.http == 401:
-        with _auth_store_lock(timeout_seconds=35):
-            store = _load_auth_store()
-            current, expiry = primary(store)
-            if (current["id"] == row["id"] and current["access_token"] == observed
-                    and current["refresh_token"] == row["refresh_token"]):
-                # Hermes has a separate recovery path for an expired quota-limited grant.
-                # Do not race it or remove its cooldown.
-                if _entry_is_rate_limit_exhausted(current) and expiry <= time.time() + 120:
-                    raise CheckError("preferred login expired in cooldown; inspect gateway")
-                if not due and denied_bearer.exists() and denied_bearer.read_text() == fingerprint(observed):
-                    raise CheckError("Codex account endpoint still returns HTTP 401 after renewal")
-                refresh = current["refresh_token"]
-                signature = fingerprint(refresh)
-                if REJECTED.exists() and REJECTED.read_text() == signature:
-                    raise CheckError("OpenAI previously rejected this grant; owner login required")
-                try:
-                    updated = refresh_codex_oauth_pure(observed, refresh)
-                except AuthError as exc:
-                    status_code = getattr(exc, "oauth_refresh_status", None)
-                    if (exc.relogin_required and status_code in (None, 400, 401, 403)
-                            and exc.code in {"invalid_grant", "refresh_token_reused", "refresh_token_expired",
-                                             "refresh_token_invalidated", "invalid_token"}):
-                        REJECTED.write_text(signature)
-                        raise CheckError("OpenAI rejected renewal; owner login required" + renewal_detail(exc)) from None
-                    raise CheckError("OpenAI did not complete renewal; retry next check" + renewal_detail(exc)) from None
-                # Save the replacement immediately, under the same Hermes lock, keeping quota,
-                # identity, priority and the other login intact.
-                current.update({k: updated[k] for k in ("access_token", "refresh_token", "last_refresh")})
-                _save_auth_store(store)
-                renewed = True
-        disk, expiry = primary(_load_auth_store())
-        if renewed and (disk["id"] != current["id"] or disk["refresh_token"] != current["refresh_token"]):
-            raise CheckError("persisted credential changed during renewal; check again")
-        checked = disk["access_token"]
-        account = check_provider(checked)
-        if renewed and account.http == 401:
-            # Continue probing hourly, but a fresh grant did not repair this endpoint.
-            denied_bearer.write_text(fingerprint(checked))
+    try:
+        row, expiry = policy.preferred(_load_auth_store())
+        checked = row["access_token"]
+        due = force or expiry - time.time() <= RENEW_BEFORE
+        account = None if due else check_provider(checked)
+        if due or account.http == 401:
+            row, expiry, renewed = policy.renew(row, check=admit, rejected_file=REJECTED)
+            checked = row["access_token"]
+            account = check_provider(checked)
+            if renewed and account.http == 401:
+                denied_bearer.write_text(policy.fingerprint(checked))
+    except policy.CredentialIssue as exc:
+        raise CheckError(str(exc) + renewal_detail(exc.__cause__)) from None
     if account.auth != "valid":
         raise CheckError(account.summary())
-    if denied_bearer.exists() and denied_bearer.read_text() == fingerprint(checked):
+    if policy.legacy_marker(denied_bearer, checked):
         denied_bearer.unlink(missing_ok=True)
     hours = int((expiry - time.time()) // 3600)
     if hours < 1 or (renewed and expiry - time.time() <= RENEW_BEFORE):

@@ -217,7 +217,7 @@ index 9682aedc..e51b032d 100644
                      cleared_any = True
              if refresh and self._entry_needs_refresh(entry):
 diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
-index e296bbb6..65eae4d0 100644
+index e296bbb6..68076801 100644
 --- a/hermes_cli/auth.py
 +++ b/hermes_cli/auth.py
 @@ -75,6 +75,7 @@ from hermes_cli.auth_xai import (
@@ -228,7 +228,17 @@ index e296bbb6..65eae4d0 100644
      _codex_access_token_is_expiring, _codex_device_code_login, _codex_http_client,
      _codex_pool_rate_limit_status, _codex_quota_probe_cache, _codex_usage_probe_url,
      _import_codex_cli_tokens, _is_codex_rate_limit_shaped, _login_openai_codex,
-@@ -1985,7 +1986,8 @@ OAUTH_PROVIDER_FLOWS: dict[str, OAuthProviderFlow] = {
+@@ -1967,6 +1968,9 @@ class OAuthProviderFlow:
+         return globals()[self.status_fn]()
+ 
+     def is_terminal_refresh_error(self, exc: Exception) -> bool:
++        if self.provider_id == "openai-codex" and getattr(exc, "oauth_refresh_status", None) is not None:
++            from hermes_cli.psy_codex_policy import terminal
++            return isinstance(exc, AuthError) and exc.provider == self.provider_id and terminal(exc)
+         return (
+             isinstance(exc, AuthError) and exc.provider == self.provider_id
+             and exc.code in self.terminal_refresh_codes and bool(exc.relogin_required))
+@@ -1985,7 +1989,8 @@ OAUTH_PROVIDER_FLOWS: dict[str, OAuthProviderFlow] = {
          terminal_refresh_codes=_OAUTH_GRANT_DEAD_CODES | _NOUS_AUTH_MISSING_CODES, logout_from_config=True),
      "openai-codex": OAuthProviderFlow(
          "openai-codex", "resolve_codex_runtime_credentials", "get_codex_auth_status",
@@ -239,7 +249,7 @@ index e296bbb6..65eae4d0 100644
      "xai-oauth": OAuthProviderFlow(
          "xai-oauth", "resolve_xai_oauth_runtime_credentials", "get_xai_oauth_auth_status",
 diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
-index 257b4314..fa9ea800 100644
+index 257b4314..e8931737 100644
 --- a/hermes_cli/auth_codex.py
 +++ b/hermes_cli/auth_codex.py
 @@ -16,7 +16,7 @@ import json
@@ -262,7 +272,7 @@ index 257b4314..fa9ea800 100644
  def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
      """Decode a non-200 Codex token-refresh response into a shaped AuthError."""
      from hermes_cli.auth import _nonempty_str
-@@ -475,6 +479,7 @@ def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
+@@ -475,41 +479,78 @@ def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
      # force relogin even if the body error code wasn't one of the known strings.
      relogin_required = (
          code in {"invalid_grant", "invalid_token", "invalid_request", "refresh_token_reused"}
@@ -270,8 +280,17 @@ index 257b4314..fa9ea800 100644
          or response.status_code in {401, 403})
      return _codex_err(message, code, relogin=relogin_required)
  
-@@ -487,29 +492,58 @@ def refresh_codex_oauth_pure(
-     if not _nonempty_str(refresh_token):
+ 
+ def refresh_codex_oauth_pure(
+     access_token: str, refresh_token: str, *, timeout_seconds: float = 20.0) -> dict[str, Any]:
+-    """Refresh Codex OAuth tokens without mutating Hermes auth state."""
+-    from hermes_cli.auth import _nonempty_str, _utc_now_z
+-    del access_token  # Access token is only used by callers to decide whether to refresh.
+-    if not _nonempty_str(refresh_token):
++    """Serialize the single-use grant, including failures after dispatch."""
++    from hermes_cli.psy_codex_policy import guarded_exchange
++
++    if not isinstance(refresh_token, str) or not refresh_token.strip():
          raise _codex_err(_MISSING_REFRESH_TOKEN_MSG.format(relogin=_codex_relogin_command()),
                           "codex_auth_missing_refresh_token", relogin=True)
 -    with _codex_http_client(
@@ -287,6 +306,13 @@ index 257b4314..fa9ea800 100644
 -        # cannot lift a quota cap, so classify distinctly from auth failures ("retry later").
 -        raise _codex_quota_exhausted_error(
 -            _parse_retry_after_seconds(getattr(response, "headers", None)))
++    grant = refresh_token.strip()
++    return guarded_exchange(grant, lambda: _exchange_codex_token(grant, timeout_seconds))
++
++
++def _exchange_codex_token(refresh_token: str, timeout_seconds: float) -> dict[str, Any]:
++    """Send one refresh request. The caller handles replay protection."""
++    from hermes_cli.auth import _nonempty_str, _utc_now_z
 +    try:
 +        with _codex_http_client(
 +            timeout=httpx.Timeout(max(5.0, float(timeout_seconds))),
@@ -351,7 +377,7 @@ index 257b4314..fa9ea800 100644
      updated = {
          "access_token": refreshed_access, "refresh_token": refresh_token.strip(),
          "last_refresh": _utc_now_z()}
-@@ -636,12 +670,9 @@ def resolve_codex_runtime_credentials(
+@@ -636,12 +677,9 @@ def resolve_codex_runtime_credentials(
              if imported:
                  data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
      if data is None:
@@ -367,7 +393,7 @@ index 257b4314..fa9ea800 100644
          if pool_token:
              # Report the host this row routes to, not the ambient default: a pooled gateway key
              # paired with chatgpt.com leaks to every consumer of this result (#121486).
-@@ -654,16 +685,28 @@ def resolve_codex_runtime_credentials(
+@@ -654,16 +692,28 @@ def resolve_codex_runtime_credentials(
              # days in the future while the account is already usable again. Never from a
              # read-only caller: the picker fingerprint resolves on every cache-only read.
              if not read_only and _probe_codex_pool_entry_quota_restored(pool_rate_limit):
@@ -402,7 +428,7 @@ index 257b4314..fa9ea800 100644
          if read_error is not None:
              raise read_error
          raise _codex_err(_NO_CREDENTIALS_MSG.format(relogin=_codex_relogin_command()),
-@@ -790,7 +833,8 @@ def _probe_codex_quota_restored(
+@@ -790,7 +840,8 @@ def _probe_codex_quota_restored(
  
  def _refresh_expired_codex_probe_token(
      access_token: Any, refresh_token: Any, *,
@@ -412,7 +438,7 @@ index 257b4314..fa9ea800 100644
      """Refresh an EXPIRED stored access token so the quota probe can get a real answer.
  
      Exhausted pool entries are skipped by the proactive refresh chain (#44799), so by the time
-@@ -818,34 +862,97 @@ def _refresh_expired_codex_probe_token(
+@@ -818,34 +869,97 @@ def _refresh_expired_codex_probe_token(
              return None
      try:
          return refresh_codex_oauth_pure(token, refresh)
@@ -532,7 +558,7 @@ index 257b4314..fa9ea800 100644
  
  
  def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
-@@ -918,29 +1025,95 @@ def _pool_entries(auth_store: dict[str, Any], provider_id: str) -> Optional[list
+@@ -918,29 +1032,95 @@ def _pool_entries(auth_store: dict[str, Any], provider_id: str) -> Optional[list
      return entries if isinstance(entries, list) else None
  
  

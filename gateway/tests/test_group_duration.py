@@ -93,7 +93,8 @@ class Duration(unittest.TestCase):
             if instructions == m.REVIEW:
                 return self.answer('{"edits":[]}')
             return self.answer("Verified analysis")
-        result = self.compose("Research question", stage, research=True)
+        with patch.object(m.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")):
+            result = self.compose("Публичная тема: Academic topic", stage, research=True)
         self.assertTrue(result.complete)
         self.assertEqual(result.text, "Verified analysis")
         self.assertEqual(result.searches, 2)

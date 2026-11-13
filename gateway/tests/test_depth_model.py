@@ -34,6 +34,9 @@ class Depth(unittest.TestCase):
         bootstrap.enable_happy_eyeballs_on_client = lambda client: None
         mods = patch.dict(sys.modules, {"httpx": httpx, "agent.process_bootstrap": bootstrap})
         auth = patch.object(m, "_connection", return_value=("fixture", {}))
+        locate = patch.object(m.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context"))
+        locate.start()
+        self.addCleanup(locate.stop)
         auth.start()
         self.addCleanup(auth.stop)
         mods.start()
@@ -97,7 +100,7 @@ class Depth(unittest.TestCase):
         call = Mock(side_effect=[m.Result("search", [], 1), metadata(a, ["Позиция в 1940"]),
                                  metadata(b, [])])
         r = m._primary_sources(call, "Academic topic")
-        self.assertEqual(json.loads(r.text)["claims"], [a,b])
+        self.assertEqual(json.loads(r.text)["claims"], [dict(c,access="excerpt",location="HTML, абзац 1",context="fixture context") for c in (a,b)])
         self.assertIn("Позиция в 1940", call.call_args.args[0][-1]["content"])
 
     def test_corrects_original_claim_and_its_recap_in_place(self):
@@ -296,6 +299,11 @@ def inventory(*numbers, trace=True):
 
 
 class CentralReading(unittest.TestCase):
+    def setUp(self):
+        locate = patch.object(m.EvidenceReader, "locate", return_value=("PDF, страница 1", "fixture context"))
+        locate.start()
+        self.addCleanup(locate.stop)
+
     def test_finds_all_members_of_series_prior_to_comparative_work(self):
         calls = []
         def call(turns, instructions, *, web):

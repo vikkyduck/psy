@@ -9,6 +9,7 @@ from copy import deepcopy
 from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock, patch
+import json
 
 from psy_modules import psy_group_codex as adapter
 
@@ -41,6 +42,9 @@ class TestPreferredCredentials(unittest.TestCase):
         constants.AuthError = OAuthError
         constants._decode_jwt_claims = lambda token: {"exp": time.time() + {"old":-30, "soon":60}.get(token, 6000)}
         self.modules["httpx"].RequestError = type("RequestError", (Exception,), {})
+        constants.httpx = self.modules["httpx"]
+        for name in ("PoolTimeout", "ConnectTimeout", "ConnectError", "ReadTimeout", "WriteError"):
+            setattr(constants.httpx, name, type(name, (constants.httpx.RequestError,), {}))
         self.auth._load_auth_store = lambda: deepcopy(self.store)
         self.auth._save_auth_store = Mock(side_effect=self._save)
         self.auth._auth_store_lock = self._lock
@@ -134,6 +138,143 @@ class TestPreferredCredentials(unittest.TestCase):
             path.unlink()
         self.codex.refresh_codex_oauth_pure.assert_not_called()
 
+    def install_grant_guard(self):
+        # Keep the public plugin, Hermes grant guard and store transaction real, replace
+        # only the underlying HTTP exchange, filesystem root and interprocess lock.
+        policy = adapter.codex_policy
+        self.network = self.codex.refresh_codex_oauth_pure
+        self.auth._auth_file_path = lambda: self.markers / "test-auth.json"
+        self.auth._global_auth_file_path = lambda: None
+        self.auth._save_private_json = lambda path, data, **options: path.write_text(json.dumps(data))
+        self.auth._auth_store_lock = lambda **kwargs: nullcontext() if "target_path" in kwargs else self._lock()
+        pool = ModuleType("agent.credential_pool")
+        pool._profile_owns_pool_provider = lambda _: True
+        self.enterContext(patch.dict(sys.modules, {"agent.credential_pool": pool}))
+        def block(code):
+            error = OAuthError(code, None)
+            error.relogin_required = False
+            return error
+        self.enterContext(patch.object(policy, "block_error", block))
+        self.codex.refresh_codex_oauth_pure = lambda access, grant: policy.guarded_exchange(
+            grant, lambda: self.network(access, grant))
+
+    def test_three_questions_preconnect_failure_share_backoff_and_restart_recovers(self):
+        self.install_grant_guard()
+        self.network.side_effect = self.modules["httpx"].ConnectError()
+        model = Mock(side_effect=lambda token: 401 if token == "live" else 200)
+        for _ in range(3):
+            with self.assertRaises(adapter.ModelIssue) as issue:
+                self.group_question(model)
+            self.assertEqual(issue.exception.kind, "access_wait")
+        self.network.assert_called_once()
+        model.assert_called_once()
+        self.network.side_effect = self._refresh
+        with patch("time.time", return_value=time.time()+65):
+            self.assertEqual(self.group_question(model).text, "42")
+        self.assertEqual(self.network.call_count, 2)
+
+    def test_lost_rotation_response_is_never_replayed_by_fresh_process(self):
+        self.install_grant_guard()
+        self.network.side_effect = self.modules["httpx"].ReadTimeout()
+        model = Mock(return_value=401)
+        for _ in range(3):
+            with self.assertRaises(adapter.ModelIssue) as issue:
+                self.group_question(model)
+            self.assertEqual(issue.exception.kind, "signin")
+        with patch("time.time", return_value=time.time()+4*86400):
+            with self.assertRaises(OAuthError) as issue:
+                self.codex.refresh_codex_oauth_pure("live", "first-grant")
+            self.assertEqual(issue.exception.code, "psy_refresh_uncertain")
+        self.network.assert_called_once()
+        model.assert_called_once()
+        # A replacement login ignores the journal entry for a different grant.
+        row = self.store["credential_pool"]["openai-codex"][1]
+        row.update(access_token="signed-in", refresh_token="fresh-login")
+        self.assertEqual(self.group_question(lambda _: 200).text, "42")
+
+    def test_incomplete_server_response_never_replays_grant(self):
+        self.install_grant_guard()
+        for status in (200, 502, 503, 504):
+            grant = "invalid-response-fixture-" + str(status)
+            self.network.side_effect = OAuthError("invalid_response", status)
+            for _ in range(2):
+                with self.assertRaises(OAuthError) as issue:
+                    self.codex.refresh_codex_oauth_pure("live", grant)
+                self.assertEqual(issue.exception.code, "psy_refresh_uncertain")
+            self.network.assert_called_once()
+            self.network.reset_mock()
+
+    def test_token_endpoint_429_respects_server_retry_after_across_callers(self):
+        self.install_grant_guard()
+        error = OAuthError("rate_limit", 429)
+        error.retry_after = 115
+        self.network.side_effect = error
+        self.primary["access_token"] = "old"
+        self.issue("access_wait")
+        with patch("time.time", return_value=time.time()+90):
+            self.issue("access_wait")
+        self.network.assert_called_once()
+        self.network.side_effect = self._refresh
+        with patch("time.time", return_value=time.time()+120):
+            self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+        self.assertEqual(self.network.call_count, 2)
+
+    def test_conflicting_account_claim_cannot_receive_a_rotated_grant(self):
+        constants = self.modules["hermes_cli.auth_constants"]
+        constants._decode_jwt_claims = lambda token: {"sub": token, "exp": time.time()+60}
+        self.rows.append(dict(self.primary, id="alias", priority=2, access_token="different-account"))
+        self.issue("access_wait")
+        self.auth._save_auth_store.assert_not_called()
+        self.codex.refresh_codex_oauth_pure.assert_not_called()
+
+    def test_corrupt_marker_fails_closed_without_redeeming_grant(self):
+        self.install_grant_guard()
+        directory = self.markers / "psy-codex-renewals"
+        directory.mkdir()
+        path = directory / (adapter.codex_policy.fingerprint("first-grant") + ".json")
+        for damaged in ("{", "null", "{}", '{"state":"wait"}'):
+            path.write_text(damaged)
+            with self.assertRaises(OAuthError) as issue:
+                self.codex.refresh_codex_oauth_pure("live", "first-grant")
+            self.assertEqual(issue.exception.code, "psy_refresh_uncertain")
+        self.network.assert_not_called()
+
+    def test_process_stop_during_exchange_never_resends_pending_grant(self):
+        self.install_grant_guard()
+        self.network.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            self.codex.refresh_codex_oauth_pure("live", "first-grant")
+        with self.assertRaises(OAuthError) as issue:
+            self.codex.refresh_codex_oauth_pure("live", "first-grant")
+        self.assertEqual(issue.exception.code, "psy_refresh_uncertain")
+        self.network.assert_called_once()
+
+    def test_failed_proactive_renewal_can_use_unrejected_bearer_until_expiry(self):
+        self.install_grant_guard()
+        self.primary["access_token"] = "soon"
+        self.network.side_effect = self.modules["httpx"].ReadTimeout()
+        for _ in range(2):
+            self.assertEqual(self.group_question(lambda _: 200).text, "42")
+        self.network.assert_called_once()
+
+    def test_legacy_alias_renewed_in_same_transaction_and_independent_login_preserved(self):
+        self.primary["access_token"] = "old"
+        self.rows.append(dict(self.primary, id="alias", priority=2, label="alias", last_error_code=429))
+        self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+        rows = self.store["credential_pool"]["openai-codex"]
+        self.assertEqual(rows[0], self.other)
+        self.assertEqual([r["refresh_token"] for r in rows[1:]], ["rotated", "rotated"])
+        self.assertEqual(rows[2]["last_error_code"], 429)
+        self.auth._save_auth_store.assert_called_once()
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+
+    def test_conflicting_alias_cannot_receive_tokens(self):
+        self.primary["access_token"] = "soon"
+        self.rows.append(dict(self.primary, id="alias", priority=2, base_url="https://test.invalid"))
+        self.issue("access_wait")
+        self.auth._save_auth_store.assert_not_called()
+        self.codex.refresh_codex_oauth_pure.assert_not_called()
+
     def test_near_expiry_and_quota_are_renewed_once_with_status_preserved(self):
         self.cooldown("usage_limit_exceeded")
         self.primary["access_token"] = "soon"
@@ -165,13 +306,14 @@ class TestPreferredCredentials(unittest.TestCase):
         self.assertEqual(self.store["credential_pool"]["openai-codex"][0],self.other)
 
     def test_challenge_does_not_quarantine(self):
+        self.install_grant_guard()
         self.primary["access_token"] = "old"
-        self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("http_error",403)
+        self.network.side_effect = OAuthError("http_error",403)
         self.issue("access_wait")
         self.issue("access_wait")
-        self.codex.refresh_codex_oauth_pure.assert_called_once()
+        self.network.assert_called_once()
         self.assertNotEqual(self.store["credential_pool"]["openai-codex"][1].get("last_status"), "dead")
-        self.codex.refresh_codex_oauth_pure.side_effect = self._refresh
+        self.network.side_effect = self._refresh
         with patch("time.time", return_value=time.time()+65):
             self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
 

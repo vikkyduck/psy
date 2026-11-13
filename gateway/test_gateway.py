@@ -17,6 +17,7 @@ def main():
     os.environ.update(PSY_OWNER_ID="101", PSY_GROUP_ID="-202", PSY_BOT_ID="303",
                       PSY_BOT_USERNAME="DemoTestBot", PSY_PUBLIC_URL="https://example.invalid")
     # Load the actual restored modules without starting the real Telegram adapter.
+    sys.path.insert(0, str(checkout))
     pkg = types.ModuleType("psy_modules")
     pkg.__path__ = [str(checkout/TELEGRAM)]
     sys.modules[pkg.__name__] = pkg

@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 if __name__ == "__main__":
     pkg = types.ModuleType("psy_modules")
     pkg.__path__ = [sys.argv[1]]
+    sys.path.insert(0, str(Path(sys.argv[1]).parents[2]))
     sys.modules[pkg.__name__] = pkg
 
 from psy_modules import psy_group_codex as model, psy_group_store as store
@@ -37,7 +38,7 @@ def run_child(root, kind, interrupt):
         store.recover(root=root)
     assert store.claim_next(root=root)[0] == ident
     source = "https://example.org/public-work"
-    question = "Synthetic assignment"
+    question = "Публичная тема: Synthetic assignment"
     plan = {"title": "Lecture", "sections": [
         {"title": f"Chapter {i}", "brief": "An example", "minutes": 10, "activity_minutes": 0}
         for i in range(1, 7)
@@ -93,7 +94,7 @@ def run_child(root, kind, interrupt):
             os._exit(83)
         return model.Result(text, [], int(web), source_urls=(source,) if web else ())
 
-    with patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(
+    with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(
         model, "_connection", return_value=("", {})
     ), patch.object(model, "_stream", stream):
         result = model._compose(None, [model._user(question)], kind == "analysis", "fixture", question,
@@ -157,7 +158,7 @@ class ModelRestart(unittest.TestCase):
             return model.Result("Restored ending.", [], 0)
         client = Mock()
         client.stream.return_value = nullcontext(Mock(status_code=200, iter_lines=events))
-        with patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(model, "_connection", return_value=("", {})):
+        with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(model, "_connection", return_value=("", {})):
             with self.assertRaises(Interrupted):
                 model._compose(client, turns, False, "fixture", question, checkpoints=checkpoints)
             self.assertNotIn(hidden[:100], json.dumps(checkpoints))
