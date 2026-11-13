@@ -95,7 +95,7 @@ def run_child(root, kind, interrupt):
         return model.Result(text, [], int(web), source_urls=(source,) if web else ())
 
     with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(
-        model, "_connection", return_value=("", {})
+        model, "_connection", return_value=("", {}, "fixture-generation")
     ), patch.object(model, "_stream", stream):
         result = model._compose(None, [model._user(question)], kind == "analysis", "fixture", question,
                                 checkpoints=Checkpoints(ident, root=root))
@@ -158,7 +158,7 @@ class ModelRestart(unittest.TestCase):
             return model.Result("Restored ending.", [], 0)
         client = Mock()
         client.stream.return_value = nullcontext(Mock(status_code=200, iter_lines=events))
-        with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(model, "_connection", return_value=("", {})):
+        with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(model, "_connection", return_value=("", {}, "fixture-generation")):
             with self.assertRaises(Interrupted):
                 model._compose(client, turns, False, "fixture", question, checkpoints=checkpoints)
             self.assertNotIn(hidden[:100], json.dumps(checkpoints))

@@ -28,7 +28,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.markers = Path(dirs.name)
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(patch.object(adapter, "_GROUP_AUTH_MARKERS", dirs.name))
+        stack.enter_context(patch.object(adapter.codex_policy, "MARKERS", self.markers))
         self.primary = dict(id="first", priority=0, auth_type="oauth", source="manual:device_code",
                             access_token="live", refresh_token="first-grant")
         self.other = dict(self.primary, id="other", priority=1, access_token="other", refresh_token="alternate-grant")
@@ -66,7 +66,7 @@ class TestPreferredCredentials(unittest.TestCase):
         finally:
             self.locked = False
 
-    def _refresh(self, access, grant):
+    def _refresh(self, access, grant, *, timeout_seconds=20.0):
         self.assertTrue(self.locked)
         self.assertEqual((access, grant), (self.primary["access_token"], self.primary["refresh_token"]))
         return dict(access_token="renewed", refresh_token="rotated", last_refresh="now")
@@ -89,7 +89,8 @@ class TestPreferredCredentials(unittest.TestCase):
             if reason:
                 self.cooldown(reason)
             self.assertEqual(adapter.get_credentials(), {"provider":"openai-codex",
-                             "base_url":"https://chatgpt.com/backend-api/codex", "api_key":"live"})
+                             "base_url":"https://chatgpt.com/backend-api/codex", "api_key":"live",
+                             "generation":adapter.codex_policy.generation(self.primary)})
         self.auth._save_auth_store.assert_not_called()
         self.codex.refresh_codex_oauth_pure.assert_not_called()
 
@@ -155,7 +156,7 @@ class TestPreferredCredentials(unittest.TestCase):
             error.relogin_required = False
             return error
         self.enterContext(patch.object(policy, "block_error", block))
-        self.codex.refresh_codex_oauth_pure = lambda access, grant: policy.guarded_exchange(
+        self.codex.refresh_codex_oauth_pure = lambda access, grant, **options: policy.guarded_exchange(
             grant, lambda: self.network(access, grant))
 
     def test_three_questions_preconnect_failure_share_backoff_and_restart_recovers(self):
@@ -226,6 +227,33 @@ class TestPreferredCredentials(unittest.TestCase):
         self.issue("access_wait")
         self.auth._save_auth_store.assert_not_called()
         self.codex.refresh_codex_oauth_pure.assert_not_called()
+
+    def test_conflicting_alias_owners_with_partial_primary_do_not_receive_tokens(self):
+        self.primary["access_token"] = "soon"
+        accounts = {"first-alias": "X", "second-alias": "Y"}
+        self.modules["hermes_cli.auth_constants"]._decode_jwt_claims = lambda token: {
+            "exp": time.time() + 60, "sub": "A",
+            "https://api.openai.com/auth": {"chatgpt_account_id": accounts.get(token)},
+        }
+        for i, key in enumerate(accounts, 2):
+            self.rows.append(dict(self.primary, id=key, priority=i, access_token=key))
+        self.issue("access_wait")
+        self.codex.refresh_codex_oauth_pure.assert_not_called()
+        self.auth._save_auth_store.assert_not_called()
+
+    def test_an_exchange_returning_another_owner_quarantines_only_its_grant(self):
+        self.primary["access_token"] = "soon"
+        self.rows.append(dict(self.primary, id="alias", priority=2))
+        self.modules["hermes_cli.auth_constants"]._decode_jwt_claims = lambda token: {
+            "exp": time.time() + 60, "sub": "B" if token == "renewed" else "A",
+        }
+        for _ in range(2):
+            self.issue("signin")
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+        rows = self.store["credential_pool"]["openai-codex"]
+        self.assertEqual(rows[0], self.other)
+        self.assertTrue(all(r["access_token"] == "soon" and r["last_status"] == "dead" for r in rows[1:]))
+        self.assertNotIn("renewed", repr(self.store))
 
     def test_corrupt_marker_fails_closed_without_redeeming_grant(self):
         self.install_grant_guard()
@@ -337,7 +365,7 @@ class TestPreferredCredentials(unittest.TestCase):
         reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
         self.assertEqual(self.group_question(reply).text, "42")
         self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "renewed"])
-        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant")
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0)
 
     def test_rejected_refresh_on_model_401_blocks_later_questions_until_owner_login(self):
         self.codex.refresh_codex_oauth_pure.side_effect = OAuthError("refresh_token_expired", 401)
@@ -347,17 +375,39 @@ class TestPreferredCredentials(unittest.TestCase):
                 self.group_question(reply)
             self.assertEqual((caught.exception.kind, caught.exception.stage), ("signin", "credentials"))
         reply.assert_called_once_with("live")
-        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant")
+        self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0)
         self.assertEqual(self.store["credential_pool"]["openai-codex"][0], self.other)
 
     def test_second_model_401_does_not_keep_rotating_a_fresh_grant(self):
         reply = Mock(return_value=401)
-        for _ in range(2):
+        for _ in range(3):
             with self.assertRaises(adapter.ModelIssue) as caught:
                 self.group_question(reply)
             self.assertEqual(caught.exception.kind, "signin")
         self.codex.refresh_codex_oauth_pure.assert_called_once()
         self.assertEqual(self.store["credential_pool"]["openai-codex"][1]["refresh_token"], "rotated")
+        self.assertEqual([item.args[0] for item in reply.call_args_list], ["live", "renewed"])
+        self.store["credential_pool"]["openai-codex"][1].update(access_token="next-login", refresh_token="new-grant")
+        self.assertEqual(self.group_question(lambda token: 200 if token == "next-login" else 401).text, "42")
+
+    def test_late_model_401_does_not_mark_new_login_sharing_only_the_bearer(self):
+        def respond(token):
+            if token == "renewed":
+                self.store["credential_pool"]["openai-codex"][1]["refresh_token"] = "peer-grant"
+            return 401
+        with self.assertRaises(adapter.ModelIssue):
+            self.group_question(respond)
+        self.assertEqual(self.group_question(lambda _: 200).text, "42")
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
+
+    def test_401_on_peer_with_same_bearer_does_not_quarantine_that_login(self):
+        def rotate_grant(_):
+            self.store["credential_pool"]["openai-codex"][1]["refresh_token"] = "peer-grant"
+            return 401
+        with self.assertRaises(adapter.ModelIssue):
+            self.group_question(rotate_grant)
+        self.assertEqual(self.group_question(lambda _: 200).text, "42")
+        self.codex.refresh_codex_oauth_pure.assert_not_called()
 
     def test_model_401_adopts_a_token_already_rotated_by_peer(self):
         self.on_lock = lambda: self.primary.update(access_token="peer-live", refresh_token="peer-grant")
@@ -383,10 +433,12 @@ class TestPreferredCredentials(unittest.TestCase):
         self.codex.refresh_codex_oauth_pure.side_effect = None
         self.codex.refresh_codex_oauth_pure.return_value = dict(access_token="live", refresh_token="rotated", last_refresh="now")
         reply = Mock(return_value=401)
-        with self.assertRaises(adapter.ModelIssue) as caught:
-            self.group_question(reply)
-        self.assertEqual(caught.exception.kind, "signin")
+        for _ in range(3):
+            with self.assertRaises(adapter.ModelIssue) as caught:
+                self.group_question(reply)
+            self.assertEqual(caught.exception.kind, "signin")
         reply.assert_called_once()
+        self.codex.refresh_codex_oauth_pure.assert_called_once()
 
     def test_image_401_recovers_without_publishing_provider_detail(self):
         import base64

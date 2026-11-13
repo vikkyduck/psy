@@ -7,10 +7,7 @@ from pathlib import Path
 from typing import NamedTuple, Optional
 
 PROVIDER = "openai-codex"
-BASE = "https://chatgpt.com/backend-api/codex"
 USAGE = "https://chatgpt.com/backend-api/wham/usage"
-RENEW_BEFORE = 24 * 3600
-REJECTED = Path("/var/lib/psy-codex-auth/rejected")
 
 
 class CheckError(Exception):
@@ -110,36 +107,14 @@ def check_provider(access):
 
 def maintain(force=False):
     from hermes_cli import psy_codex_policy as policy
-    from hermes_cli.auth import _load_auth_store
-    from hermes_cli.auth_codex import _entry_is_rate_limit_exhausted
-
-    def admit(store, row, expiry):
-        if _entry_is_rate_limit_exhausted(row) and expiry <= time.time() + 120:
-            raise CheckError("preferred login expired in cooldown; inspect gateway")
-        if not due and policy.legacy_marker(denied_bearer, row["access_token"]):
-            raise CheckError("Codex account endpoint still returns HTTP 401 after renewal")
-
-    denied_bearer = REJECTED.with_name("account-denied")
-    renewed = False
     try:
-        row, expiry = policy.preferred(_load_auth_store())
-        checked = row["access_token"]
-        due = force or expiry - time.time() <= RENEW_BEFORE
-        account = None if due else check_provider(checked)
-        if due or account.http == 401:
-            row, expiry, renewed = policy.renew(row, check=admit, rejected_file=REJECTED)
-            checked = row["access_token"]
-            account = check_provider(checked)
-            if renewed and account.http == 401:
-                denied_bearer.write_text(policy.fingerprint(checked))
+        expiry, renewed, account = policy.account_credentials(check_provider, force=force)
     except policy.CredentialIssue as exc:
         raise CheckError(str(exc) + renewal_detail(exc.__cause__)) from None
     if account.auth != "valid":
         raise CheckError(account.summary())
-    if policy.legacy_marker(denied_bearer, checked):
-        denied_bearer.unlink(missing_ok=True)
     hours = int((expiry - time.time()) // 3600)
-    if hours < 1 or (renewed and expiry - time.time() <= RENEW_BEFORE):
+    if hours < 1 or (renewed and expiry - time.time() <= policy.RENEW_BEFORE):
         raise CheckError("OpenAI returned a short-lived credential; check again")
     print(f"{account.summary()} renewed={renewed} valid_hours={hours}")
 

@@ -33,7 +33,7 @@ class Depth(unittest.TestCase):
         bootstrap = types.ModuleType("agent.process_bootstrap")
         bootstrap.enable_happy_eyeballs_on_client = lambda client: None
         mods = patch.dict(sys.modules, {"httpx": httpx, "agent.process_bootstrap": bootstrap})
-        auth = patch.object(m, "_connection", return_value=("fixture", {}))
+        auth = patch.object(m, "_connection", return_value=("fixture", {}, "fixture-generation"))
         locate = patch.object(m.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context"))
         locate.start()
         self.addCleanup(locate.stop)
@@ -278,7 +278,7 @@ class Depth(unittest.TestCase):
         opts=[{"id":16,"name":"пример"}]
         for value, expected in ((16,16),(17,"clarify"),(None,None),(True,"clarify")):
             result=m.Result(json.dumps({"source":value}),[],0)
-            with patch.object(m,"_connection",return_value=("fake",{})), patch.object(m,"_stream",return_value=result) as stream:
+            with patch.object(m,"_connection",return_value=("fake",{}, "fixture-generation")), patch.object(m,"_stream",return_value=result) as stream:
                 self.assertEqual(m.choose_source("почему?",opts,16,model="fake"),expected)
                 self.assertFalse(stream.call_args.args[3])
 

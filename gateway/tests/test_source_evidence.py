@@ -51,7 +51,7 @@ class Evidence(unittest.TestCase):
         def sources(call, topic, *, read_main):
             self.assertEqual(topic, "Freud Repression 1915")
             return model.Result("Проверка",[],0,False)
-        with patch.object(model,"_transport",nullcontext),patch.object(model,"_stream",stream),patch.object(model,"_connection",return_value=("fixture",{})),patch.object(model,"_primary_sources",side_effect=sources) as lookup:
+        with patch.object(model,"_transport",nullcontext),patch.object(model,"_stream",stream),patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),patch.object(model,"_primary_sources",side_effect=sources) as lookup:
             model._compose(None,[model._user(question)],False,"fixture",question)
             lookup.assert_called_once()
         self.assertEqual(evidence.public_topic("Разбери Условный Маркер Сосна"), "")
@@ -72,7 +72,7 @@ class Evidence(unittest.TestCase):
         question = "Разбери Условный Маркер"
         stream = lambda *args,**kwargs: model.Result('PSY_TASK {"public_topic":"Условный Маркер"}', [], 0)
         with (patch.object(model,"_transport",nullcontext),patch.object(model,"_stream",stream),
-              patch.object(model,"_connection",return_value=("fixture",{})),
+              patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),
               patch.object(model,"_primary_sources") as search):
             result=model._compose(None,[model._user(question)],False,"fixture",question)
         self.assertIn("Публичная тема",result.text)

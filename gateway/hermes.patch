@@ -1,8 +1,8 @@
 diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
-index 10a5b181..67735ab9 100644
+index 10a5b181..600ab0ee 100644
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
-@@ -3837,9 +3837,22 @@ def _refresh_copilot_credentials() -> bool:
+@@ -3837,9 +3837,27 @@ def _refresh_copilot_credentials() -> bool:
      return True
  
  
@@ -10,15 +10,20 @@ index 10a5b181..67735ab9 100644
 +def _refresh_codex_credentials(failed_api_key: str = "") -> bool:
      from hermes_cli.auth import resolve_codex_runtime_credentials
 -    return _creds_have_api_key(resolve_codex_runtime_credentials(force_refresh=True))
-+    from hermes_cli.auth_codex import _codex_pool_owner_lock
++    from hermes_cli.auth_codex import _codex_pool_owner_lock, _renew_psy_codex
 +    if not isinstance(failed_api_key, str) or not failed_api_key:
 +        return False
 +    with _codex_pool_owner_lock():
 +        pool = load_pool("openai-codex")
 +        if pool.has_credentials():
 +            matches = [entry for entry in pool.entries() if entry.runtime_api_key == failed_api_key]
-+            if len(matches) != 1 or matches[0].auth_type != "oauth":
++            if not matches or any(entry.auth_type != "oauth" for entry in matches):
 +                return False
++            if len(matches) > 1:
++                # A shared bearer alone does not prove a shared grant.
++                if len({entry.refresh_token for entry in matches}) != 1:
++                    return False
++                return _renew_psy_codex(matches[0].to_dict()) is not None
 +            return pool.try_refresh_matching(credential_id=matches[0].id) is not None
 +        current = resolve_codex_runtime_credentials(read_only=True)
 +        if current.get("api_key") != failed_api_key:
@@ -27,7 +32,7 @@ index 10a5b181..67735ab9 100644
  
  
  def _refresh_nous_credentials() -> bool:
-@@ -3899,7 +3912,7 @@ def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") ->
+@@ -3899,7 +3917,7 @@ def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") ->
      if refresher is None:
          return False
      try:
@@ -36,7 +41,7 @@ index 10a5b181..67735ab9 100644
              return False
          _evict_cached_clients(normalized)
          return True
-@@ -4110,7 +4123,7 @@ def _plan_fallback_auth_retry(
+@@ -4110,7 +4128,7 @@ def _plan_fallback_auth_retry(
      """After an auth error on a fallback candidate: refresh credentials and rebuild the request.
      Returns ``(refresh_provider, retry)``; ``retry`` = ``(client, kwargs, destination)`` or None."""
      fb_provider = _auth_refresh_provider_for_route(destination.provider, destination.base_url)
@@ -45,7 +50,7 @@ index 10a5b181..67735ab9 100644
      if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider, **refresh_kwargs):
          retry_client, retry_model = _get_cached_client(
              fb_provider, destination.model, **({"async_mode": True} if async_mode else {}),
-@@ -7777,7 +7790,7 @@ def _ladder_credential_rungs(
+@@ -7777,7 +7795,7 @@ def _ladder_credential_rungs(
      if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
              and not client_is_nous):
          refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
@@ -55,7 +60,7 @@ index 10a5b181..67735ab9 100644
              if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                  # The stale client is cached under the route label (e.g. "auto"), not the
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 9682aedc..e51b032d 100644
+index 9682aedc..402684d6 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -1186,7 +1186,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
@@ -97,7 +102,22 @@ index 9682aedc..e51b032d 100644
              return entry
          is_anthropic = self.provider == "anthropic"
          is_xai = self.provider == "xai-oauth"
-@@ -1546,12 +1547,21 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -1364,7 +1365,13 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+             return entry
+         try:
+             with _auth_store_lock():
+-                state = _load_provider_state(_load_auth_store(), self.provider)
++                store = _load_auth_store()
++                state = _load_provider_state(store, self.provider)
++                if is_codex and state:
++                    from hermes_cli.psy_codex_policy import is_managed
++                    effective_pool = {"credential_pool": {self.provider: read_credential_pool(self.provider)}}
++                    if is_managed(effective_pool, entry.to_dict()):
++                        return entry
+             tokens = state.get("tokens") if isinstance(state, dict) else None
+             if not isinstance(tokens, dict):
+                 return entry
+@@ -1546,12 +1553,30 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
          # there was no recovery path at all). Serialize through the shared
          # cross-process auth-store flock; a waiter's in-lock re-sync picks up
          # the winner's rotated token and skips the POST.
@@ -107,13 +127,22 @@ index 9682aedc..e51b032d 100644
 -                if synced is not entry and not force and not self._entry_needs_refresh(synced):
 -                    return synced
 +        if self.provider == "openai-codex":
-+            from hermes_cli.auth_codex import _codex_pool_owner_lock, _codex_pool_row_available
++            from hermes_cli.auth_codex import _codex_pool_owner_lock, _codex_pool_row_available, _renew_psy_codex
 +            with self._lock, _codex_pool_owner_lock():
 +                # A waiting reader can outlive removal or quarantine of its exact generation.
 +                if entry.id in self._persisted_token_pairs:
 +                    row = next((r for r in read_credential_pool(self.provider) if isinstance(r, dict) and r.get("id") == entry.id), None)
 +                    if row is None or not _codex_pool_row_available(row, self._is_sole_credential()):
 +                        return None
++                try:
++                    managed = _renew_psy_codex(entry.to_dict())
++                except auth_mod.AuthError:
++                    # The authority persisted any wait or quarantine. Never bench this row again.
++                    self._adopt_psy_store_rows(entry)
++                    return None
++                if managed is not None:
++                    self._adopt_psy_store_rows(entry)
++                    return self._find(lambda item: item.id == entry.id)
 +                current = self._sync_entry_from_pool_store(entry) if _is_manual_source(entry.source) else entry
 +                synced = self._sync_entry_from_auth_store(current)
 +                if synced is not entry and not self._entry_needs_refresh(synced):
@@ -124,7 +153,25 @@ index 9682aedc..e51b032d 100644
              synced = self._sync_entry_from_pool_store(entry)
              if self.provider == "anthropic" and synced.source == "claude_code":
                  # claude_code entries are NOT profile-owned: the refresh token
-@@ -1750,7 +1760,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -1572,6 +1597,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+                 return synced
+             return self._refresh_entry_impl(synced, force=force)
+ 
++    def _adopt_psy_store_rows(self, observed: PooledCredential) -> None:
++        """Adopt the authority's committed pairs and statuses without flushing a stale pool."""
++        stored = auth_mod._entry_ids(read_credential_pool(self.provider))
++        for current in self._entries:
++            if current.id != observed.id and current.refresh_token != observed.refresh_token:
++                continue
++            row = stored.get(current.id)
++            if row is not None:
++                self._replace_entry(current, PooledCredential.from_dict(self.provider, row))
++                self._persisted_token_pairs[current.id] = auth_mod._credential_token_pair(row)
++
+     def _claude_code_credentials_lock(self):
+         """Cross-process lock keyed to the shared claude_code credentials file.
+ 
+@@ -1750,7 +1786,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
          except _RefreshDone as done:
              return done.result
          except Exception as exc:
@@ -136,7 +183,7 @@ index 9682aedc..e51b032d 100644
              return self._recover_failed_refresh(entry, exc)
  
          updated = replace(updated, **_MARK_OK)
-@@ -1834,9 +1847,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -1834,9 +1873,11 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                  # silent quarantine looked like "I logged in once and Hermes keeps failing" (#113023).
                  logger.warning(
                      "%s OAuth refresh token is terminally invalid (%s); clearing local token state. "
@@ -150,7 +197,7 @@ index 9682aedc..e51b032d 100644
                  self._mark_dead_refresh_grant(entry, exc)
                  return None
          elif self.provider == "nous":
-@@ -1902,7 +1917,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -1902,7 +1943,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                  tokens = (state.get("tokens") or {}) if isinstance(state, dict) else None
                  if isinstance(tokens, dict):
                      store_refresh = str(tokens.get("refresh_token") or "").strip()
@@ -160,7 +207,7 @@ index 9682aedc..e51b032d 100644
                          tokens.pop("access_token", None)
                          tokens.pop("refresh_token", None)
                          state["tokens"] = tokens
-@@ -1959,24 +1975,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -1959,24 +2001,14 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
          if not token:
              return False
          try:
@@ -193,7 +240,7 @@ index 9682aedc..e51b032d 100644
          except Exception:
              logger.debug("Codex quota-restored probe failed", exc_info=True)
              return False
-@@ -2121,16 +2127,12 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
+@@ -2121,16 +2153,12 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                  exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                  # Codex quota windows can reopen EARLY; a throttled live probe
                  # lifts a stale cooldown (issue #43747).
@@ -216,8 +263,21 @@ index 9682aedc..e51b032d 100644
                      entry = self._adopt(entry, persist=False, **_MARK_OK)
                      cleared_any = True
              if refresh and self._entry_needs_refresh(entry):
+@@ -2809,6 +2837,12 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: dict[str, Any]) -> None:
+     if not (isinstance(tokens, dict) and tokens.get("access_token")):
+         return
+     if seed.provider == "openai-codex":
++        from hermes_cli.psy_codex_policy import is_managed
++        effective_pool = {"credential_pool": {seed.provider: [e.to_dict() for e in seed.entries]}}
++        if any(is_managed(effective_pool, row) for row in effective_pool["credential_pool"][seed.provider]
++               if row.get("source") == "device_code"):
++            # The legacy seeder upserts by source and can replace every alias of this type.
++            return
+         base_url = auth_mod.DEFAULT_CODEX_BASE_URL
+         custom_label = str(state.get("label") or "").strip()
+     else:
 diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
-index e296bbb6..68076801 100644
+index e296bbb6..a5879acb 100644
 --- a/hermes_cli/auth.py
 +++ b/hermes_cli/auth.py
 @@ -75,6 +75,7 @@ from hermes_cli.auth_xai import (
@@ -228,7 +288,19 @@ index e296bbb6..68076801 100644
      _codex_access_token_is_expiring, _codex_device_code_login, _codex_http_client,
      _codex_pool_rate_limit_status, _codex_quota_probe_cache, _codex_usage_probe_url,
      _import_codex_cli_tokens, _is_codex_rate_limit_shaped, _login_openai_codex,
-@@ -1967,6 +1968,9 @@ class OAuthProviderFlow:
+@@ -1016,6 +1017,11 @@ def _merge_pool_row_generation(
+     merge in ``_merge_disk_cooldown_state``."""
+     from agent.credential_pool import STATUS_DEAD
+ 
++    if provider_id == "openai-codex" and isinstance(disk_entry, dict):
++        # PSY's authority is the sole writer of generation-bound recovery markers.
++        # Even a flush of the same token pair can race a marker creation or removal.
++        entry = {key: value for key, value in entry.items() if not key.startswith("psy_")}
++        entry.update((key, value) for key, value in disk_entry.items() if key.startswith("psy_"))
+     merge_disk = None if status_cleared else disk_entry
+     disk_pair = _credential_token_pair(disk_entry)
+     if base_pair is None or not any(disk_pair) or disk_pair == base_pair:
+@@ -1967,6 +1973,9 @@ class OAuthProviderFlow:
          return globals()[self.status_fn]()
  
      def is_terminal_refresh_error(self, exc: Exception) -> bool:
@@ -238,7 +310,7 @@ index e296bbb6..68076801 100644
          return (
              isinstance(exc, AuthError) and exc.provider == self.provider_id
              and exc.code in self.terminal_refresh_codes and bool(exc.relogin_required))
-@@ -1985,7 +1989,8 @@ OAUTH_PROVIDER_FLOWS: dict[str, OAuthProviderFlow] = {
+@@ -1985,7 +1994,8 @@ OAUTH_PROVIDER_FLOWS: dict[str, OAuthProviderFlow] = {
          terminal_refresh_codes=_OAUTH_GRANT_DEAD_CODES | _NOUS_AUTH_MISSING_CODES, logout_from_config=True),
      "openai-codex": OAuthProviderFlow(
          "openai-codex", "resolve_codex_runtime_credentials", "get_codex_auth_status",
@@ -249,7 +321,7 @@ index e296bbb6..68076801 100644
      "xai-oauth": OAuthProviderFlow(
          "xai-oauth", "resolve_xai_oauth_runtime_credentials", "get_xai_oauth_auth_status",
 diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
-index 257b4314..e8931737 100644
+index 257b4314..03370da6 100644
 --- a/hermes_cli/auth_codex.py
 +++ b/hermes_cli/auth_codex.py
 @@ -16,7 +16,7 @@ import json
@@ -261,7 +333,25 @@ index 257b4314..e8931737 100644
  from pathlib import Path
  from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Tuple
  from hermes_cli.auth_constants import (
-@@ -440,6 +440,10 @@ def _codex_quota_exhausted_error(retry_after: Optional[int]) -> AuthError:
+@@ -148,6 +148,8 @@ def _sync_codex_pool_entries(
+     with the latest-authenticated token pair. The access_token-match check distinguishes the two cases
+     without changing the source-string contract.
+     """
++    from hermes_cli.psy_codex_policy import is_managed
++
+     access_token = tokens.get("access_token")
+     if not access_token:
+         return
+@@ -158,6 +160,8 @@ def _sync_codex_pool_entries(
+     # None/empty prev_at → no manual entry can be an alias (right default for a first-ever save).
+     prev_at = (previous_singleton_tokens or {}).get("access_token") or None
+     for entry in _codex_pool_dicts(entries):
++        if is_managed(auth_store, entry):
++            continue
+         source = entry.get("source")
+         is_alias = source == "manual:device_code" and bool(
+             prev_at and entry.get("access_token") == prev_at)
+@@ -440,6 +444,10 @@ def _codex_quota_exhausted_error(retry_after: Optional[int]) -> AuthError:
      return _codex_err(message, CODEX_RATE_LIMITED_CODE, relogin=False)
  
  
@@ -272,7 +362,7 @@ index 257b4314..e8931737 100644
  def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
      """Decode a non-200 Codex token-refresh response into a shaped AuthError."""
      from hermes_cli.auth import _nonempty_str
-@@ -475,41 +479,78 @@ def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
+@@ -475,41 +483,78 @@ def _codex_refresh_failure_error(response: httpx.Response) -> AuthError:
      # force relogin even if the body error code wasn't one of the known strings.
      relogin_required = (
          code in {"invalid_grant", "invalid_token", "invalid_request", "refresh_token_reused"}
@@ -377,7 +467,47 @@ index 257b4314..e8931737 100644
      updated = {
          "access_token": refreshed_access, "refresh_token": refresh_token.strip(),
          "last_refresh": _utc_now_z()}
-@@ -636,12 +677,9 @@ def resolve_codex_runtime_credentials(
+@@ -519,6 +564,29 @@ def refresh_codex_oauth_pure(
+     return updated
+ 
+ 
++def _renew_psy_codex(observed, *, quota_probe=False, timeout_seconds=None):
++    """Offer native refreshes to the PSY owner before Hermes' independent-account path."""
++    from hermes_cli.psy_codex_policy import CredentialIssue, renew_native
++
++    if timeout_seconds is None:
++        timeout_seconds = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
++    try:
++        managed = renew_native(observed, quota_probe=quota_probe,
++                               timeout_seconds=timeout_seconds)
++    except CredentialIssue as issue:
++        signin = issue.kind == "signin"
++        raise AuthError(
++            "Codex owner login required" if signin else "Codex renewal deferred",
++            provider="openai-codex", code="psy_signin" if signin else "psy_access_wait",
++            relogin_required=signin, retryable=not signin) from None
++    except OSError:
++        # Persistence can fail after a successful rotating POST. Never fall through
++        # to the legacy exchanger. The durable journal arbitrates the next attempt.
++        raise AuthError("Codex credential storage temporarily unavailable", provider="openai-codex",
++                        code="psy_access_wait", retryable=True) from None
++    return managed[0] if managed is not None else None
++
++
+ def _refresh_codex_auth_tokens(tokens: dict[str, str], timeout_seconds: float) -> dict[str, str]:
+     """Refresh Codex access token using the refresh token.
+ 
+@@ -534,6 +602,9 @@ def _refresh_codex_auth_tokens(tokens: dict[str, str], timeout_seconds: float) -
+         stored = (state or {}).get("tokens")
+         stored = stored if isinstance(stored, dict) else {}
+         stored_at, stored_rt = _stripped(stored.get("access_token")), _stripped(stored.get("refresh_token"))
++        managed = _renew_psy_codex(tokens, timeout_seconds=timeout_seconds)
++        if managed is not None:
++            return {**tokens, "access_token": managed["access_token"], "refresh_token": managed["refresh_token"]}
+         if stored_at and stored_rt and stored_rt != _stripped(tokens.get("refresh_token")):
+             logger.info("Codex refresh token already rotated by a peer — adopting the stored pair.")
+             return {**tokens, "access_token": stored_at, "refresh_token": stored_rt}
+@@ -636,12 +707,9 @@ def resolve_codex_runtime_credentials(
              if imported:
                  data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
      if data is None:
@@ -393,7 +523,7 @@ index 257b4314..e8931737 100644
          if pool_token:
              # Report the host this row routes to, not the ambient default: a pooled gateway key
              # paired with chatgpt.com leaks to every consumer of this result (#121486).
-@@ -654,16 +692,28 @@ def resolve_codex_runtime_credentials(
+@@ -654,16 +722,28 @@ def resolve_codex_runtime_credentials(
              # days in the future while the account is already usable again. Never from a
              # read-only caller: the picker fingerprint resolves on every cache-only read.
              if not read_only and _probe_codex_pool_entry_quota_restored(pool_rate_limit):
@@ -428,7 +558,7 @@ index 257b4314..e8931737 100644
          if read_error is not None:
              raise read_error
          raise _codex_err(_NO_CREDENTIALS_MSG.format(relogin=_codex_relogin_command()),
-@@ -790,7 +840,8 @@ def _probe_codex_quota_restored(
+@@ -790,7 +870,8 @@ def _probe_codex_quota_restored(
  
  def _refresh_expired_codex_probe_token(
      access_token: Any, refresh_token: Any, *,
@@ -438,7 +568,7 @@ index 257b4314..e8931737 100644
      """Refresh an EXPIRED stored access token so the quota probe can get a real answer.
  
      Exhausted pool entries are skipped by the proactive refresh chain (#44799), so by the time
-@@ -818,34 +869,97 @@ def _refresh_expired_codex_probe_token(
+@@ -818,34 +899,104 @@ def _refresh_expired_codex_probe_token(
              return None
      try:
          return refresh_codex_oauth_pure(token, refresh)
@@ -511,33 +641,40 @@ index 257b4314..e8931737 100644
 +            return row.get("last_status") not in {"dead", "exhausted"}
 +        token, grant = _stripped(row.get("access_token")), _stripped(row.get("refresh_token"))
 +        if row.get("auth_type") == "oauth" and _codex_access_token_is_expiring(token, 0):
-+            state = (store.get("providers") or {}).get("openai-codex") or {}
-+            singleton = state.get("tokens") or {}
-+            same_singleton = bool(grant) and singleton.get("refresh_token") == grant
-+            # The exact single-use grant also identifies any legacy aliases of this row.
-+            aliases = [item for item in _codex_pool_dicts(_pool_entries(store, "openai-codex"))
-+                       if grant and item.get("refresh_token") == grant]
 +            try:
-+                fresh = _refresh_expired_codex_probe_token(token, grant, propagate_terminal=True)
-+            except AuthError as exc:
-+                now = time.time()
++                managed = _renew_psy_codex(row, quota_probe=True)
++            except AuthError as issue:
++                return False if issue.relogin_required else None
++            if managed is not None:
++                row = managed
++            else:
++                state = (store.get("providers") or {}).get("openai-codex") or {}
++                singleton = state.get("tokens") or {}
++                same_singleton = bool(grant) and singleton.get("refresh_token") == grant
++                # The exact single-use grant also identifies any legacy aliases of this row.
++                aliases = [item for item in _codex_pool_dicts(_pool_entries(store, "openai-codex"))
++                           if grant and item.get("refresh_token") == grant]
++                try:
++                    fresh = _refresh_expired_codex_probe_token(token, grant, propagate_terminal=True)
++                except AuthError as exc:
++                    now = time.time()
++                    for item in aliases:
++                        item.update(last_status="dead", last_status_at=now, last_error_code=None,
++                                    last_error_reason=exc.code, last_error_message="Codex OAuth grant rejected")
++                    if same_singleton:
++                        singleton.pop("refresh_token", None)
++                        singleton.pop("access_token", None)
++                        state["last_auth_error"] = {"code": exc.code, "relogin_required": True}
++                    _save_auth_store(store, target_path=target)
++                    return False
++                if not fresh:
++                    return None
 +                for item in aliases:
-+                    item.update(last_status="dead", last_status_at=now, last_error_code=None,
-+                                last_error_reason=exc.code, last_error_message="Codex OAuth grant rejected")
++                    item.update(fresh)
 +                if same_singleton:
-+                    singleton.pop("refresh_token", None)
-+                    singleton.pop("access_token", None)
-+                    state["last_auth_error"] = {"code": exc.code, "relogin_required": True}
++                    singleton.update({key: fresh[key] for key in ("access_token", "refresh_token")})
++                    state["last_refresh"] = fresh.get("last_refresh")
 +                _save_auth_store(store, target_path=target)
-+                return False
-+            if not fresh:
-+                return None
-+            for item in aliases:
-+                item.update(fresh)
-+            if same_singleton:
-+                singleton.update({key: fresh[key] for key in ("access_token", "refresh_token")})
-+                state["last_refresh"] = fresh.get("last_refresh")
-+            _save_auth_store(store, target_path=target)
 +            token = row["access_token"]
 +        base_url = _codex_pool_route_base_url(row.get("base_url"))
 +    result = _probe_codex_quota_restored(token, base_url=base_url)
@@ -558,7 +695,7 @@ index 257b4314..e8931737 100644
  
  
  def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
-@@ -918,29 +1032,95 @@ def _pool_entries(auth_store: dict[str, Any], provider_id: str) -> Optional[list
+@@ -918,29 +1069,98 @@ def _pool_entries(auth_store: dict[str, Any], provider_id: str) -> Optional[list
      return entries if isinstance(entries, list) else None
  
  
@@ -643,6 +780,9 @@ index 257b4314..e8931737 100644
 +    from hermes_cli.auth import read_credential_pool
 +
 +    with _codex_pool_owner_lock():
++        managed = _renew_psy_codex(row)
++        if managed is not None:
++            return managed["access_token"], _stripped(managed.get("base_url"))
 +        if not row.get("id"):
 +            # Old stores have no row id. Only a unique, unchanged bearer can identify that row.
 +            token = row["access_token"]

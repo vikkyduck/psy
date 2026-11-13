@@ -88,12 +88,14 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.message.reply_text.return_value = NS(message_id=110)
         store.Checkpoints(self.ident).put("route:input:v1", dict(destination=[-202,7,0,100], doc_id=None,
                           question="write lecture",quote="",history=[],research=False,draw=False,model="fixture"))
-        with (patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture", {})),
+        with (patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture", {}, "fixture-generation")),
+              patch.object(model.codex_policy, "record_model_refusal") as refused,
               patch.object(model,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
             await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
             self.assertEqual(counts, Counter({1:1,2:1,3:1}))
             self.assertEqual(accepted, [])
             self.assertEqual(store.state(self.ident),"queued")
+            refused.assert_called_once_with("fixture-generation")
             store.recover()
             self.now += 1 + store.next_retry_delay()
             authenticated = True
@@ -133,7 +135,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             def run_model(turns, **opts):
                 return model._compose(None,turns,False,"test",opts["question"],checkpoints=opts["checkpoints"])
             with (patch.object(queue.Update,"de_json",return_value=NS(message=self.message,update_id=ident)),
-                  patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture",{})),
+                  patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),
                   patch.object(model,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
                 await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
                 self.assertEqual(store.state(ident),"queued")
@@ -181,7 +183,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.to_thread(classify, msg.checkpoints)
         with (patch.object(queue.Update, "de_json", side_effect=restore), patch.object(route, "group_message",group),
-              patch.object(model, "_connection", return_value=("fixture", {})), patch.object(model, "_transport", nullcontext),
+              patch.object(model, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(model, "_transport", nullcontext),
               patch.object(model, "time", NS(monotonic=lambda: getattr(clocks,"now",0)))):
             worker=asyncio.create_task(queue.work(self.app, wake))
             try:

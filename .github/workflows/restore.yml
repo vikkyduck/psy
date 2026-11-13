@@ -25,6 +25,11 @@ jobs:
           python3 gateway/apply.py verify "$target"
           python3 gateway/test_gateway.py "$target"
           python3 gateway/apply.py apply "$target"
+      - name: Test Codex renewal across the gateway, monitor and Hermes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/oauth-tests"
+          "$RUNNER_TEMP/oauth-tests/bin/pip" install "httpx==0.28.1" "ruamel.yaml==0.18.16" "python-dotenv==1.2.4"
+          "$RUNNER_TEMP/oauth-tests/bin/python" -B gateway/integration/codex_renewal.py "$RUNNER_TEMP/hermes"
       - name: Exercise the Mini App with synthetic recordings over loopback
         run: |
           python3 -m venv "$RUNNER_TEMP/psy-venv"

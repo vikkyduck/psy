@@ -30,7 +30,7 @@ class Duration(unittest.TestCase):
 
     def connection(self):
         # A fresh stage must see the same account's currently usable token.
-        return "unused", {"fixture-issued": self.elapsed}
+        return "unused", {"fixture-issued": self.elapsed}, "fixture-generation"
 
     def compose(self, question, stage, *, research=False):
         def stream(method, endpoint, *, headers, json, timeout):

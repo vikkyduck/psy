@@ -28,7 +28,7 @@ class Incident(unittest.TestCase):
         bootstrap.enable_happy_eyeballs_on_client=lambda c:None
         modules={"httpx":httpx,"agent.codex_headers":headers,"agent.process_bootstrap":bootstrap}
         with patch.dict(sys.modules,modules), patch.object(m,"_credentials",return_value={
-                "provider":"openai-codex","base_url":m.ENDPOINT,"api_key":"test-only"}):
+                "provider":"openai-codex","base_url":m.ENDPOINT,"api_key":"test-only", "generation":"fixture-generation"}):
             self.assertEqual(m._respond([{"role":"user","content":"test"}],research=False,draw=False,model="test").text,"ok")
         client.get.assert_not_called()
         self.assertEqual(client.stream.call_args.args,("POST",m.ENDPOINT+"/responses"))

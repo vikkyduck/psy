@@ -191,90 +191,15 @@ def _failure(status, detail, stage):
 from hermes_cli import psy_codex_policy as codex_policy
 
 CredentialIssue = codex_policy.CredentialIssue
-_GROUP_AUTH_MARKERS = "/var/lib/psy-codex-auth"
 
 
-def _group_subscription_cooldown(row):
-    import re
-    import time
-
-    # Hermes treats any 429 as quota-shaped. Keep documented traffic throttles in force.
-    if row.get("last_status") != "exhausted" or row.get("last_error_code") not in (None, 429):
-        return False
-    reason = str(row.get("last_error_reason") or "").lower()
-    if reason in {"usage_limit_reached", "usage_limit_exceeded", "insufficient_quota"}:
-        return True
-    if reason in {"rate_limit_exceeded", "too_many_requests"}:
-        return False
-    message = str(row.get("last_error_message") or "").lower()
-    if any(part in message for part in ("usage_limit_reached", "usage_limit_exceeded", "insufficient_quota",
-                                        "hit your usage limit", "usage limit reached", "usage limit has been reached")):
-        return True
-    # With only an HTTP status and reset, the upstream classifier can persist a
-    # long subscription window with no reason. Let a real job test it after
-    # the same backoff Hermes uses for account monitoring. No probe is issued.
-    if row.get("last_error_code") != 429 or reason or not re.fullmatch(
-            r"(?:|(?:http(?: error)? |error code: ?)?429[.]?)", message.strip()):
-        return False
-    started = row.get("last_status_at")
-    reset = row.get("last_error_reset_at")
-    return (type(started) in (int, float) and type(reset) in (int, float)
-            and reset - started >= 3600 and started + 300 <= time.time() < reset)
+def get_credentials(rejected=None):
+    return codex_policy.model_credentials(rejected)
 
 
-def get_credentials(rejected_bearer=None):
-    from pathlib import Path
-    import httpx
-    from hermes_cli.auth import _load_auth_store
-    from hermes_cli.auth_codex import _codex_pool_row_available
-
-    markers = Path(_GROUP_AUTH_MARKERS)
-    def admit(store, row, _expiry):
-        if (codex_policy.legacy_marker(markers / "rejected", row["refresh_token"])
-                or codex_policy.legacy_marker(markers / "account-denied", row["access_token"])):
-            raise CredentialIssue("signin", "preferred login refused")
-        recovery = codex_policy.group_recovery(row)
-        if recovery in ("access_wait", "signin"):
-            raise CredentialIssue(recovery, "model authorization recovery pending")
-        if rejected_bearer == row["access_token"] and recovery == "renewed":
-            raise CredentialIssue("signin", "model refused renewed bearer")
-        rows = store["credential_pool"][codex_policy.PROVIDER]
-        sole = sum(isinstance(r, dict) and r.get("last_status") != "dead" for r in rows) <= 1
-        if not _codex_pool_row_available(row, sole) and not _group_subscription_cooldown(row):
-            raise CredentialIssue("access_wait", "preferred login in cooldown")
-
+def _credentials(rejected=None):
     try:
-        store = _load_auth_store()
-        row, expiry = codex_policy.preferred(store)
-        admit(store, row, expiry)
-        rejected = rejected_bearer == row["access_token"]
-        if rejected or expiry <= time.time() + 300:
-            try:
-                row, expiry, changed = codex_policy.renew(
-                    row, check=admit, rejected_file=markers / "rejected", model_rejected=rejected)
-            except CredentialIssue as exc:
-                # A temporary proactive renewal failure need not interrupt a live bearer.
-                if rejected or expiry <= time.time() or not exc.may_use_current:
-                    raise
-            else:
-                if not changed:
-                    # Re-evaluate markers and admission when a peer supplied the generation.
-                    latest = _load_auth_store()
-                    current, expiry = codex_policy.preferred(latest)
-                    if current["id"] != row["id"]:
-                        raise CredentialIssue("access_wait", "preferred login changed")
-                    row = current
-                    admit(latest, row, expiry)
-                if expiry <= time.time():
-                    raise CredentialIssue("access_wait", "Codex login expired")
-        return {"provider": codex_policy.PROVIDER, "base_url": codex_policy.BASE, "api_key": row["access_token"]}
-    except (OSError, httpx.RequestError):
-        raise CredentialIssue("access_wait", "credential store unavailable") from None
-
-
-def _credentials(rejected_bearer=None):
-    try:
-        return get_credentials(rejected_bearer)
+        return get_credentials(rejected)
     except CredentialIssue as exc:
         raise ModelIssue(exc.kind, "credentials") from None
 
@@ -296,27 +221,38 @@ def _transport():
         raise ModelIssue("connection", "transport") from None
 
 
-def _connection(rejected_bearer=None):
+def _connection(rejected=None):
     from agent.codex_headers import codex_cloudflare_headers
-    cred = _credentials(rejected_bearer)
+    cred = _credentials(rejected)
     if cred["base_url"].rstrip("/") != ENDPOINT or cred["provider"] != "openai-codex":
         raise RuntimeError("group model route unavailable")
     token = cred["api_key"]
-    return token, {**codex_cloudflare_headers(token), "Authorization": f"Bearer {token}", "Accept": "text/event-stream"}
+    headers = {**codex_cloudflare_headers(token), "Authorization": f"Bearer {token}", "Accept": "text/event-stream"}
+    return token, headers, cred["generation"]
 
 
 def _authenticated_request(request):
-    token, headers = _connection()
+    token, headers, generation = _connection()
     try:
         return request(token, headers)
     except ModelIssue as exc:
         # Only a refusal before the stream starts guarantees no accepted work.
         if (exc.kind, exc.stage) != ("signin", "http"):
             raise
-    replacement, headers = _connection(rejected_bearer=token)
-    if replacement == token:
-        raise ModelIssue("signin", "credentials")
-    return request(replacement, headers)
+    replacement, headers, next_generation = _connection(rejected=generation)
+    if replacement != token:
+        try:
+            return request(replacement, headers)
+        except ModelIssue as exc:
+            if (exc.kind, exc.stage) != ("signin", "http"):
+                raise
+    try:
+        # If only the grant changed and the bearer is identical, the HTTP evidence
+        # belongs to the first generation. A concurrent owner login must survive.
+        codex_policy.record_model_refusal(generation if replacement == token else next_generation)
+    except CredentialIssue as exc:
+        raise ModelIssue(exc.kind, "credentials") from None
+    raise ModelIssue("signin", "credentials")
 
 
 class _ResumeModelJob(Exception):

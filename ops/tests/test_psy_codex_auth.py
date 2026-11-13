@@ -1,5 +1,6 @@
 """Offline renewal tests. The only credentials, clock and store here are fixtures."""
 import copy
+import json
 import sys
 import tempfile
 from io import StringIO
@@ -25,8 +26,8 @@ class TestCodexMaintenance(unittest.TestCase):
     def setUp(self):
         self.now = 1_800_000_000
         self.expiry = {
-            "initial": self.now + guard.RENEW_BEFORE * 5,
-            "rotated": self.now + guard.RENEW_BEFORE * 10,
+            "initial": self.now + policy.RENEW_BEFORE * 5,
+            "rotated": self.now + policy.RENEW_BEFORE * 10,
         }
         self.primary = {
             "id": "first", "label": "primary", "source": "manual:device_code",
@@ -54,7 +55,7 @@ class TestCodexMaintenance(unittest.TestCase):
             self.assertTrue(self.locked)
             self.store = copy.deepcopy(store)
 
-        def rotate(access, refresh):
+        def rotate(access, refresh, *, timeout_seconds=20.0):
             self.assertTrue(self.locked)
             self.assertEqual((access, refresh), ("initial", "first-grant"))
             return self.rotated.copy()
@@ -69,6 +70,7 @@ class TestCodexMaintenance(unittest.TestCase):
         modules["hermes_cli.auth_constants"].httpx = SimpleNamespace(RequestError=ConnectionError)
         modules["hermes_cli.auth"]._auth_store_lock = lock
         modules["hermes_cli.auth"]._load_auth_store = lambda: copy.deepcopy(self.store)
+        modules["hermes_cli.auth"]._save_private_json = lambda p, data, **opts: p.write_text(json.dumps(data))
         modules["hermes_cli.auth"]._save_auth_store = self.save
         modules["hermes_cli.auth_codex"].refresh_codex_oauth_pure = self.refresh
         # These fixtures use the numeric 429 form of Hermes' quota classification.
@@ -85,14 +87,15 @@ class TestCodexMaintenance(unittest.TestCase):
         for replacement in (
             patch.dict(sys.modules, modules),
             patch.object(guard, "time", SimpleNamespace(time=lambda: self.now)),
-            patch.object(guard, "REJECTED", Path(directory.name) / "marker"),
+            patch.object(policy, "MARKERS", Path(directory.name)),
+            patch.object(policy, "time", SimpleNamespace(time=lambda: self.now)),
             patch.object(guard, "check_provider", self.probe),
         ):
             replacement.start()
             self.addCleanup(replacement.stop)
 
     def due(self):
-        self.expiry["initial"] = self.now + guard.RENEW_BEFORE // 2
+        self.expiry["initial"] = self.now + policy.RENEW_BEFORE // 2
 
     def test_fresh_login_is_checked_without_refresh(self):
         guard.maintain()
@@ -103,7 +106,7 @@ class TestCodexMaintenance(unittest.TestCase):
     def test_early_refresh_preserves_cooldown_identity_and_other_rows(self):
         self.due()
         self.primary.update(last_status="exhausted", last_error_code=429,
-                            last_error_reset_at=self.now + 3 * guard.RENEW_BEFORE)
+                            last_error_reset_at=self.now + 3 * policy.RENEW_BEFORE)
         expected = copy.deepcopy(self.store)
         expected["credential_pool"][guard.PROVIDER][1].update(self.rotated)
         guard.maintain()
@@ -132,7 +135,7 @@ class TestCodexMaintenance(unittest.TestCase):
             guard.maintain()
         self.assertEqual(self.store, before)
         self.save.assert_not_called()
-        self.assertFalse(guard.REJECTED.exists())
+        self.assertFalse((policy.MARKERS / "rejected").exists())
         self.refresh.side_effect = None
         self.refresh.return_value = self.rotated.copy()
         guard.maintain()
@@ -180,7 +183,7 @@ class TestCodexMaintenance(unittest.TestCase):
         self.refresh.side_effect = error
         with self.assertRaisesRegex(guard.CheckError, "retry next check"):
             guard.maintain()
-        self.assertFalse(guard.REJECTED.exists())
+        self.assertFalse((policy.MARKERS / "rejected").exists())
 
     def test_peer_rotation_before_lock_is_reused_after_401(self):
         self.probe.side_effect = [self.rejected, self.available]
@@ -244,12 +247,46 @@ class TestCodexMaintenance(unittest.TestCase):
         self.assertEqual(self.refresh.call_count, 2)
         self.assertEqual(self.probe.call_count, 6)
 
+    def test_delayed_401_after_renewal_cannot_overwrite_denial_for_new_login(self):
+        self.due()
+        marker = policy.MARKERS / "account-denied"
+        def late_rejection(_):
+            row = self.store["credential_pool"][guard.PROVIDER][1]
+            row["refresh_token"] = "another-generation"
+            marker.write_text(json.dumps({"generation": policy.generation(row)}))
+            return self.rejected
+        self.probe.side_effect = late_rejection
+        with self.assertRaisesRegex(guard.CheckError, "changed during account check"):
+            guard.maintain()
+        row = self.store["credential_pool"][guard.PROVIDER][1]
+        self.assertTrue(policy.account_denied(policy.MARKERS, row))
+        self.refresh.assert_called_once()
+
+    def test_delayed_valid_account_cannot_clear_denial_for_new_login_with_same_bearer(self):
+        marker = policy.MARKERS / "account-denied"
+        def late_success(_):
+            self.primary["refresh_token"] = "another-generation"
+            marker.write_text(json.dumps({"generation": policy.generation(self.primary)}))
+            return self.available
+        self.probe.side_effect = late_success
+        with self.assertRaisesRegex(guard.CheckError, "changed during account check"):
+            guard.maintain()
+        self.assertTrue(policy.account_denied(policy.MARKERS, self.primary))
+        self.refresh.assert_not_called()
+
+    def test_fresh_account_success_leaves_model_refusal_in_force(self):
+        policy.mark_model(self.primary, "signin", 0)
+        guard.maintain()
+        self.assertEqual(policy.group_recovery(self.primary), "signin")
+        self.save.assert_not_called()
+        self.refresh.assert_not_called()
+
     def test_persistent_account_401_allows_scheduled_renewal(self):
         self.probe.side_effect = [self.rejected, self.rejected, self.available]
         with self.assertRaises(guard.CheckError):
             guard.maintain()
-        self.expiry["rotated"] = self.now + guard.RENEW_BEFORE // 2
-        self.expiry["scheduled"] = self.now + 10 * guard.RENEW_BEFORE
+        self.expiry["rotated"] = self.now + policy.RENEW_BEFORE // 2
+        self.expiry["scheduled"] = self.now + 10 * policy.RENEW_BEFORE
         self.refresh.side_effect = None
         self.refresh.return_value = dict(self.rotated, access_token="scheduled")
         guard.maintain()
@@ -288,7 +325,7 @@ class TestCodexMaintenance(unittest.TestCase):
         self.assertEqual(self.store, before)
         self.refresh.assert_not_called()
         self.save.assert_not_called()
-        self.assertFalse(guard.REJECTED.exists())
+        self.assertFalse((policy.MARKERS / "rejected").exists())
 
     def test_transient_and_unrecognized_response_keep_quota_unknown(self):
         for status, body in [(None, None), (429, None), (503, None), (403, {}),
