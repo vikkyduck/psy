@@ -68,7 +68,9 @@ class Depth(unittest.TestCase):
         client = Mock()
         client.stream.return_value = nullcontext(response)
         res = m._stream(client, {}, [], research, "model", 180)
-        self.assertNotIn("verbosity", str(client.stream.call_args.kwargs["json"]))
+        payload = client.stream.call_args.kwargs["json"]
+        self.assertNotIn("verbosity", str(payload))
+        self.assertNotIn("max_output_tokens", payload)
         return res
 
     def test_commentary_never_becomes_a_response_or_a_continuation(self):
@@ -139,6 +141,8 @@ class Depth(unittest.TestCase):
                 return m.Result(json.dumps(plan,ensure_ascii=False),[],0)
             if "только раздел 1" in instructions:
                 return m.Result("Материал "*1500,[],0)
+            if "Проверь содержание раздела" in instructions:
+                return m.Result('{"missing":""}', [], 0)
             raise m.ModelIssue("quota","test")
         r=m._lecture(call,[m._user("текст лекции")],30)
         self.assertFalse(r.complete)
@@ -146,20 +150,57 @@ class Depth(unittest.TestCase):
         self.assertIn("Материал Материал",r.text)
         self.assertIn("лимита",r.text)
 
-    def test_lecture_appends_missing_speech_without_replacing_the_draft(self):
+    def test_lecture_fills_a_concrete_gap_even_in_a_long_draft(self):
         plan = {"title":"Чтение", "sections":[
             {"title":"Текст", "minutes":30, "activity_minutes":10, "brief":"пример"}]}
+        draft = "Разбор уже прозвучавшего материала. " * 1500
         def call(turns, instructions):
             if "редакционный" in instructions:
                 return m.Result(json.dumps(plan, ensure_ascii=False), [], 0)
             if "только раздел 1" in instructions:
-                return m.Result("основа " * 1700, [], 0)
-            self.assertIn("только добавляемый текст", turns[-1]["content"])
-            return m.Result("продолжение " * 300, [], 0)
+                return m.Result(draft, [], 0)
+            if "Проверь содержание раздела" in instructions:
+                self.assertEqual(turns[-1]["content"], draft)
+                return m.Result('{"missing":"Разбор реплики из источника"}', [], 0)
+            self.assertIn("Разбор реплики из источника", turns[-1]["content"])
+            return m.Result("Продолжение примера.", [], 0)
         r = m._lecture(call, [m._user("рукопись")], 30)
         self.assertTrue(r.complete)
-        self.assertEqual(r.text.count("основа"), 1700)
-        self.assertEqual(r.text.count("продолжение"), 300)
+        self.assertIn(draft + "\n\nПродолжение примера.", r.text)
+        self.assertIn("10 мин", r.text)
+
+    def test_lecture_accepts_semantic_completion_regardless_of_length(self):
+        for size in (1, 10000):
+            with self.subTest(size=size):
+                q = "Подготовь занятие на 30 минут. По моей просьбе объем текста - 400 слов."
+                doc = "Материал " * size
+                calls = []
+                def call(turns, instructions):
+                    self.assertEqual(turns[0], m._user(q))
+                    calls.append(instructions)
+                    if "редакционный" in instructions:
+                        return m.Result(json.dumps({"title":"Разбор", "sections":[{"title":"Пример",
+                            "minutes":30, "activity_minutes":8, "brief":"Разобрать эпизод"}]}), [], 0)
+                    if "только раздел 1" in instructions:
+                        return m.Result(doc, [], 0)
+                    self.assertIn("Проверь содержание раздела", instructions)
+                    return m.Result('{"missing":""}', [], 0)
+                r = m._lecture(call, [m._user(q)], 30)
+                self.assertTrue(r.complete)
+                self.assertIn(doc, r.text)
+                self.assertEqual(len(calls), 3)
+                for text in [*calls, r.text]:
+                    self.assertNotRegex(text, r"\d+ (?:произносимых )?слов|слов/мин|словах в минуту")
+
+    def test_lecture_does_not_lose_draft_on_review_failure(self):
+        plan = {"title":"Разбор", "sections":[{"title":"Пример", "minutes":30,
+                                                  "activity_minutes":0, "brief":"Разобрать эпизод"}]}
+        call = Mock(side_effect=[m.Result(json.dumps(plan), [], 0), m.Result("Сохранить текст", [], 0),
+                                 m.ModelIssue("quota", "test")])
+        r = m._lecture(call, [m._user("Лекция")], 30)
+        self.assertFalse(r.complete)
+        self.assertIn("Сохранить текст", r.text)
+        self.assertIn("лимита", r.text)
 
     def test_selector_is_toolless_and_rejects_unscoped_ids(self):
         opts=[{"id":16,"name":"пример"}]
