@@ -277,5 +277,60 @@ class Depth(unittest.TestCase):
                 self.assertFalse(stream.call_args.args[3])
 
 
+URL = "https://example.org/research.pdf"
+
+
+def card(number, total):
+    return dict(name=f"Observation {number}", number=number, total=total, series="Experiments",
+                author="A", work="Article", date="1920", url=URL + f"#page={number}",
+                support=f"sample {number}", access="full_text", location=f"section {number}",
+                claim=f"distinct mechanism {number}")
+
+
+def inventory(*numbers, trace=True):
+    body = {"scope":"Article, sections 1-3", "items":[card(n, 3) for n in numbers], "gaps":[]}
+    return m.Result(json.dumps(body), [], 1, source_urls=(URL,) if trace else ())
+
+
+class CentralReading(unittest.TestCase):
+    def test_finds_all_members_of_series_prior_to_comparative_work(self):
+        calls = []
+        def call(turns, instructions, *, web):
+            self.assertTrue(web)
+            calls.append(instructions)
+            if instructions == m.CENTRAL_READING:
+                if calls.count(m.CENTRAL_READING) == 1:
+                    self.assertIn("Die Verdrängung", turns[0]["content"])
+                    self.assertIn("#page=8", turns[0]["content"])
+                    self.assertNotIn("Lacan", str(turns))
+                    return inventory(1)
+                self.assertIn("[1] из 3", turns[-1]["content"])
+                return inventory(2, 3)
+            if instructions == m.WEB_SYSTEM:
+                return m.Result("Comparative sources", [], 1)
+            self.assertEqual(instructions, m.SOURCE_CHECK)
+            self.assertIn("distinct mechanism 3", str(turns))
+            return m.Result(json.dumps({"claims":[card(1, 3)], "gaps":[]}), [], 1, source_urls=(URL,))
+        result = m._primary_sources(call, "Freud repression and French legacy", read_main=True)
+        evidence = json.loads(result.text)
+        self.assertCountEqual(calls, [m.CENTRAL_READING, m.CENTRAL_READING, m.WEB_SYSTEM, m.SOURCE_CHECK])
+        self.assertEqual(calls[-1], m.SOURCE_CHECK)
+        self.assertEqual([c["number"] for c in evidence["central_reading"]], [1,2,3])
+        self.assertEqual(evidence["gaps"], [])
+
+    def test_partial_read_preserves_real_cells_and_labels_missing_elements(self):
+        mock = Mock(side_effect=[inventory(1), inventory(2,3,trace=False)])
+        entries, gaps, count = m._read_central_work(mock, "Another author")
+        self.assertEqual([c["number"] for c in entries], [1])
+        self.assertTrue(any("[1] из 3" in g for g in gaps))
+        self.assertEqual(count, 2)
+
+    def test_french_assignment_points_to_requested_sessions_and_later_publication(self):
+        text = m.reading_list("Recherche sur le refoulement chez Freud et les psychanalystes français")
+        for locator in ("#page=197", "197-198", "Perrier", "Mannoni", "verworfen", "#page=14", "#page=9"):
+            self.assertIn(locator, text)
+        self.assertEqual(m.reading_list("Different author and work"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
