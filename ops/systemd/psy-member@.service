@@ -1,6 +1,7 @@
 [Unit]
 Description=Validate a PSY Mini App launch or check fixed group membership
 [Service]
+LoadCredential=recording-signing:/etc/psy-upload/recording-signing
 EnvironmentFile=/etc/psy/instance.env
 Type=exec
 User=psy-access

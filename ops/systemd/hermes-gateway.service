@@ -5,6 +5,7 @@ Wants=network-online.target psy-group-upload.socket
 StartLimitIntervalSec=0
 
 [Service]
+LoadCredential=recording-signing:/etc/psy-upload/recording-signing
 Type=simple
 User=hermes
 Group=hermes

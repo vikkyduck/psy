@@ -1,5 +1,7 @@
 """Offline socket worker. Only the uploader UID can submit job IDs."""
 import json
+import hashlib
+import tempfile
 import math
 import os
 from pathlib import Path
@@ -88,6 +90,43 @@ def decode(jobdir, src, target, lang, ident, env):
             child.wait()
 
 
+def snapshot(jobdir, job):
+    """Open the upload once without following links, check its signed digest and decode these bytes."""
+    ext, size, expected = job['ext'], job['size'], job['content_id']
+    if type(size) is not int or not 0 < size <= 1024**3 or not re.fullmatch('[a-f0-9]{64}', expected):
+        raise ValueError('Invalid recording bounds')
+    source = INPUT / (job['id'] + ext)
+    private = jobdir / ('input-' + expected + ext)
+    fd = os.open(source,os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as src:
+        info = os.fstat(src.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            raise ValueError('Invalid recording file')
+        with tempfile.NamedTemporaryFile(dir=jobdir,prefix='input-staging-',delete=False) as temp:
+            path = Path(temp.name)
+            try:
+                blocks, full = hashlib.sha256(), hashlib.sha256()
+                remaining = size
+                while remaining:
+                    chunk = src.read(min(1024**2,remaining))
+                    if not chunk:
+                        raise ValueError('Incomplete recording')
+                    blocks.update(hashlib.sha256(chunk).digest())
+                    full.update(chunk)
+                    temp.write(chunk)
+                    remaining -= len(chunk)
+                if src.read(1) or blocks.hexdigest() != expected:
+                    raise ValueError('Recording digest mismatch')
+                temp.flush()
+                os.fsync(temp.fileno())
+                # A stable timestamp keeps the decoder checkpoint key across retries.
+                os.utime(path,ns=(0,0))
+                os.replace(path,private)
+                return private,full.hexdigest()
+            finally:
+                path.unlink(missing_ok=True)
+
+
 def serve(conn):
     peer = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i'))
     if struct.unpack('3i', peer)[1] != pwd.getpwnam('psy-deliver').pw_uid:
@@ -101,17 +140,14 @@ def serve(conn):
     ident, ext, lang = job['id'], job['ext'], job['language']
     if not re.fullmatch('[0-9a-f]{32}', ident) or not re.fullmatch(r'\.[a-z0-9]+', ext) or ext[1:] not in EXTENSIONS or lang not in ('auto', 'ru', 'en'):
         return
-    src = INPUT / (ident + ext)
-    st = src.lstat()
-    if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= 1024 ** 3:
-        return
     jobdir = OUTPUT / ident
     jobdir.mkdir(mode=0o700, exist_ok=True)
     if jobdir.is_symlink():
         raise ValueError('Unsafe job directory')
+    src,sha = snapshot(jobdir,job)
     target = jobdir / 'result.txt'
     env = {**os.environ, 'HERMES_HOME': str(jobdir), 'HOME': str(jobdir),
-           'PSY_ASR_OUTPUT': str(jobdir), 'TMPDIR': str(jobdir)}
+           'PSY_ASR_INPUT': str(jobdir), 'PSY_ASR_OUTPUT': str(jobdir), 'TMPDIR': str(jobdir)}
     try:
         env['PSY_ASR_PROGRESS_FILE'] = str(jobdir / 'progress.json')
         meta = decode(jobdir, src, target, lang, ident, env)
@@ -121,16 +157,21 @@ def serve(conn):
         count = target.stat().st_size
         if not meta['complete'] or not math.isfinite(duration) or duration <= 0 or not 0 < count <= MAX_TEXT:
             return
-        header = dict(complete=True, duration=duration, speech_detected=meta['speech_detected'], text_bytes=count)
+        header = dict(complete=True, duration=duration, speech_detected=meta['speech_detected'], text_bytes=count,sha256=sha)
         conn.sendall(json.dumps(header).encode() + b'\n')
         with target.open('rb') as file:
             conn.sendfile(file)
     finally:
         target.unlink(missing_ok=True)
+        src.unlink(missing_ok=True)
 
 
 def main():
     OUTPUT.mkdir(mode=0o700, exist_ok=True, parents=True)
+    # Only one decoder runs. Remove snapshots interrupted before their final rename/cleanup.
+    for abandoned in OUTPUT.glob('*/input-*'):
+        if abandoned.is_file() and not abandoned.is_symlink():
+            abandoned.unlink()
     SOCKET.unlink(missing_ok=True)
     with socket.socket(socket.AF_UNIX) as server:
         server.bind(str(SOCKET))

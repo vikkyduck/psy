@@ -4,6 +4,7 @@ Wants=network-online.target
 After=network-online.target psy-asr.service
 Wants=psy-asr.service
 [Service]
+LoadCredential=recording-signing:/etc/psy-upload/recording-signing
 EnvironmentFile=/etc/psy/instance.env
 Type=simple
 User=psy-deliver
@@ -23,7 +24,7 @@ ProcSubset=pid
 LoadCredential=telegram:/etc/psy-upload/telegram
 BindPaths=/home/hermes/.hermes/vault/uploads:/srv/psy-queue /home/hermes/.hermes/media-vault/uploads:/srv/psy-media
 BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress
-ReadWritePaths=/srv/psy-queue /srv/psy-media
+ReadWritePaths=/srv/psy-queue /var/lib/psy-recording-receipts
 InaccessiblePaths=/etc/psy-upload
 PrivateTmp=true
 CapabilityBoundingSet=

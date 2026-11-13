@@ -4,6 +4,11 @@ import json
 import logging
 import os
 import time
+import tempfile
+from pathlib import Path
+import io
+import recording_grant as grants
+import recording_receipts as receipts
 
 from aiohttp import ClientSession, ClientTimeout, FormData
 from asr_client import ASRStalled
@@ -34,17 +39,19 @@ async def group_access(http, job):
 
 async def transcribe(job):
     from asr_client import transcribe_recording
-    source, output = C.file_path(job), C.file_path(job,'.txt')
-    if source.stat().st_size != job['size']:
-        raise ValueError('Size mismatch')
-    sha, identity = await asyncio.to_thread(C.file_hashes, source)
-    if (job['sha256'] and job['sha256'] != sha) or (job['content_id'] and job['content_id'] != identity):
-        raise ValueError('File digest mismatch')
-    with C.db() as c:
-        c.execute('UPDATE jobs SET sha256=? WHERE id=?', (sha, job['id']))
-    result = await transcribe_recording(job, output)
-    if result.get('complete') is not True or not output.is_file() or not output.stat().st_size:
-        raise ValueError('Incomplete output')
+    if (not grants.valid_job(job) or job['ext'] not in C.EXTENSIONS
+            or (job['chat'] != C.GROUP and (job['uid'] != C.OWNER or job['chat'] != C.OWNER))):
+        raise ValueError('Unverified recording grant')
+    # The worker never opens a path under the web-writable directory. ASR checks
+    # the signed content digest on its own private audio snapshot before decoding.
+    with tempfile.TemporaryDirectory(dir=receipts.root()) as directory:
+        output = Path(directory) / 'result.txt'
+        result = await transcribe_recording(job, output)
+        if result.get('complete') is not True:
+            raise ValueError('Incomplete output')
+        data = receipts.read_regular(output)
+        receipts.save(job,result,data)
+        result['text_size'] = len(data)
     return result
 
 
@@ -71,26 +78,49 @@ def retry_later(job, stage, delay=0):
 
 
 async def deliver(http, job):
+    record = receipts.get(job['id'],body=True)
+    if record is None:
+        finish(job,'unverified')
+        return
+    origin = json.loads(record['binding'])
+    if not grants.valid_job(origin) or any(origin[k]!=job[k] for k in grants.ROUTE):
+        # The projection is writable by ingress. Reject rerouting even to an allowed chat.
+        finish(job,'unverified')
+        return
+    state = record['delivery']
+    retry = json.loads(job['retry_proof']) if job.get('retry_proof') else None
+    if state == 'sent' or (state != 'ready' and not retry):
+        finish(job,'unknown' if state == 'sending' else state,record['message_id'])
+        return
+    if state == 'ready' and record['next_try'] > C.now():
+        with C.db() as conn:
+            conn.execute('UPDATE jobs SET next_try=? WHERE id=?',(record['next_try'],job['id']))
+        return
     try:
-        allowed = await group_access(http, job)
+        allowed = await group_access(http, origin)
     except MembershipUnavailable:
         retry_later(job,'delivery_pending')
         return
     if not allowed:
+        receipts.status(job['id'],'access_revoked')
         finish(job,'access_revoked')
         return
+    if not receipts.start(job['id'],C.now(),retry):
+        finish(job,'unknown' if state == 'sending' else state,record['message_id'])
+        return
+    origin['speech_detected'] = record['speech']
     form = FormData()
-    form.add_field('chat_id',str(job['chat']))
-    if job['speech_detected'] == 0:
+    form.add_field('chat_id',str(origin['chat']))
+    if origin['speech_detected'] == 0:
         caption = 'Обработка завершена. Разборчивая речь в записи не обнаружена.'
     else:
-        caption = 'Расшифровка записи "'+job['filename'][:150]+'" готова. Ответьте на это сообщение, чтобы обсудить текст.'
+        caption = 'Расшифровка записи "'+origin['filename'][:150]+'" готова. Ответьте на это сообщение, чтобы обсудить текст.'
     form.add_field('caption',caption)
-    if job['thread']:
-        form.add_field('message_thread_id',str(job['thread']))
-    if job['reply']:
-        form.add_field('reply_parameters',json.dumps({'message_id':job['reply'],'allow_sending_without_reply':True}))
-    with C.file_path(job,'.txt').open('rb') as text_file:
+    if origin['thread']:
+        form.add_field('message_thread_id',str(origin['thread']))
+    if origin['reply']:
+        form.add_field('reply_parameters',json.dumps({'message_id':origin['reply'],'allow_sending_without_reply':True}))
+    with io.BytesIO(record['body']) as text_file:
         form.add_field('document',text_file,filename='Расшифровка.txt',content_type='text/plain; charset=utf-8')
         # Persist the ambiguous boundary before doing the non-idempotent HTTP call.
         with C.db() as c:
@@ -98,21 +128,42 @@ async def deliver(http, job):
         try:
             result = await bot_call(http,'sendDocument',form)
         except Exception:
+            receipts.status(job['id'],'unknown')
             finish(job,'unknown')
             return
-    if result.get('ok') and isinstance((result.get('result') or {}).get('message_id'),int):
-        finish(job,'sent',result['result']['message_id'])
+    if result.get('ok') and type((result.get('result') or {}).get('message_id')) is int:
+        msg = result['result']['message_id']
+        receipts.status(job['id'],'sent',msg)
+        finish(job,'sent',msg)
     elif result.get('ok') is False and result.get('error_code') == 429:
-        retry_later(job,'delivery_pending',int((result.get('parameters') or {}).get('retry_after') or 0))
-    elif result.get('ok') is False and result.get('error_code',0) in range(400,500):
-        finish(job,'failed')
+        count = record['attempts'] + 1
+        if count >= 8:
+            receipts.status(job['id'],'failed')
+            finish(job,'failed')
+            return
+        wait = max(10*2**(count-1),int((result.get('parameters') or {}).get('retry_after') or 0))
+        receipts.status(job['id'],'ready',next_try=C.now()+wait,attempt=count)
+        retry_later({**job,'attempts':count-1},'delivery_pending',wait)
     else:
-        finish(job,'unknown')
+        state = 'failed' if result.get('ok') is False and result.get('error_code',0) in range(400,500) else 'unknown'
+        receipts.status(job['id'],state)
+        finish(job,state)
+
 
 
 async def run_job(http, job):
     if job['state'] == 'delivery_pending':
         await deliver(http,job)
+        return
+    if not grants.valid_job(job):
+        with C.db() as conn:
+            conn.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
+                         ('У записи нет подтвержденного источника. Загрузите исходный файл заново.',C.now(),job['id']))
+        return
+    saved = receipts.get(job['id'])
+    if saved:
+        with C.db() as conn:
+            conn.execute("UPDATE jobs SET state='delivery_pending',updated=? WHERE id=?",(C.now(),job['id']))
         return
     try:
         if not await group_access(http,job):
@@ -130,8 +181,8 @@ async def run_job(http, job):
         return
     with C.db() as c:
         c.execute("""UPDATE jobs SET state='delivery_pending',duration=?,speech_detected=?,
-                     attempts=0,next_try=0,updated=? WHERE id=?""",
-                  (result['duration'],result.get('speech_detected'),C.now(),job['id']))
+                     attempts=0,next_try=0,updated=?,text_size=?,sha256=? WHERE id=?""",
+                  (result['duration'],result.get('speech_detected'),C.now(),result['text_size'],result.get('sha256'),job['id']))
 
 
 def next_ready_job(conn):
@@ -142,9 +193,12 @@ def next_ready_job(conn):
 
 async def main():
     C.initialize()
+    receipts.initialize()
+    with receipts.db(True) as db:
+        db.execute("UPDATE results SET delivery='unknown' WHERE delivery='sending'")
     with C.db() as c:
         c.execute("UPDATE jobs SET state='queued' WHERE state='processing'")
-        c.execute("UPDATE jobs SET state='done',delivery='unknown' WHERE state='sending'")
+        c.execute("UPDATE jobs SET state='delivery_pending',next_try=0 WHERE state='sending'")
     async with ClientSession(timeout=ClientTimeout(total=120)) as http:
         while True:
             with C.db() as c:

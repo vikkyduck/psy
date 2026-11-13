@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import recording_grant as grants
 import sqlite3
 import time
 from urllib.parse import parse_qsl, urlsplit
@@ -73,13 +74,16 @@ def initialize():
         CREATE INDEX IF NOT EXISTS job_owner ON jobs(uid, chat, created);
         ''')
         c.execute('BEGIN IMMEDIATE')
+        for table in ('sessions','tickets'):
+            if 'proof' not in {r['name'] for r in c.execute('PRAGMA table_info('+table+')')}:
+                c.execute('ALTER TABLE '+table+' ADD COLUMN proof TEXT')
         columns = {r['name'] for r in c.execute('PRAGMA table_info(jobs)')}
         for column, definition in (
             ('content_id', 'TEXT'), ('speech_detected', 'INTEGER'),
             ('attempts', 'INTEGER NOT NULL DEFAULT 0'), ('next_try', 'INTEGER NOT NULL DEFAULT 0'),
             ('retry_generation', 'INTEGER NOT NULL DEFAULT 0'),
             ('queued_at_ns', 'INTEGER'),
-            ('reprocess_of', 'TEXT'),
+            ('reprocess_of', 'TEXT'), ('proof','TEXT'), ('retry_proof','TEXT'), ('text_size','INTEGER'),
         ):
             if column not in columns:
                 c.execute(f'ALTER TABLE jobs ADD COLUMN {column} {definition}')
@@ -120,7 +124,9 @@ def ticket(uid, chat, thread=None, reply=None):
     ident = secrets.token_hex(16)
     with db() as c:
         c.execute('DELETE FROM tickets WHERE expires < ?', (now(),))
-        c.execute('INSERT INTO tickets VALUES(?,?,?,?,?,?)', (ident, uid, chat, thread, reply, now()+3600))
+        row = dict(id=ident,uid=uid,chat=chat,thread=thread,reply=reply,expires=now()+3600)
+        row['proof'] = grants.sign('ticket',grants.ticket_fields(row))
+        c.execute('INSERT INTO tickets(id,uid,chat,thread,reply,expires,proof) VALUES(:id,:uid,:chat,:thread,:reply,:expires,:proof)',row)
     return ident
 
 
@@ -157,14 +163,12 @@ def validate_init(raw, token, current=None):
     return validate_init_context(raw, token, current)['uid']
 
 
-def create_session(uid, context):
-    secret = secrets.token_urlsafe(32)
+def store_session(row):
     with db() as c:
         c.execute('DELETE FROM sessions WHERE expires < ?', (now(),))
-        c.execute('DELETE FROM sessions WHERE uid=? AND hash NOT IN (SELECT hash FROM sessions WHERE uid=? ORDER BY expires DESC LIMIT 9)', (uid,uid))
-        c.execute('INSERT INTO sessions VALUES(?,?,?,?,?,?)',
-            (hashlib.sha256(secret.encode()).hexdigest(), uid, context['chat'], context.get('thread'), context.get('reply'), now()+8*3600))
-    return secret
+        c.execute('DELETE FROM sessions WHERE uid=? AND hash NOT IN (SELECT hash FROM sessions WHERE uid=? ORDER BY expires DESC LIMIT 9)', (row['uid'],row['uid']))
+        c.execute('INSERT INTO sessions(hash,uid,chat,thread,reply,expires,proof) VALUES(:hash,:uid,:chat,:thread,:reply,:expires,:proof)',row)
+
 
 
 def get_session(secret):
@@ -179,7 +183,10 @@ def file_path(job, suffix=None):
     ident = job['id']
     if not re.fullmatch('[a-f0-9]{32}', ident):
         raise ValueError('Invalid job')
-    return FILES / (ident + (suffix or job['ext']))
+    ext = suffix or job['ext']
+    if ext not in EXTENSIONS and ext != '.txt':
+        raise ValueError('Invalid extension')
+    return FILES / (ident + ext)
 
 
 def bot_settings():

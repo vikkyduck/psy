@@ -16,7 +16,7 @@ async def transcribe_recording(job, destination):
     async with asyncio.timeout(6 * 3600 + 180):
         reader, writer = await asyncio.open_unix_connection('/run/psy-asr/transcribe.sock')
         try:
-            request = {key: job[key] for key in ('id', 'ext', 'language')}
+            request = {key: job[key] for key in ('id', 'ext', 'language','size','content_id')}
             writer.write(json.dumps(request).encode() + b'\n')
             await writer.drain()
             header = json.loads(await reader.readline())
@@ -37,8 +37,7 @@ async def transcribe_recording(job, destination):
                     out.flush()
                     os.fsync(out.fileno())
                     out.close()
-                    # Give the gateway read access through its restricted shared group.
-                    os.chmod(temp, 0o640)
+                    os.chmod(temp, 0o600)
                     os.replace(temp, destination)
                 finally:
                     temp.unlink(missing_ok=True)

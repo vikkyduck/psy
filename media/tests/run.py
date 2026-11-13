@@ -17,9 +17,15 @@ def main():
             PSY_ASR_PROGRESS=temp+'/progress', PSY_ACCESS_SOCKET=temp+'/member.sock',
             PSY_MEMBER_QUOTA_BYTES=str(4*1024**3),
         )
-        os.environ.pop('CREDENTIALS_DIRECTORY', None)
+        os.environ['CREDENTIALS_DIRECTORY'] = temp+'/fixture-credentials'
+        Path(os.environ['CREDENTIALS_DIRECTORY']).mkdir()
+        (Path(os.environ['CREDENTIALS_DIRECTORY'])/'recording-signing').write_bytes(os.urandom(32))
+        os.environ['PSY_RECEIPT_ROOT'] = temp+'/receipts'
+        Path(os.environ['PSY_RECEIPT_ROOT']).mkdir()
         sys.path.insert(0, str(MEDIA))
         sys.path.insert(0, str(MEDIA/'tests'))
+        import recording_receipts
+        recording_receipts.initialize()
         suite = unittest.defaultTestLoader.discover(str(MEDIA/'tests'))
         if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
             return 1

@@ -37,6 +37,9 @@ as_user psy-asr psy-deliver "BindReadOnlyPaths=$p:/srv/psy-media" /bin/sh -ec \
     'test -r "$1"; test ! -w "$1"; test ! -r /home/hermes/.hermes' sh "$media"
 as_user psy-upload psy-upload "BindPaths=$p:/srv/psy-media" /usr/bin/test -r "$media.txt"
 runuser -u hermes -- test -r "$p/$tag.txt"
+receipt=/var/lib/psy-recording-receipts
+runuser -u psy-upload -- sh -ec 'test -r "$1/results.sqlite3"; test ! -w "$1/results.sqlite3"; test ! -w "$1"; test ! -r /etc/psy-upload/recording-signing' sh "$receipt"
+runuser -u psy-deliver -- test -w "$receipt/results.sqlite3"
 for account in psy-upload psy-deliver; do
     as_user "$account" "$account" "BindPaths=$q:/srv/psy-queue" /bin/sh -ec \
         'test -w "$1"; test ! -r /home/hermes/.hermes' sh "$db"

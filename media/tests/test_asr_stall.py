@@ -151,6 +151,7 @@ class StalledJobContract(unittest.IsolatedAsyncioTestCase):
                 c.execute("""INSERT INTO jobs(id,uid,chat,filename,ext,size,fingerprint,language,state,created,updated)
                              VALUES(?,?,?,?,?,?,?,?,?,?,?)""",('b'*32,C.OWNER,C.OWNER,'test.wav','.wav',1,'fake','ru','processing',0,0))
                 job=dict(c.execute('SELECT * FROM jobs').fetchone())
+            job['proof']=worker.grants.sign('job',worker.grants.job_fields(job))
             C.file_path(job).write_bytes(b'X')
             with patch.object(asyncio,'open_unix_connection',AsyncMock(return_value=(reader,writer))):
                 await worker.run_job(None,job)

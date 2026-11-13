@@ -16,6 +16,7 @@ import psy_upload_common as C
 import server
 import storage_capacity
 import worker
+import recording_receipts as receipts
 from test_upload import TOKEN, signed
 from broker_fixture import start_broker
 
@@ -77,7 +78,7 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
     async def recognize(self, job, destination):
         self.recognized.append(job["id"])
         destination.write_bytes(("fixture transcript " + job["id"]).encode())
-        return {"complete": True, "duration": 1.25, "speech_detected": True}
+        return {"complete": True, "duration": 1.25, "speech_detected": True, "sha256":hashlib.sha256(self.audio).hexdigest()}
 
     async def login(self, uid, chat, thread=None, reply=None):
         body = {"initData": signed(uid)}
@@ -181,7 +182,7 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
         with C.db() as db:
             db.execute("UPDATE jobs SET content_id=NULL,sha256=NULL WHERE id=?", (parent,))
         row = self.job(parent)
-        text = C.file_path(row, ".txt").read_bytes()
+        text = receipts.get(row["id"],body=True)["body"]
         minimum = len(self.audio) + len(text) + storage_capacity.MAX_TRANSCRIPT_BYTES
         with patch.dict(os.environ, PSY_MEMBER_QUOTA_BYTES=str(minimum - 1)):
             denied = await self.client.post(path + "/reprocess", headers=self.private)
@@ -196,7 +197,7 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
             await self.finish(child)
         self.assertEqual(self.job(child)["sha256"], hashlib.sha256(self.audio).hexdigest())
         self.assertEqual(self.job(parent), row)
-        self.assertEqual(C.file_path(row, ".txt").read_bytes(), text)
+        self.assertEqual(receipts.get(row["id"],body=True)["body"], text)
         self.assertEqual(self.deliveries[-1][0], C.OWNER)
 
     async def test_source_unavailable_keeps_original_download_and_receipt(self):
@@ -204,7 +205,7 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(parent)
         row = self.job(parent)
         path = "/api/jobs/" + parent
-        text = C.file_path(row, ".txt").read_bytes()
+        text = receipts.get(row["id"],body=True)["body"]
         C.file_path(row).unlink()
         self.assertEqual((await self.client.post(path + "/reprocess", headers=self.private)).status, 409)
         self.assertEqual(await (await self.client.get(path + "/transcript", headers=self.private)).read(), text)

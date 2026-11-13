@@ -26,8 +26,10 @@ def _regular_file(path):
 def _member_usage(conn, files, uid):
     used = reserved = 0
     sources = set()
-    for ident, ext, size, offset, state in conn.execute(
-        'SELECT id,ext,size,offset,state FROM jobs WHERE uid=?', (uid,)
+    has_size = any(row[1] == 'text_size' for row in conn.execute('PRAGMA table_info(jobs)'))
+    size_column = 'text_size' if has_size else 'NULL'
+    for ident, ext, size, offset, state, known_text_size in conn.execute(
+        'SELECT id,ext,size,offset,state,'+size_column+' FROM jobs WHERE uid=?', (uid,)
     ):
         if not re.fullmatch('[0-9a-f]{32}', ident) or not re.fullmatch(r'\.[a-z0-9]{1,8}', ext) or ext == '.txt':
             raise ValueError('Unexpected upload storage identifier')
@@ -37,8 +39,11 @@ def _member_usage(conn, files, uid):
             if inode not in sources:
                 used += source.st_size
                 sources.add(inode)
-        transcript = _regular_file(files / (ident + '.txt'))
-        text_size = transcript.st_size if transcript else 0
+        if known_text_size is None:
+            transcript = _regular_file(files / (ident + '.txt'))
+            text_size = transcript.st_size if transcript else 0
+        else:
+            text_size = known_text_size
         used += text_size
         if state == 'uploading':
             # Bytes written by an uncommitted PATCH may be rewound when it is retried.

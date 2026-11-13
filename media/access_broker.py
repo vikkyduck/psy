@@ -1,5 +1,8 @@
 """One peer-authenticated, narrowly scoped Mini App lookup per systemd-accepted socket."""
 import http.client
+import hashlib
+import secrets
+import time
 import json
 import os
 from pathlib import Path
@@ -10,6 +13,7 @@ import sys
 
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 import psy_upload_common as C
+import recording_grant as grant
 
 MAX_REQUEST = 32 * 1024
 MAX_RESPONSE = 16 * 1024
@@ -37,6 +41,39 @@ def telegram_member(uid, token):
 def dispatch(request,token,member_lookup=telegram_member):
     if not isinstance(request,dict):
         return {'status':400}
+    if request.get('action') in ('login','session','bind','redeliver'):
+        try:
+            action = request['action']
+            if action == 'login':
+                ctx = C.validate_init_context(request['init_data'], token)
+                ticket = request.get('ticket')
+                uid = ctx['uid']
+                if ticket is not None:
+                    if (not isinstance(ticket,dict) or ticket['uid'] != uid or ticket['expires'] <= time.time()
+                            or not grant.checked('ticket',grant.ticket_fields(ticket),ticket.get('proof'))):
+                        raise PermissionError()
+                    dest = grant.route(ticket)
+                elif ctx['start_param'] == 'psy_group':
+                    dest = {'uid':uid,'chat':C.GROUP}
+                elif not ctx['start_param'] and uid == C.OWNER:
+                    dest = {'uid':uid,'chat':C.OWNER}
+                else:
+                    raise PermissionError()
+                secret = secrets.token_urlsafe(32)
+                return {'status':200,'secret':secret,'session':grant.session(secret,dest,C.now()+grant.TTL)}
+            session = request['session']
+            if (not grant.valid_session(session) or hashlib.sha256(request['secret'].encode()).hexdigest()
+                    != session['hash']):
+                raise PermissionError()
+            if action == 'session':
+                return {'status':200}
+            if action == 'bind':
+                return {'status':200, 'job':grant.bind(session, request['shape'], request.get('parent'))}
+            return {'status':200, 'retry':grant.redelivery(session, request['job'],request.get('confirmed'))}
+        except PermissionError:
+            return {'status':403}
+        except (ValueError,KeyError,TypeError,AttributeError):
+            return {'status':401}
     if request.get('action')=='init' and set(request)=={'action','init_data'}:
         try:
             ctx=C.validate_init_context(request['init_data'],token)

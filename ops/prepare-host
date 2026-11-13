@@ -36,6 +36,14 @@ runuser -u hermes -- sh -ec 'test -e "$1" || (set -C; : > "$1")' sh "$h/vault/up
 runuser -u hermes -- setfacl -m u:psy-upload:rw,u:psy-deliver:rw "$h/vault/uploads/state.sqlite3"
 runuser -u hermes -- setfacl -m u:psy-upload:rwx,u:psy-deliver:rwx,u:psy-asr:--x,d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rx,d:u:psy-asr:rx,d:g::---,d:o::--- "$h/media-vault/uploads"
 install -d -m 0755 /etc/psy /etc/psy-upload /srv/psy-media /srv/psy-queue /srv/psy-progress
+install -d -m 0750 -o psy-deliver -g psy-upload /var/lib/psy-recording-receipts
+if [[ ! -e /etc/psy-upload/recording-signing ]]; then
+    (set -C; head -c 32 /dev/urandom > /etc/psy-upload/recording-signing)
+fi
+[[ ! -L /etc/psy-upload/recording-signing && $(stat -c '%U:%a:%s' /etc/psy-upload/recording-signing) == 'root:600:32' ]]
+if [[ ! -e /var/lib/psy-recording-receipts/results.sqlite3 ]]; then
+    install -m 0640 -o psy-deliver -g psy-upload /dev/null /var/lib/psy-recording-receipts/results.sqlite3
+fi
 if [[ ! -e /etc/psy/instance.env ]]; then
     install -m 0640 -o root -g hermes "$base/instance.env.example" /etc/psy/instance.env
 fi

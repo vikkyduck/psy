@@ -16,6 +16,8 @@ import time
 import weakref
 from aiohttp import web
 import psy_upload_common as C
+import recording_grant as grants
+import recording_receipts as receipts
 from storage_capacity import MAX_TRANSCRIPT_BYTES, admission_reason, capacity_snapshot
 from queue_health import PROGRESS_WARNING_SECONDS, processing_age
 
@@ -56,7 +58,7 @@ async def membership(request, uid):
 
 async def access_lookup(payload):
     async def exchange():
-        reader,writer=await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'],limit=1024)
+        reader,writer=await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'],limit=16384)
         try:
             writer.write(json.dumps(payload,separators=(',',':')).encode()+b'\n')
             await writer.drain()
@@ -92,27 +94,34 @@ async def auth(request):
     if request.content_length is None or request.content_length > 20000:
         raise web.HTTPRequestEntityTooLarge(max_size=20000, actual_size=request.content_length or 0)
     body = await request.json()
-    launch = await access_lookup({'action':'init','init_data':body.get('initData')})
-    if type(launch.get('uid')) is not int or launch.get('start_param') not in ('','psy_group'):
-        raise web.HTTPServiceUnavailable()
-    uid=launch['uid']
-    ident = body.get('ticket')
-    # The shared group entry uses Telegram's signed start parameter. It is not
-    # an access token: every participant must still pass a live membership check.
-    # Ignore browser-supplied chat/user/destination fields entirely.
-    if ident:
-        context = C.get_ticket(ident, uid)
-    elif launch['start_param'] == 'psy_group':
-        context = {'chat': C.GROUP}
-    elif not launch['start_param'] and uid == C.OWNER:
-        context = {'chat': C.OWNER}
-    else:
-        context = None
-    if not context:
-        return failure(403, 'Эта загрузка недоступна. Откройте кнопку "Записи" в закрепленном сообщении группы.')
-    if context['chat'] == C.GROUP and not await membership(request, uid):
-        return failure(403, 'Загрузка доступна только участникам группы.')
-    return web.json_response({'session': C.create_session(uid, context), 'destination': 'Группа' if context['chat'] == C.GROUP else 'Личная переписка с PSY', 'limit': C.LIMIT, 'chunk': C.CHUNK})
+    raw = body.get('initData')
+    ticket = None
+    if body.get('ticket'):
+        launch = await access_lookup({'action':'init','init_data':raw})
+        ticket = C.get_ticket(body['ticket'],launch['uid'])
+        if not ticket:
+            raise web.HTTPForbidden()
+    reply = await access_lookup({'action':'login','init_data':raw,'ticket':ticket})
+    session = reply['session']
+    if session['chat'] == C.GROUP and not await membership(request, session['uid']):
+        raise web.HTTPForbidden()
+    C.store_session(session)
+    return web.json_response({'session':reply['secret'],'destination':'Группа' if session['chat']==C.GROUP else 'Личная переписка с PSY','limit':C.LIMIT,'chunk':C.CHUNK})
+
+
+async def bound_request(request, session, action, **data):
+    return await access_lookup({'action':action,'secret':request.headers['X-Upload-Session'],'session':session,**data})
+
+
+def authorized_result(job, session, body=False):
+    result = receipts.get(job['id'], body=body)
+    if not result:
+        raise web.HTTPNotFound()
+    origin = json.loads(result['binding'])
+    if any(origin[k] != session[k] for k in ('uid','chat')):
+        raise web.HTTPNotFound()
+    return origin,result
+
 
 
 def owned_job(ident, session):
@@ -215,30 +224,23 @@ async def create(request):
     if not re.fullmatch('[a-f0-9]{64}', str(b.get('content_id',''))):
         return failure(426, 'Откройте кнопку "Записи" заново, чтобы проверить целостность всего файла.')
     content_id = b['content_id']
-    import secrets
-    ident = secrets.token_hex(16)
+    shape = dict(filename=name,ext=ext,size=size,language=language,content_id=content_id)
+    proof = (await bound_request(request,s,'bind',shape=shape))['job']
+    ident = proof['id']
     with C.db() as c:
         c.execute('BEGIN IMMEDIATE')
         expire_drafts(c)
         existing = c.execute("""SELECT * FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
-            AND filename=? AND size=? AND language=? AND content_id=? AND (state IN
+            AND filename=? AND size=? AND language=? AND content_id=? AND proof IS NOT NULL AND (state IN
             ('uploading','queued','processing','delivery_pending','sending') OR (state='done' AND updated>?))
             ORDER BY created DESC LIMIT 1""", (s['uid'],s['chat'],s['thread'],s['reply'],name,size,
                                                language,content_id,C.now()-86400)).fetchone()
         if existing:
             return web.json_response(public_job(existing))
-        legacy=c.execute("""SELECT * FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
-            AND filename=? AND size=? AND language=? AND fingerprint=? AND state='uploading'
-            AND content_id IS NULL ORDER BY updated DESC LIMIT 1""",
-            (s['uid'],s['chat'],s['thread'],s['reply'],name,size,language,fp)).fetchone()
-        if legacy:
-            # Preserve a pre-upgrade transfer. The final digest must still match every byte.
-            c.execute('UPDATE jobs SET content_id=? WHERE id=?',(content_id,legacy['id']))
-            return web.json_response(public_job(legacy))
         denied=admission(c,s['uid'],size)
         if denied is not None:return denied
-        c.execute('INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,fingerprint,language,state,created,updated,content_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            (ident,s['uid'],s['chat'],s['thread'],s['reply'],name,ext,size,fp,language,'uploading',C.now(),C.now(),content_id))
+        c.execute('INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,fingerprint,language,state,created,updated,content_id,proof) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (ident,s['uid'],s['chat'],s['thread'],s['reply'],name,ext,size,fp,language,'uploading',C.now(),C.now(),content_id,proof['proof']))
         p=C.file_path({'id':ident,'ext':ext})
         with p.open('xb'):
             pass
@@ -317,9 +319,11 @@ async def complete(request):
 
 async def transcript(request):
     s=await authorize(request);j=owned_job(request.match_info['id'],s)
-    p=C.file_path(j,'.txt')
-    if j['state'] not in ('done','delivery_pending','sending') or not p.is_file():raise web.HTTPNotFound()
-    return web.FileResponse(p,headers={'Content-Disposition':'attachment; filename="transcript.txt"'})
+    await bound_request(request,s,'session')
+    _,result = authorized_result(j,s,body=True)
+    return web.Response(body=result['body'],content_type='text/plain',charset='utf-8',
+                        headers={'Content-Disposition':'attachment; filename="transcript.txt"'})
+
 
 
 async def retry(request):
@@ -361,6 +365,12 @@ async def reprocess(request):
     owned_job(parent, session)
     if session['chat'] == C.GROUP and not await membership(request, session['uid']):
         raise web.HTTPForbidden()
+    original = owned_job(parent, session)
+    if original['state'] != 'done':
+        return failure(409,'Запись еще обрабатывается.')
+    origin,_ = authorized_result(original,session)
+    shape = {k:origin[k] for k in ('filename','ext','size','language','content_id')}
+    bound = (await bound_request(request,session,'bind',shape=shape,parent=origin))['job']
     with C.db() as conn:
         conn.execute('BEGIN IMMEDIATE')
         original = conn.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?',
@@ -385,14 +395,14 @@ async def reprocess(request):
             return failure(409, 'Исходный файл изменился. Выберите запись на устройстве.')
         # One successor per finished version, including retries after a lost HTTP response
         # or a process death between linking the recording and committing the database.
-        ident = hashlib.sha256(('psy-reprocess-v1:' + parent).encode()).hexdigest()[:32]
+        ident = bound['id']
         now = C.now()
         try:
             conn.execute("""INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,offset,
-                                fingerprint,language,content_id,sha256,state,created,updated,queued_at_ns,reprocess_of)
-                            SELECT ?,uid,chat,thread,reply,filename,ext,size,size,fingerprint,language,
-                                content_id,sha256,'queued',?,?,?,id FROM jobs WHERE id=?""",
-                         (ident,now,now,time.time_ns(),parent))
+                            fingerprint,language,content_id,state,created,updated,queued_at_ns,reprocess_of,proof)
+                            VALUES(:id,:uid,:chat,:thread,:reply,:filename,:ext,:size,:size,
+                            :fingerprint,:language,:content_id,'queued',:now,:now,:clock,:parent,:proof)""",
+                         {**bound,'fingerprint':original['fingerprint'],'now':now,'clock':time.time_ns(),'parent':parent})
         except sqlite3.IntegrityError:
             return failure(409, 'Эта запись уже обрабатывается. Откройте ее в списке записей.')
         target = C.file_path({'id':ident,'ext':original['ext']})
@@ -420,10 +430,11 @@ async def redeliver(request):
         if (job['state']!='done' or job['delivery']=='sent'
                 or (job['delivery']=='unknown' and not confirmed)):
             return failure(409,'Сначала проверьте, был ли файл доставлен.')
-        if not C.file_path(job,'.txt').is_file():raise web.HTTPNotFound()
+        origin,_ = authorized_result(job,s)
+        retry = (await bound_request(request,s,'redeliver',job=origin,confirmed=confirmed))['retry']
         with C.db() as c:
             c.execute("""UPDATE jobs SET state='delivery_pending',delivery=NULL,attempts=0,
-                        next_try=0,updated=? WHERE id=? AND state='done'""",(C.now(),ident))
+                        next_try=0,updated=?,retry_proof=? WHERE id=? AND state='done'""",(C.now(),json.dumps(retry),ident))
     return web.json_response({'state':'delivery_pending'})
 
 

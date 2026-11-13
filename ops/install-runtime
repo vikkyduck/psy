@@ -19,7 +19,7 @@ test -f "$repo/media/audio-transcription-SKILL.md"
 test -f "$repo/profile/SOUL.md"
 test -f "$repo/gateway/group-manifest.json"
 install -d -m 0755 /usr/local/libexec /usr/local/lib/psy-group /opt/psy-upload /opt/psy-upload/static
-for file in access_broker asr_client asr_sandbox asr_service psy_upload_common queue_health server storage_capacity transcribe worker; do
+for file in access_broker asr_client asr_sandbox asr_service psy_upload_common queue_health recording_grant recording_receipts server storage_capacity transcribe worker; do
     install -m 0644 "$repo/media/$file.py" /opt/psy-upload/
 done
 install -m 0644 "$repo/media/static/"* /opt/psy-upload/static/

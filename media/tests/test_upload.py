@@ -11,6 +11,7 @@ from unittest.mock import patch
 from aiohttp.test_utils import TestClient, TestServer
 import psy_upload_common as C
 import server
+import recording_receipts as receipts
 from broker_fixture import start_broker
 
 TOKEN='test-credential-only'
@@ -45,6 +46,11 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.close();C.ROOT=self.oldroot;C.FILES=self.oldfiles;server.membership=self.oldmembership;self.temp.cleanup()
+
+    def seal(self,ident,text):
+        with C.db() as c:
+            row=dict(c.execute('SELECT * FROM jobs WHERE id=?',(ident,)).fetchone())
+        receipts.save(row,dict(duration=3,speech_detected=True),text,delivery=row['delivery'] or 'ready',message_id=row['message_id'])
 
     async def new_job(self,size,head,auth=None,name='recording.wav',**extra):
         manifest=hashlib.sha256()
@@ -234,7 +240,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         ident=(await result.json())['id']
         with C.db() as c:
             c.execute("UPDATE jobs SET state='done',delivery='unknown' WHERE id=?",(ident,))
-        C.file_path({'id':ident},'.txt').write_text('fixture')
+        self.seal(ident,b'fixture')
         path='/api/jobs/'+ident+'/redeliver'
         self.assertEqual((await self.client.post(path,json={},headers=self.auth)).status,409)
         self.assertEqual((await self.client.post(path,json={'confirm_possible_duplicate':True},headers=self.auth)).status,200)
@@ -269,7 +275,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status,status)
             forged=await self.client.post('/api/auth',json={'initData':signed(123)+'x'})
             self.assertEqual(forged.status,401)
-        self.assertEqual(calls,['init','member','init','member','init','member','init'])
+        self.assertEqual(calls,['login','member','login','member','login','member','login'])
 
 
     async def test_concurrent_retries_share_create_limit_preserve_results_and_queue_fairly(self):
@@ -327,6 +333,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             conn.execute("UPDATE jobs SET state='done',delivery='sent',message_id=392 WHERE id=?",(source_id,))
         original_txt = C.file_path({'id':source_id},'.txt')
         original_txt.write_bytes(b'first transcript')
+        self.seal(source_id,b'first transcript')
         self.assertEqual((await self.client.post(route,headers=self.auth)).status,404)
         with patch.object(server, 'membership', return_value=False):
             self.assertEqual((await self.client.post(route,headers=auth)).status,403)
@@ -376,6 +383,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status,200)
                 with C.db() as conn:
                     conn.execute("UPDATE jobs SET state='done' WHERE id=?",(ident,))
+                self.seal(ident,b'fixture')
                 response = await self.client.post('/api/jobs/'+ident+'/reprocess',headers=self.auth)
                 self.assertEqual(response.status,409)
                 self.assertIn('лимита', (await response.json())['error'])

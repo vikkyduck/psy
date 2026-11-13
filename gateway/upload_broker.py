@@ -1,5 +1,4 @@
 """One systemd-accepted, UID-checked request -> a 5-minute upload session for PSY only."""
-import hashlib
 import json
 import os
 import pwd
@@ -7,6 +6,9 @@ import secrets
 import socket
 import sqlite3
 import struct
+import sys
+sys.path.insert(0,"/opt/psy-upload")
+import recording_grant
 import time
 
 def group_id():
@@ -39,8 +41,8 @@ def issue(request, database=DATABASE):
                       (uid,GROUP,now+301)).fetchone()[0]
         if n >= 24:
             raise ValueError()
-        c.execute("INSERT INTO sessions(hash,uid,chat,thread,reply,expires) VALUES(?,?,?,?,?,?)",
-                  (hashlib.sha256(token.encode()).hexdigest(),uid,GROUP,thread,reply,now+300))
+        grant = recording_grant.session(token,dict(uid=uid,chat=GROUP,thread=thread,reply=reply),now+300)
+        c.execute("INSERT INTO sessions(hash,uid,chat,thread,reply,expires,proof) VALUES(:hash,:uid,:chat,:thread,:reply,:expires,:proof)",grant)
     return token
 
 

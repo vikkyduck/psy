@@ -7,8 +7,9 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace as S
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 import sys
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/"media"))
 import upload_broker as broker
 from psy_modules import psy_group_audio as audio
 
@@ -18,13 +19,14 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path=str(Path(tmp)/"s.sqlite")
             with sqlite3.connect(path) as c:
-                c.execute("CREATE TABLE sessions(hash PRIMARY KEY, uid,chat,thread,reply,expires)")
+                c.execute("CREATE TABLE sessions(hash PRIMARY KEY, uid,chat,thread,reply,expires,proof)")
             req={"uid":11, "thread":3, "reply":9}
-            token=broker.issue(req,path)
+            with patch.object(broker.recording_grant,"key",return_value=b"x"*32):
+                token=broker.issue(req,path)
             with sqlite3.connect(path) as c:
                 data=c.execute("SELECT * FROM sessions").fetchone()
             self.assertEqual(data[:5],(hashlib.sha256(token.encode()).hexdigest(),11,audio.GROUP,3,9))
-            self.assertLessEqual(abs(time.time()+300-data[-1]),2)
+            self.assertLessEqual(abs(time.time()+300-data[5]),2)
             for invalid in ({**req,"chat":1},{**req,"uid":True},{**req,"thread":-7},{**req,"reply":"path"}):
                 with self.assertRaises(ValueError): broker.issue(invalid,path)
     async def test_upload_resume_content_checked_and_final(self):

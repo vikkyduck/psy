@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import psy_upload_common as C
 import worker
+import recording_receipts as receipts
+import recording_grant as grants
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -22,6 +24,10 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         paths=patch.multiple(C,ROOT=Path(tmp.name)/'state',FILES=Path(tmp.name)/'files')
         paths.start()
         self.addCleanup(paths.stop)
+        env=patch.dict(os.environ,PSY_RECEIPT_ROOT=tmp.name)
+        env.start()
+        self.addCleanup(env.stop)
+        receipts.initialize()
         C.initialize()
         self.ident='a'*32
         self.ok={'ok':True,'result':{'status':'member'}}
@@ -29,7 +35,11 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             c.execute("""INSERT INTO jobs(id,uid,chat,filename,ext,size,fingerprint,language,state,
                       created,updated,speech_detected) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (self.ident,17,C.GROUP,'example.wav','.wav',10,'x','ru','delivery_pending',0,0,0))
-        C.file_path(self.job(),'.txt').write_text('fixture')
+        job=self.job()
+        job['proof']=grants.sign('job',grants.job_fields(job))
+        receipts.save(job,{'duration':1,'speech_detected':False},b'fixture')
+        with C.db() as c:
+            c.execute('UPDATE jobs SET proof=?',(job['proof'],))
 
     def job(self):
         with C.db() as c:
@@ -51,7 +61,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             await worker.run_job(None,self.job())
         self.assertEqual(self.job()['state'],'delivery_pending')
         self.assertGreaterEqual(self.job()['next_try'],C.now()+44)
-        with patch.object(worker,'bot_call',AsyncMock(side_effect=[self.ok,{'ok':True,'result':{'message_id':12}}])):
+        with patch.object(C,'now',return_value=C.now()+60), patch.object(worker,'bot_call',AsyncMock(side_effect=[self.ok,{'ok':True,'result':{'message_id':12}}])):
             await worker.run_job(None,self.job())
         self.assertEqual((self.job()['state'],self.job()['delivery'],self.job()['message_id']),('done','sent',12))
 
