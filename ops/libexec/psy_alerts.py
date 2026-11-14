@@ -48,6 +48,12 @@ def group_status(path, now):
     return messages
 
 
+def memory_status(state, available, pressure):
+    struggling = available < 96 * 1024**2 or pressure > 20
+    state["memory_fails"] = state.get("memory_fails", 0) + 1 if struggling else 0
+    return state["memory_fails"] >= 3
+
+
 def collect(previous, now):
     problems = {}
     counters = {}
@@ -83,6 +89,15 @@ def collect(previous, now):
         messages = ["Не удалось прочитать состояние очереди группы."]
     if messages:
         problems["group"] = " ".join(messages)
+    try:
+        memory = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+        available = int(memory["MemAvailable"].split()[0]) * 1024
+        pressure_line = Path("/proc/pressure/memory").read_text().splitlines()[0].split()[1:]
+        pressure = float(dict(item.split("=", 1) for item in pressure_line)["avg10"])
+        if memory_status(previous, available, pressure):
+            problems["memory"] = "На сервере ПСИ сохраняется нехватка оперативной памяти или ожидание памяти при 3 проверках подряд. Требуется увеличить ресурсы."
+    except (OSError, ValueError, KeyError, IndexError):
+        pass
     origin = urllib.parse.urlsplit(os.environ["PSY_PUBLIC_URL"])
     context = ssl.create_default_context()
     try:

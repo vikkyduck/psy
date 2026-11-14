@@ -8,6 +8,13 @@ import psy_alerts as alerts
 
 
 class OwnerAlerts(unittest.TestCase):
+    def test_memory_alert_requires_sustained_pressure_and_clears(self):
+        state = {}
+        for expected in (False, False, True):
+            self.assertEqual(alerts.memory_status(state, 80 * 1024**2, 0), expected)
+        self.assertFalse(alerts.memory_status(state, 500 * 1024**2, 0))
+        self.assertEqual(state["memory_fails"], 0)
+
     def test_duplicate_suppression_retry_and_recovery(self):
         state = {}
         sender = Mock(side_effect=[alerts.Later(90), None, None])
