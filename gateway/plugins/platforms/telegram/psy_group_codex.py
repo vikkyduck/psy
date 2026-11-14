@@ -366,18 +366,18 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if not isinstance(event, dict):
                 raise ModelIssue("connection", "stream_format")
             typ = event.get("type")
-            if progress_idle and (typ in ("response.output_text.delta","response.reasoning_summary_text.delta",
-                                           "response.reasoning_text.delta") and event.get("delta")):
-                last_progress = time.monotonic()
-                if on_progress and last_progress - last_report >= 15:
-                    on_progress()
-                    last_report = last_progress
             item = event.get("item") or {}
             item_id = event.get("item_id") or item.get("id") or event.get("output_index", 0)
             content_index = event.get("content_index", 0)
             if typ in ("response.output_item.added", "response.output_item.done") and item.get("phase") == "commentary":
                 commentary.add(item_id)
                 commentary.add(event.get("output_index", item_id))
+            if progress_idle and item_id not in commentary and event.get("delta") and typ in (
+                    "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
+                last_progress = time.monotonic()
+                if on_progress and last_progress - last_report >= 15:
+                    on_progress()
+                    last_report = last_progress
             if typ == "response.output_item.added" and item.get("type") == "message" and item.get("phase") == "final_answer":
                 final_items.add(item_id)
             part = event.get("part") or {}

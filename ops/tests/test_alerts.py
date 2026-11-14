@@ -47,6 +47,17 @@ class OwnerAlerts(unittest.TestCase):
                 alerts.send_owner('test')
             token.assert_not_called()
 
+    def test_parked_model_retry_is_reported_even_when_no_job_is_stale(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'group.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.executescript('CREATE TABLE requests(id INTEGER,state TEXT); CREATE TABLE job_progress(request_id INTEGER,updated REAL,stage TEXT); CREATE TABLE model_retries(request_id INTEGER,attempts INTEGER);')
+                db.execute("INSERT INTO requests VALUES(1,'queued')")
+                db.execute("INSERT INTO model_retries VALUES(1,1)")
+            messages = alerts.group_status(path, 100)
+            self.assertEqual(len(messages), 1)
+            self.assertIn('1.', messages[0])
+
     def test_inactive_gateway_is_observed_without_gateway_import(self):
         props = lambda name: {'ActiveState': 'failed' if name=='hermes-gateway' else 'active', 'Result':'success','NRestarts':'0'}
         with patch.object(alerts, 'properties', side_effect=props), patch.object(alerts, 'group_status', return_value=[]), patch.object(alerts.socket, 'create_connection', side_effect=OSError), patch.dict(alerts.os.environ, {'PSY_PUBLIC_URL':'https://example.invalid'}):

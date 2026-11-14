@@ -8,6 +8,19 @@ from psy_modules import psy_group_codex as model, psy_group_store as store
 
 
 class ProgressWatch(unittest.TestCase):
+    def test_commentary_alone_cannot_extend_generation(self):
+        clock = [0]
+        def lines():
+            yield 'data: ' + json.dumps({"type":"response.output_item.added", "item":{"id":"c", "phase":"commentary"}})
+            for _ in range(41):
+                clock[0] += 45
+                yield 'data: ' + json.dumps({"type":"response.output_text.delta", "item_id":"c", "delta":"working"})
+        client = Mock(stream=Mock(return_value=nullcontext(Mock(status_code=200, iter_lines=lines))))
+        with patch.object(model.time, "monotonic", side_effect=lambda:clock[0]):
+            with self.assertRaises(model.ModelIssue):
+                model._stream(client, {}, [], False, "test")
+        self.assertLessEqual(clock[0], 315)
+
     def test_keepalive_cannot_hold_a_stage_forever(self):
         clock = [0]
         def lines():
