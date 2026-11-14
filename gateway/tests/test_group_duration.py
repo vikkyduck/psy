@@ -42,11 +42,10 @@ class Duration(unittest.TestCase):
         return m._compose(client, [m._user(question)], research, "test", question)
 
     def answer(self, text, *, incomplete=False, citation=None):
-        # No output deltas during the reasoning period. Each SSE comment arrives
-        # inside the read idle interval, but the whole stream takes two hours.
+        # Real reasoning progress keeps a long stream alive without a total deadline.
         for _ in range(120):
             self.elapsed += 60
-            yield ": keep-alive"
+            yield event("response.reasoning_summary_text.delta", delta="working")
         if citation:
             yield event("response.output_item.done", item={"type": "web_search_call", "status": "completed",
                         "action": {"type": "open_page", "url": citation}})

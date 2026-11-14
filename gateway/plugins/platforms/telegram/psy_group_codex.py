@@ -313,7 +313,7 @@ def _respond(turns, *, research=False, draw=False, model, question=None, checkpo
         return Result("", [base64.b64decode(encoded, validate=True)], False)
 
 
-def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=None):
+def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=300, on_progress=None):
     if read_idle is None:
         read_idle = READ_IDLE_SECONDS[bool(research)]
     tools = [{"type": "web_search"}] if research else []
@@ -347,9 +347,12 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
         unsaved_chars = 0
         last_save = time.monotonic() if save_prefix else 0
         last_progress = time.monotonic() if progress_idle else None
+        last_report = time.monotonic()
+        if on_progress:
+            on_progress()
         for line in _lines(response):
             if progress_idle and time.monotonic() - last_progress >= progress_idle:
-                interruption = ModelIssue("timeout", "classification_idle")
+                interruption = ModelIssue("timeout", "model_progress_idle")
                 break
             if isinstance(line, ModelIssue):
                 interruption = line
@@ -366,6 +369,9 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if progress_idle and (typ in ("response.output_text.delta","response.reasoning_summary_text.delta",
                                            "response.reasoning_text.delta") and event.get("delta")):
                 last_progress = time.monotonic()
+                if on_progress and last_progress - last_report >= 15:
+                    on_progress()
+                    last_report = last_progress
             item = event.get("item") or {}
             item_id = event.get("item_id") or item.get("id") or event.get("output_index", 0)
             content_index = event.get("content_index", 0)
@@ -830,8 +836,10 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
             saved_prefix = True
 
         options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
-        if checkpoints is not None and DISPATCH in instructions:
-            options["progress_idle"] = 300
+        if checkpoints is not None:
+            report = getattr(checkpoints, "progress", None)
+            if report is not None:
+                options["on_progress"] = report
         try:
             with _transport():
                 result = _authenticated_request(lambda token, headers: _stream(

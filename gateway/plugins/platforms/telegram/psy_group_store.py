@@ -45,6 +45,9 @@ def database(root=ROOT):
               PRIMARY KEY(uid,topic,message_id));
             CREATE TABLE IF NOT EXISTS turn_order (
               turn_id INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE, message_id INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS job_progress (
+              request_id INTEGER PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,
+              updated REAL NOT NULL, stage TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS checkpoints (
               request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
               key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(request_id,key));
@@ -301,6 +304,12 @@ class Checkpoints:
         if not admit_long(self.ident, root=self.root):
             raise GroupJobParked()
 
+    def progress(self, stage="model", *, now=None):
+        with database(self.root) as con:
+            con.execute("""INSERT INTO job_progress VALUES(?,?,?)
+                           ON CONFLICT(request_id) DO UPDATE SET updated=excluded.updated, stage=excluded.stage""",
+                        (self.ident, time.time() if now is None else now, stage))
+
     def get(self, key):
         with database(self.root) as con:
             row = con.execute("SELECT value FROM checkpoints WHERE request_id=? AND key=?",
@@ -313,6 +322,7 @@ class Checkpoints:
             con.execute("""INSERT INTO checkpoints(request_id,key,value) VALUES(?,?,?)
                            ON CONFLICT(request_id,key) DO UPDATE SET value=excluded.value""",
                         (self.ident, key, encoded))
+            con.execute("INSERT OR REPLACE INTO job_progress VALUES(?,?,?)", (self.ident, time.time(), "checkpoint"))
 
 
 def _schedule_request(con, ident, payload):
@@ -387,6 +397,7 @@ def claim_next(*, root=ROOT, now=None):
                        r.rowid LIMIT 1""", (MAX_LONG_JOBS, now, now)).fetchone()
         if record:
             con.execute("UPDATE requests SET state='running' WHERE id=?", (record[0],))
+            con.execute("INSERT OR REPLACE INTO job_progress VALUES(?,?,?)", (record[0], now, "started"))
             # A verified login can arrive while a previously claimed model call is unwinding.
             con.execute("""INSERT OR REPLACE INTO model_attempts(request_id,auth_revision)
                            SELECT ?,coalesce(max(revision),0) FROM auth_recoveries""", (record[0],))
