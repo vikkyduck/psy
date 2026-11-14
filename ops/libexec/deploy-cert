@@ -3,14 +3,7 @@
 set -eu
 umask 077
 base=/etc/psy-upload/tls
-# Certbot lineage: PSY_CERT_NAME from the renew unit's environment or /etc/psy/instance.env.
-name=${PSY_CERT_NAME:-}
-if [ -z "$name" ] && [ -r /etc/psy/instance.env ]; then
-  name=$(sed -n 's/^PSY_CERT_NAME=//p' /etc/psy/instance.env | tail -n 1)
-fi
-name=${name:-psy-upload}
-case "$name" in .*|*[!A-Za-z0-9._-]*) echo "Invalid PSY_CERT_NAME" >&2; exit 1 ;; esac
-source=/etc/letsencrypt/live/$name
+source=/etc/letsencrypt/live/psy-upload-ip
 install -d -o root -g root -m 0755 /etc/psy-upload "$base"
 exec 9>"$base/.deploy.lock"
 flock -x 9

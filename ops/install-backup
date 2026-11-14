@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stage backup code and units. Never create keys or enable a network timer automatically.
+set -euo pipefail
+[[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
+ops=$(cd -- "$(dirname -- "$0")" && pwd)
+for command in gpg gpgconf zstd rsync ssh tar; do command -v "$command" >/dev/null; done
+install -d -m 0700 /etc/psy-backup /var/lib/psy-backup
+if [[ ! -e /etc/psy-backup/destination.env ]]; then
+    install -m 0600 "$ops/backup/destination.env.example" /etc/psy-backup/destination.env
+fi
+if [[ ! -e /etc/psy-backup/README.txt ]]; then
+    install -m 0600 "$ops/backup/README.txt" /etc/psy-backup/README.txt
+fi
+install -m 0755 "$ops/backup/psy-backup" /usr/local/sbin/psy-backup
+install -m 0644 "$ops/systemd/psy-backup.service" "$ops/systemd/psy-backup.timer" /etc/systemd/system/
+install -d -m 0755 /etc/systemd/system/psy-backup.service.d
+printf '[Unit]\nOnFailure=psy-alerts.service\n' > /etc/systemd/system/psy-backup.service.d/owner-alert.conf
+systemctl daemon-reload
+echo "Backup staged, not started. Configure private credentials and verify one copy before enabling the timer."

@@ -42,10 +42,13 @@ jobs:
       - name: Provision isolated system accounts and check access on the runner
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends acl ffmpeg python3-venv
+          sudo apt-get install -y --no-install-recommends acl ffmpeg gnupg python3-venv rsync zstd
           sudo bash ops/prepare-host
           sudo bash ops/install-runtime
           sudo bash ops/test-host
+          sudo bash ops/tests/test_recovered_access.sh
+      - name: Verify encrypted synthetic recovery and observer configuration
+        run: python3 -m unittest discover -s tools -p "test_*.py" -v
   recognition:
     name: Verify pinned Whisper and Linux isolation
     runs-on: ubuntu-24.04

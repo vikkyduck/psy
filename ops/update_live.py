@@ -96,7 +96,8 @@ def system_entries(hermes_uid):
     entries += [Entry(LIBEXEC / dst, (REPO / "ops/libexec" / src).read_bytes(), f"ops/libexec/{src}",
                       mode=0o755 if src == "deploy-cert" else 0o644) for src, dst in HELPERS.items()]
     for unit in sorted((REPO / "ops/systemd").iterdir()):
-        if unit.is_file() and not unit.name.startswith("psy-audio-priority."):
+        # Like install-runtime: the optional audio-priority build and the backup, which ops/install-backup owns.
+        if unit.is_file() and not unit.name.startswith(("psy-audio-priority.", "psy-backup.")):
             entries.append(Entry(SYSTEMD / unit.name, unit.read_bytes(), f"ops/systemd/{unit.name}"))
     for conf in sorted((REPO / "ops/systemd/hermes-gateway.service.d").glob("*.conf")):
         entries.append(Entry(SYSTEMD / "hermes-gateway.service.d" / conf.name, conf.read_bytes(),

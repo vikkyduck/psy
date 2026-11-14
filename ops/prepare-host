@@ -6,7 +6,7 @@ command -v setfacl >/dev/null
 command -v systemctl >/dev/null
 for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
     psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer; do
+    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer psy-backup.timer; do
     if systemctl is-active --quiet "$unit"; then
         echo "$unit active. Use an idle recovery host." >&2; exit 1
     fi

@@ -29,6 +29,7 @@ class ReleaseInventory(unittest.TestCase):
             self.assertIn(f"{src}\" /usr/local/libexec/{dst}", script)
         self.assertIn("/etc/systemd/system/hermes-gateway.service.d/user-session.conf", targets)
         self.assertNotIn("/etc/systemd/system/psy-audio-priority.service", targets)
+        self.assertNotIn("/etc/systemd/system/psy-backup.service", targets)
         self.assertFalse(any("SOUL.md" in t or "/skills/" in t or t.endswith("instance.env") for t in targets))
 
 

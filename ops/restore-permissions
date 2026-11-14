@@ -1,0 +1,68 @@
+#!/bin/bash
+# Rebuild named ownership and ACLs after regular-file recovery, only on an idle host.
+set -euo pipefail
+[[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
+for unit in hermes-gateway psy-upload psy-upload-worker psy-asr psy-member.socket psy-group-upload.socket \
+    psy-healthcheck.timer psy-upload-health.timer psy-codex-auth.timer psy-alerts.timer \
+    psy-vault-archive.timer psy-backup.timer psy-upload-cert-renew.timer; do
+    state=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)
+    case "$state" in active|activating|deactivating|reloading)
+        echo "Recovery requires idle services and disabled timers" >&2; exit 1 ;;
+    esac
+done
+h=/home/hermes/.hermes
+[[ -d $h && ! -L $h && $(getent passwd hermes | cut -d: -f6) == /home/hermes ]]
+# The verifier never restores links. Refuse links in state rather than chowning a target.
+for tree in "$h/vault" "$h/media-vault" "$h/psy-owner-recovery" "$h/psy-codex-renewals" /var/lib/psy-asr; do
+    if [[ -d $tree ]] && [[ -n $(find "$tree" -type l -print -quit) ]]; then
+        echo "Unexpected link in recovered private state" >&2; exit 1
+    fi
+done
+chown hermes:hermes /home/hermes
+# Do not dereference environment symlinks. All profile state, including pending OAuth journals, belongs to hermes.
+chown -hR hermes:hermes "$h"
+chmod 0700 /home/hermes "$h"
+for tree in "$h/vault" "$h/media-vault" "$h/psy-owner-recovery" "$h/psy-codex-renewals"; do
+    [[ -d $tree ]] || continue
+    chown -R hermes:hermes "$tree"
+    setfacl -R -b -k "$tree"
+    find "$tree" -type d -exec chmod 0700 {} +
+    find "$tree" -type f -exec chmod 0600 {} +
+done
+find "$h" -maxdepth 1 -type f -exec chmod go-rwx {} +
+for name in .env auth.json config.yaml SOUL.md state.db psy-codex-received.json; do
+    p=$h/$name
+    [[ ! -L $p ]]
+    if [[ -f $p ]]; then chown hermes:hermes "$p"; chmod 0600 "$p"; fi
+done
+q=$h/vault/uploads
+m=$h/media-vault/uploads
+[[ -d $q && -d $m ]]
+setfacl -R -m u:psy-upload:rwX,u:psy-deliver:rwX "$q"
+setfacl -m d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rwx,d:g::---,d:o::--- "$q"
+setfacl -R -m u:psy-upload:rwX,u:psy-deliver:rX,u:psy-asr:rX "$m"
+setfacl -m d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rx,d:u:psy-asr:rx,d:g::---,d:o::--- "$m"
+receipt=/var/lib/psy-recording-receipts
+[[ -d $receipt && ! -L $receipt ]]
+chown psy-deliver:psy-upload "$receipt"
+chmod 0750 "$receipt"
+if [[ -f $receipt/results.sqlite3 ]]; then
+    [[ ! -L $receipt/results.sqlite3 ]]
+    chown psy-deliver:psy-upload "$receipt/results.sqlite3"
+    chmod 0640 "$receipt/results.sqlite3"
+fi
+if [[ -d /var/lib/psy-asr ]]; then
+    chown -R psy-asr:psy-deliver /var/lib/psy-asr
+    find /var/lib/psy-asr -type d -exec chmod 0700 {} +
+    find /var/lib/psy-asr -type f -exec chmod 0600 {} +
+    progress=/var/lib/psy-asr/progress
+    install -d -m 0750 -o psy-asr -g psy-deliver "$progress"
+    setfacl -R -m u:psy-upload:rX "$progress"
+    setfacl -m d:u:psy-upload:rx,d:g::rx,d:o::--- "$progress"
+fi
+if [[ -f /etc/psy-upload/recording-signing ]]; then
+    [[ ! -L /etc/psy-upload/recording-signing ]]
+    chown root:root /etc/psy-upload/recording-signing
+    chmod 0600 /etc/psy-upload/recording-signing
+fi
+echo "Recovered state ownership and ACLs rebuilt by account name. No service started."

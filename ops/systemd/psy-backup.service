@@ -1,0 +1,17 @@
+[Unit]
+Description=Encrypted copy of the PSY bot to the configured backup host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/psy-backup
+# Runs at night and gives way to the bot: lowest CPU and disk priority, capped memory.
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=20
+MemoryMax=400M
+TimeoutStartSec=2h
+UMask=0077
+PrivateTmp=true
+ProtectSystem=full

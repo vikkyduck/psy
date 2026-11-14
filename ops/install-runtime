@@ -7,7 +7,7 @@ repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 ops=$repo/ops
 for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
     psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer; do
+    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer psy-backup.timer; do
     if systemctl is-active --quiet "$unit"; then
         echo "$unit active. Stage this restore on an idle host." >&2; exit 1
     fi
@@ -33,7 +33,7 @@ install -m 0644 "$ops/libexec/upload_healthcheck.py" /usr/local/libexec/psy-uplo
 install -m 0755 "$ops/libexec/deploy-cert" /usr/local/libexec/psy-upload-deploy-cert
 # Audio priority only controlled an optional build. Its timer is disabled on the reference host.
 for file in "$ops/systemd/"*.service "$ops/systemd/"*.socket "$ops/systemd/"*.timer; do
-    case "$file" in */psy-audio-priority.*) continue ;; esac
+    case "$file" in */psy-audio-priority.*|*/psy-backup.*) continue ;; esac
     install -m 0644 "$file" /etc/systemd/system/
 done
 install -d -m 0755 /etc/systemd/system/hermes-gateway.service.d
