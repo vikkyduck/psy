@@ -68,7 +68,7 @@ sudo bash ops/install-runtime --new-profile
 sudo bash ops/test-host --units
 ```
 
-Ключ --new-profile ставит публичный SOUL.md в новый профиль и при необходимости сохраняет первоначальный SOUL.md от Hermes рядом как SOUL.md.before-psy. При восстановлении личного профиля используйте install-runtime без ключа. Установщик располагает копию навыка и скрипта по пути skills/media/audio-transcription, исходники Mini App в /opt/psy-upload и независимый манифест границы группы в /usr/local/lib/psy-group. При каждом старте шлюза preflight сверяет 10 файлов адаптера c манифестом релиза.
+Ключ --new-profile ставит публичный SOUL.md в новый профиль и при необходимости сохраняет первоначальный SOUL.md от Hermes рядом как SOUL.md.before-psy. При восстановлении личного профиля используйте install-runtime без ключа. Установщик располагает копию навыка и скрипта по пути skills/media/audio-transcription, исходники Mini App в /opt/psy-upload и независимый манифест границы группы в /usr/local/lib/psy-group. При каждом старте шлюза preflight сверяет файлы адаптера, политики OAuth и проверки экземпляра с манифестом релиза.
 
 ## Локальные учетные данные
 
@@ -89,13 +89,13 @@ sudo -Hu hermes /home/hermes/.hermes/hermes-agent/.hermes/bin/hermes auth add op
 Для адреса с DNS именем создайте A/AAAA записи, настройте входящие TCP 80 для ACME HTTP-01 и порт из PSY_PUBLIC_URL для загрузки. Для встроенного HTTPS-сервера по умолчанию используется 9443. Для этой команды 80 должен быть свободен при выдаче и продлении. Certbot запрашивает контакт и согласие с условиями у администратора. Вместо UPLOAD_DOMAIN укажите свое DNS имя без схемы или порта в переменной окружения терминала.
 
 ```sh
-sudo /opt/psy-upload-venv/bin/certbot certonly --standalone --cert-name psy-upload -d "$UPLOAD_DOMAIN"
+sudo /opt/psy-upload-venv/bin/certbot certonly --standalone --cert-name psy-upload-ip -d "$UPLOAD_DOMAIN"
 ```
 
 Для Mini App с HTTPS по публичному IP укажите свой IP в UPLOAD_IP и используйте этот запрос сертификата. Профиль shortlived выпускает сертификат на 6 дней, поэтому таймер продления важен и при работе без DNS. [Инструкция центра сертификации](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)
 
 ```sh
-sudo /opt/psy-upload-venv/bin/certbot certonly --standalone --cert-name psy-upload --preferred-profile shortlived --ip-address "$UPLOAD_IP"
+sudo /opt/psy-upload-venv/bin/certbot certonly --standalone --cert-name psy-upload-ip --preferred-profile shortlived --ip-address "$UPLOAD_IP"
 ```
 
 После выдачи сертификата выполните общие проверки.
@@ -105,7 +105,7 @@ sudo /usr/local/libexec/psy-upload-deploy-cert --stage
 sudo bash ops/verify-ready
 ```
 
-При переносе существующей установки подготовьте действующую линию сертификата Certbot с именем psy-upload для выбранного адреса. Ключ остается в /etc/psy-upload/tls и доступен группе psy-upload. deploy-cert проверяет соответствие ключа цепочке и атомарно переключает current. При продлении Certbot вызывает тот же скрипт и загружает обновление сигналом HUP. Ключ --stage выполняет подготовку до старта. Проверку доступности публичного HTTPS-адреса проводите с внешней машины после включения.
+При переносе существующей установки подготовьте действующую линию сертификата Certbot с именем psy-upload-ip для выбранного адреса. Ключ остается в /etc/psy-upload/tls и доступен группе psy-upload. deploy-cert проверяет соответствие ключа цепочке и атомарно переключает current. При продлении Certbot вызывает тот же скрипт и загружает обновление сигналом HUP. Ключ --stage выполняет подготовку до старта. Проверку доступности публичного HTTPS-адреса проводите с внешней машины после включения.
 
 ## Включение и эксплуатация
 
@@ -128,3 +128,12 @@ systemctl list-timers 'psy-*'
 - Исходники psy-audio-priority сохранены для воспроизводимости истории конфигурации. Таймер контролировал факультативную сборку Telegram Bot API. На исходном узле он выключен, сборка отсутствует. install-runtime пропускает эти unit. Штатная очередь распознавания работает через psy-asr и psy-upload-worker.
 
 Проверки, которые требуют Telegram, перечислены в [инструкции восстановления](../docs/RESTORE.md). Они включают настройку кнопки, пробную загрузку и подтверждение результата в целевом чате.
+
+
+## Закрытые копии и внешний наблюдатель
+
+[RECOVERY.md](../docs/RECOVERY.md) описывает ночную зашифрованную копию, проверку архива и возврат SQLite, ключа подписания, OAuth, глав и медиа. `ops/install-backup` устанавливает код и unit-файлы, не начинает передачу и не создает ключи. После настройки внешнего backup-only доступа проверяется одна настоящая копия, затем включается таймер.
+
+[OBSERVABILITY.md](../docs/OBSERVABILITY.md) описывает отдельный узел для личных уведомлений владельцу при недоступности основной машины. `ops/install-observer` и `ops/stage-observer.py` ставят эту часть без автоматической отправки. При смене адреса обновляют как основную, так и внешнюю конфигурацию.
+
+На восстановленном из обычных файлов свободном узле `ops/restore-permissions` возвращает владельцев и ACL по именам учетных записей. Он не запускает службы. Эти команды не выполняют на работающем ПСИ.
