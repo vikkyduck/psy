@@ -3,5 +3,7 @@ Description=Renew the PSY upload certificate
 After=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/opt/psy-upload-venv/bin/certbot renew --cert-name psy-upload --quiet --deploy-hook /usr/local/libexec/psy-upload-deploy-cert
+Environment=PSY_CERT_NAME=psy-upload
+EnvironmentFile=/etc/psy/instance.env
+ExecStart=/opt/psy-upload-venv/bin/certbot renew --cert-name ${PSY_CERT_NAME} --quiet --deploy-hook /usr/local/libexec/psy-upload-deploy-cert
 UMask=0077
