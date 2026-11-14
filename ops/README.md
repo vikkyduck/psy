@@ -116,7 +116,7 @@ sudo systemctl enable --now psy-member.socket psy-group-upload.socket psy-asr.se
 sudo systemctl enable --now hermes-gateway.service
 systemctl is-active hermes-gateway psy-upload psy-upload-worker psy-asr
 sudo systemctl start psy-codex-auth.service
-sudo systemctl enable --now psy-codex-auth.timer psy-healthcheck.timer psy-upload-health.timer psy-vault-archive.timer psy-upload-cert-renew.timer
+sudo systemctl enable --now psy-codex-auth.timer psy-healthcheck.timer psy-upload-health.timer psy-vault-archive.timer psy-upload-cert-renew.timer psy-alerts.timer
 systemctl list-timers 'psy-*'
 ```
 

@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
     psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer; do
+    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer; do
     [[ $(systemctl show "$unit" -p LoadState --value) == loaded ]]
     [[ $(systemctl show "$unit" -p ActiveState --value) == inactive ]]
     ! systemctl is-enabled --quiet "$unit" || { echo "$unit unexpectedly enabled" >&2; exit 1; }
