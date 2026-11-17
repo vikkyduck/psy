@@ -14,6 +14,9 @@ from . import psy_group_store as store
 
 log = logging.getLogger("psy.group")
 MAX_ACTIVE_JOBS = 3
+TICK_SECONDS = 30
+RETRY_START = 1
+RESTART_START = 1
 
 
 class DeliveryUncertain(Exception):
@@ -198,17 +201,30 @@ async def typing(bot, msg, finished):
 
 
 async def drain(app, wake):
+    """Supervise the queue: a scheduler failure restarts it with backoff, never silently stops it."""
+    delay = RESTART_START
     while app.running:
-        lease = store.lease()  # LOCK_NB on a local file, acquired and closed by this task.
-        if lease is not None:
-            try:
-                await ensure_vault(app.bot)
-                await committed_call(store.recover)
-                await work(app, wake)
-            finally:
-                os.close(lease)
+        try:
+            lease = store.lease()  # LOCK_NB on a local file, acquired and closed by this task.
+        except OSError as exc:
+            lease = None
+            log.warning("group queue lease unavailable (%s)", type(exc).__name__)
+        if lease is None:
+            await asyncio.sleep(1)
+            continue
+        try:
+            await ensure_vault(app.bot)
+            await committed_call(store.recover)
+            await work(app, wake)
             return
-        await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("group queue stopped (%s); restarting in %ss", type(exc).__name__, delay)
+        finally:
+            os.close(lease)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 300)
 
 
 def group_sender(msg):
@@ -227,7 +243,7 @@ async def ensure_vault(bot):
 
 async def durable(app, func, *args, **kwargs):
     """Commit a queue decision, waiting out storage failures instead of losing the job."""
-    delay = 1
+    delay = RETRY_START
     while True:
         try:
             return await committed_call(func, *args, **kwargs)
@@ -235,7 +251,7 @@ async def durable(app, func, *args, **kwargs):
             # On shutdown the job stays running in SQLite and startup recovery requeues it.
             if not store.transient(exc) or not app.running:
                 raise
-            log.warning("group queue write failed (%s); retrying in %ds", type(exc).__name__, delay)
+            log.warning("group queue write failed (%s); retrying in %ss", type(exc).__name__, delay)
         await asyncio.sleep(delay)
         delay = min(delay * 2, 60)
 
@@ -282,30 +298,49 @@ async def run_job(app, wake, ident, body):
         await durable(app, store.settle, ident, True)
 
 
+async def _reap(app, task, ident):
+    if task.cancelled() or task.exception() is None:
+        return
+    # run_job contains job failures. Reaching this point means its own bookkeeping failed;
+    # treat the job like one interrupted by a restart, but in this process and with a delay.
+    log.warning("group job task ended with %s", type(task.exception()).__name__)
+    await durable(app, store.interrupt, ident)
+
+
 async def work(app, wake):
-    active = set()
+    active = {}
+    delay_after_failure = RETRY_START
     try:
         while app.running or active:
             wake.clear()
-            for task in tuple(active):
+            for task, ident in tuple(active.items()):
                 if task.done():
-                    active.remove(task)
-                    task.result()
+                    del active[task]
+                    await _reap(app, task, ident)
             # Use the same clock edge for both queries: a last 429 can become due
             # between an empty claim and the read of its timer.
             now = time.time()
-            while app.running and len(active) < MAX_ACTIVE_JOBS:
-                item = await committed_call(store.claim_next, now=now)
-                if item is None:
-                    break
-                task = asyncio.create_task(run_job(app, wake, *item), name="psy-group-job")
-                task.add_done_callback(lambda _: wake.set())
-                active.add(task)
-            # A new update, completed job or committed source selection can unblock a
-            # different member/question. A durable Telegram retry also has its own due time.
             delay = None
-            if app.running and len(active) < MAX_ACTIVE_JOBS:
-                delay = await asyncio.to_thread(store.next_retry_delay, now=now)
+            try:
+                while app.running and len(active) < MAX_ACTIVE_JOBS:
+                    item = await committed_call(store.claim_next, now=now)
+                    if item is None:
+                        break
+                    task = asyncio.create_task(run_job(app, wake, *item), name="psy-group-job")
+                    task.add_done_callback(lambda _: wake.set())
+                    active[task] = item[0]
+                # A new update, completed job or committed source selection can unblock a
+                # different member/question. A durable Telegram retry also has its own due time.
+                if app.running and len(active) < MAX_ACTIVE_JOBS:
+                    delay = await asyncio.to_thread(store.next_retry_delay, now=now)
+                delay_after_failure = RETRY_START
+            except Exception as exc:
+                if not store.transient(exc):
+                    raise
+                # Running jobs continue. Look at the queue again after a short pause.
+                log.warning("group queue check failed (%s); retrying in %ss", type(exc).__name__, delay_after_failure)
+                delay = delay_after_failure
+                delay_after_failure = min(delay_after_failure * 2, 60)
             if wake.is_set():
                 continue
             if delay is None:
@@ -336,10 +371,33 @@ def schedule(app):
         adapter._psy_group_task=app.create_task(drain(app,wake),name="psy-group-queue")
 
 
+async def check(app):
+    """Restart or wake the drain when a queued job is runnable, e.g. a retry timer became due."""
+    adapter = app.adapter
+    task = getattr(adapter, "_psy_group_task", None)
+    idle = task is None or task.done()
+    if await asyncio.to_thread(store.runnable) or (idle and await asyncio.to_thread(store.has_running)):
+        schedule(app)
+
+
+async def watch(app):
+    # A drain sleeps until its next timer and ends when nothing is runnable. This light
+    # check covers a drain that stopped or missed a wake, without new group messages.
+    while app.running:
+        await asyncio.sleep(TICK_SECONDS)
+        try:
+            await check(app)
+        except Exception as exc:
+            log.warning("group queue check failed (%s)", type(exc).__name__)
+
+
 async def start(app):
     from .psy_owner_recovery import start as start_owner_recovery
     schedule(app)
     start_owner_recovery(app)
+    ticker = getattr(app.adapter, "_psy_group_ticker", None)
+    if ticker is None or ticker.done():
+        app.adapter._psy_group_ticker = asyncio.create_task(watch(app), name="psy-group-tick")
 
 
 async def resume_authorized(app, incident_id):

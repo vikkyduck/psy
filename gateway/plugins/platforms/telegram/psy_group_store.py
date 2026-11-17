@@ -501,6 +501,23 @@ def admit_long(ident, *, root=ROOT):
         return True
 
 
+def runnable(*, root=ROOT, now=None):
+    """Whether claim_next would start a queued request now. Read-only, for the periodic check."""
+    now = time.time() if now is None else now
+    with database(root) as con:
+        return con.execute(f"""SELECT 1 FROM requests r LEFT JOIN schedule s ON s.request_id=r.id
+              WHERE r.state='queued' AND (s.request_id IS NULL OR ({_CLAIMABLE}
+                AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
+                                AND p.state='retry' AND p.retry_at>?)
+                AND NOT EXISTS (SELECT 1 FROM model_retries m WHERE m.request_id=r.id AND m.retry_at>?)))
+              LIMIT 1""", (MAX_LONG_JOBS, now, now)).fetchone() is not None
+
+
+def has_running(*, root=ROOT):
+    with database(root) as con:
+        return con.execute("SELECT 1 FROM requests WHERE state IN ('running','sending') LIMIT 1").fetchone() is not None
+
+
 def next_retry_delay(*, root=ROOT, now=None):
     now = time.time() if now is None else now
     with database(root) as con:
@@ -521,28 +538,46 @@ def owns_running_job(ident, uid, *, root=ROOT):
 
 
 def wait_for_model(ident, kind, reset=None, *, root=ROOT, now=None):
-    """Commit retry before any best-effort notice. A restart cannot lose chapters or repeat the notice."""
+    """Commit retry before any best-effort notice. A restart cannot lose chapters or repeat the notice.
+
+    kind is a model issue, or "infrastructure" after a storage or network failure."""
     now = time.time() if now is None else now
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
         if not con.execute("SELECT 1 FROM requests WHERE id=? AND state='running'", (ident,)).fetchone():
             raise RuntimeError("Group request is not running")
-        row = con.execute("SELECT attempts FROM model_retries WHERE request_id=?", (ident,)).fetchone()
-        attempts = (row[0] if row else 0) + 1
-        delay = min(1800, (300 if kind in ("signin","quota") else 60) * 2 ** min(attempts-1, 5))
-        due = now + delay
-        if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
-            due = max(due, reset)
-        con.execute("UPDATE model_attempts SET wait_kind=? WHERE request_id=?", (kind, ident))
-        if kind in AUTH_WAITS:
-            recovered = con.execute("""SELECT 1 FROM model_attempts
-                                       WHERE request_id=? AND auth_revision <
-                                       (SELECT max(revision) FROM auth_recoveries)""", (ident,)).fetchone()
-            if recovered:
-                due = now
-        con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
-        con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
-        return row is None
+        return _retry_later(con, ident, kind, reset, now)
+
+
+def interrupt(ident, *, root=ROOT, now=None):
+    """Recover one job whose worker task ended unexpectedly, as a restart would, after a delay."""
+    now = time.time() if now is None else now
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        current = con.execute("SELECT state FROM requests WHERE id=?", (ident,)).fetchone()
+        if current == ("sending",):
+            con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
+        elif current == ("running",):
+            _retry_later(con, ident, "infrastructure", None, now)
+
+
+def _retry_later(con, ident, kind, reset, now):
+    row = con.execute("SELECT attempts FROM model_retries WHERE request_id=?", (ident,)).fetchone()
+    attempts = (row[0] if row else 0) + 1
+    delay = min(1800, (300 if kind in ("signin","quota") else 60) * 2 ** min(attempts-1, 5))
+    due = now + delay
+    if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
+        due = max(due, reset)
+    con.execute("UPDATE model_attempts SET wait_kind=? WHERE request_id=?", (kind, ident))
+    if kind in AUTH_WAITS:
+        recovered = con.execute("""SELECT 1 FROM model_attempts
+                                   WHERE request_id=? AND auth_revision <
+                                   (SELECT max(revision) FROM auth_recoveries)""", (ident,)).fetchone()
+        if recovered:
+            due = now
+    con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
+    con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+    return row is None
 
 
 def release_auth_waits(incident, *, root=ROOT):
