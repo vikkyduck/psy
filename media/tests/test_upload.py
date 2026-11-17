@@ -275,7 +275,53 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status,status)
             forged=await self.client.post('/api/auth',json={'initData':signed(123)+'x'})
             self.assertEqual(forged.status,401)
+            tampered=await self.client.post('/api/auth',json={'initData':signed(123).replace('Test','Other')})
+            self.assertEqual(tampered.status,401)
+        # A 65-character hash is rejected locally; a well-formed forgery still needs the broker.
         self.assertEqual(calls,['login','member','login','member','login','member','login'])
+
+    async def test_malformed_launch_data_never_starts_a_broker(self):
+        connections=[]
+        async def count(reader,writer):
+            connections.append(1)
+            writer.close()
+        path=str(C.ROOT/'counting.sock')
+        sock=await asyncio.start_unix_server(count,path=path)
+        self.addAsyncCleanup(sock.wait_closed)
+        self.addCleanup(sock.close)
+        valid=dict(item.split('=',1) for item in signed(C.OWNER).split('&'))
+        def variant(**changes):
+            fields={**valid,**changes}
+            return '&'.join(f'{k}={v}' for k,v in fields.items() if v is not None)
+        junk=['', 'x'*16385, 'not a query', 'hash=', variant(hash=None), variant(hash=valid['hash'].upper()),
+              variant(hash=valid['hash'][:63]), variant(hash='g'*64), variant(auth_date='soon'),
+              variant(auth_date=str(C.now()-601)), variant(auth_date=str(C.now()+61)), variant(user=None),
+              variant(user='%7B'), variant(user='%5B%5D'), variant(user='%7B%22id%22%3A%227%22%7D'),
+              variant(user='%7B%22id%22%3A0%7D'), variant(user='%7B%22id%22%3A7%2C%22is_bot%22%3Atrue%7D'),
+              variant(user='%5B'*5000), signed(C.OWNER)+'&auth_date=1', 12345, None, ['list']]
+        with patch.dict(os.environ,{'PSY_ACCESS_SOCKET':path}):
+            for raw in junk:
+                response=await self.client.post('/api/auth',json={'initData':raw,'ticket':'0'*32})
+                self.assertEqual(response.status,401,raw if isinstance(raw,str) and len(raw)<200 else type(raw))
+            self.assertEqual(connections,[])
+            # Plausible launch data still reaches the broker, which alone checks the signature.
+            response=await self.client.post('/api/auth',json={'initData':variant(hash='0'*64)})
+            self.assertEqual(response.status,503)
+            self.assertEqual(len(connections),1)
+
+    def test_local_launch_check_is_never_stricter_than_the_broker(self):
+        import access_broker
+        now=C.now()
+        for extra in ({'auth_date':str(now-600)},{'auth_date':str(now+30)},{'auth_date':' '+str(now)},
+                      {'auth_date':'+'+str(now)},{'start_param':''},{'user':json.dumps({'id':5,'is_bot':False})}):
+            fields={'auth_date':str(now),'user':json.dumps({'id':C.OWNER}),**extra}
+            key=hmac.new(b'WebAppData',TOKEN.encode(),hashlib.sha256).digest()
+            fields['hash']=hmac.new(key,'\n'.join(f'{k}={v}' for k,v in sorted(fields.items())).encode(),hashlib.sha256).hexdigest()
+            raw=urlencode(fields)
+            self.assertEqual(access_broker.dispatch({'action':'init','init_data':raw},TOKEN)['status'],200,extra)
+            # The web server checks first and up to the broker timeout earlier.
+            self.assertTrue(C.plausible_init(raw,now),extra)
+            self.assertTrue(C.plausible_init(raw,now-20),extra)
 
 
     async def test_concurrent_retries_share_create_limit_preserve_results_and_queue_fairly(self):

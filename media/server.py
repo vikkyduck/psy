@@ -95,6 +95,9 @@ async def auth(request):
         raise web.HTTPRequestEntityTooLarge(max_size=20000, actual_size=request.content_length or 0)
     body = await request.json()
     raw = body.get('initData')
+    # Each broker lookup starts a process. Junk that cannot carry a valid signature stops here.
+    if not C.plausible_init(raw):
+        raise web.HTTPUnauthorized()
     ticket = None
     if body.get('ticket'):
         launch = await access_lookup({'action':'init','init_data':raw})

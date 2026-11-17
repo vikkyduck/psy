@@ -138,24 +138,53 @@ def get_ticket(ident, uid):
         return dict(r) if r else None
 
 
-def validate_init_context(raw, token, current=None):
+INIT_MAX_AGE = 600
+INIT_MAX_SKEW = 30
+
+
+def init_fields(raw, current=None, *, future_slack=0):
+    """Every launch-data check except the bot signature, shared by the web server and the broker.
+
+    The web server runs it before contacting the broker, so it must never reject launch data
+    that the broker would accept. future_slack only widens the clock-skew bound for a caller
+    that checks earlier than the broker does."""
     if not isinstance(raw, str) or not 1 <= len(raw) <= 16384:
         raise ValueError('Invalid authentication')
     pairs = parse_qsl(raw, keep_blank_values=True, strict_parsing=True)
     if len({k for k, _ in pairs}) != len(pairs):
         raise ValueError('Duplicate authentication field')
     fields = dict(pairs)
-    supplied = fields.pop('hash', '')
+    # The broker compares with a lowercase SHA-256 hexdigest, so nothing else can verify.
+    if not re.fullmatch('[0-9a-f]{64}', fields.get('hash', '')):
+        raise ValueError('Invalid signature')
+    age = (now() if current is None else current) - int(fields.get('auth_date', '0'))
+    if not -INIT_MAX_SKEW - future_slack <= age <= INIT_MAX_AGE:
+        raise ValueError('Authentication expired')
+    try:
+        user = json.loads(fields['user'])
+    except RecursionError:
+        raise ValueError('Invalid user') from None
+    if type(user.get('id')) is not int or user['id'] <= 0 or user.get('is_bot'):
+        raise ValueError('Invalid user')
+    return fields, user
+
+
+def plausible_init(raw, current=None):
+    """Cheap local shape check; the signature is still verified only by the broker."""
+    try:
+        init_fields(raw, current, future_slack=INIT_MAX_SKEW)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return True
+
+
+def validate_init_context(raw, token, current=None):
+    fields, user = init_fields(raw, current)
+    supplied = fields.pop('hash')
     secret = hmac.new(b'WebAppData', token.encode(), hashlib.sha256).digest()
     expected = hmac.new(secret, '\n'.join(f'{k}={v}' for k, v in sorted(fields.items())).encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(supplied, expected):
         raise ValueError('Invalid signature')
-    age = (now() if current is None else current) - int(fields.get('auth_date', '0'))
-    if not -30 <= age <= 600:
-        raise ValueError('Authentication expired')
-    user = json.loads(fields['user'])
-    if type(user.get('id')) is not int or user['id'] <= 0 or user.get('is_bot'):
-        raise ValueError('Invalid user')
     return {'uid': user['id'], 'start_param': fields.get('start_param', '')}
 
 
