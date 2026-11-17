@@ -29,8 +29,30 @@ class ReleaseInventory(unittest.TestCase):
             self.assertIn(f"{src}\" /usr/local/libexec/{dst}", script)
         self.assertIn("/etc/systemd/system/hermes-gateway.service.d/user-session.conf", targets)
         self.assertNotIn("/etc/systemd/system/psy-audio-priority.service", targets)
-        self.assertNotIn("/etc/systemd/system/psy-backup.service", targets)
         self.assertFalse(any("SOUL.md" in t or "/skills/" in t or t.endswith("instance.env") for t in targets))
+        # Every unit and timer the two installers stage, plus their code, comes from the inventory.
+        backup_script = (live.REPO / "ops/install-backup").read_text()
+        for name in live.INSTALLED:
+            self.assertIn(f"/etc/systemd/system/{name}", targets)
+        for path in ("/etc/needrestart/conf.d/50-psy.conf", "/usr/local/sbin/psy-backup",
+                     "/usr/local/lib/psy-backup/sqlite_snapshot.py", "/usr/local/lib/psy-backup/verify_backup.py"):
+            self.assertIn(path, targets)
+            self.assertIn(path.rsplit("/", 1)[0], script + backup_script)
+        self.assertIn("/etc/systemd/system/psy-restart-outdated.timer", targets)
+        self.assertNotIn("/etc/psy-backup/destination.env", targets)
+
+    def test_owner_alerts_use_one_instance_per_failing_unit(self):
+        entries = {str(e.target): e.data for e in live.system_entries(997)}
+        alerted = [n for n, u in live.INSTALLED.items() if u.get("alert")]
+        self.assertIn("psy-backup.service", alerted)
+        for name in alerted:
+            self.assertEqual(entries[f"/etc/systemd/system/{name}.d/owner-alert.conf"],
+                             b"[Unit]\nOnFailure=psy-alert@%n.service\n")
+
+    def test_only_new_runtime_timers_are_enabled(self):
+        systemd = live.SYSTEMD
+        self.assertEqual(live.new_timers([systemd / "psy-restart-outdated.timer", systemd / "psy-backup.timer",
+                                          systemd / "psy-alerts.service"]), ["psy-restart-outdated.timer"])
 
 
 class RedundantDropins(unittest.TestCase):
