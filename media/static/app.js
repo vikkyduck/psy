@@ -182,6 +182,19 @@ function render(){
     if(j.state==='failed'){
       const b=document.createElement('button');b.className='secondary';b.textContent='Повторить обработку';b.onclick=async()=>{b.disabled=true;try{await api('/api/jobs/'+j.id+'/retry',{method:'POST',body:JSON.stringify({retry_generation:j.retry_generation})});await refresh();}catch(e){note(e.message);b.disabled=false;}};box.append(b);
     }
+    if(!['uploading','sending'].includes(j.state)){
+      const del=document.createElement('button');del.className='secondary';del.textContent='Удалить с сервера';
+      del.onclick=async()=>{
+        const question=['queued','processing'].includes(j.state)
+          ?'Остановить обработку и удалить запись с сервера? Восстановить ее будет нельзя.'
+          :'Удалить запись и расшифровку с сервера? Восстановить их будет нельзя. Файл, уже отправленный в Telegram, останется в чате.';
+        if(!window.confirm(question))return;
+        del.disabled=true;
+        try{await api('/api/jobs/'+j.id+'/delete',{method:'POST'});note('Запись и расшифровка удалены с сервера.');await Promise.all([refresh(),refreshCapacity()]);}
+        catch(e){note(e.message);del.disabled=false;}
+      };
+      box.append(del);
+    }
     $('jobs').append(box);
   }
   if(moreJobs){

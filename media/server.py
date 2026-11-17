@@ -160,10 +160,10 @@ def authorized_result(job, session, body=False):
 
 
 
-def owned_job(ident, session):
+def owned_job(ident, session, deleted=False):
     with C.db() as c:
         row = c.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?', (ident, session['uid'], session['chat'])).fetchone()
-    if not row:
+    if not row or (row['state'] == 'deleted' and not deleted):
         raise web.HTTPNotFound()
     return dict(row)
 
@@ -192,8 +192,9 @@ def public_job(j):
 
 def job_listing(session, count):
     with C.db() as c:
-        rows = c.execute("""SELECT j.*, EXISTS(SELECT 1 FROM jobs c WHERE c.reprocess_of=j.id) AS has_next
-                            FROM jobs j WHERE uid=? AND chat=? ORDER BY created DESC,j.rowid DESC LIMIT ?""",
+        rows = c.execute("""SELECT j.*, EXISTS(SELECT 1 FROM jobs c WHERE c.reprocess_of=j.id AND c.state!='deleted') AS has_next
+                            FROM jobs j WHERE uid=? AND chat=? AND state!='deleted'
+                            ORDER BY created DESC,j.rowid DESC LIMIT ?""",
                          (session['uid'],session['chat'],count+1)).fetchall()
     listing = [dict(public_job(r), has_next=bool(r['has_next']), is_repeat=r['reprocess_of'] is not None)
                for r in rows[:count]]
@@ -372,11 +373,6 @@ def set_state(ident, sql, *args):
         c.execute(sql, (*args, ident))
 
 
-def queued_state(ident, session):
-    j = owned_job(ident, session)
-    return public_job(j)
-
-
 async def complete(request):
     s=await authorize(request);ident=request.match_info['id']
     await blocking(owned_job,ident,s)
@@ -472,6 +468,8 @@ def reprocess_job(parent, session, bound, busy):
         if not original:
             raise web.HTTPNotFound()
         previous = conn.execute('SELECT * FROM jobs WHERE reprocess_of=?', (parent,)).fetchone()
+        if previous and previous['state'] == 'deleted':
+            return failure(409, 'Предыдущая повторная расшифровка еще удаляется. Попробуйте через минуту.')
         if previous:
             return web.json_response(public_job(previous))
         if original['state'] != 'done' or original['ext'] not in C.EXTENSIONS:
@@ -557,6 +555,33 @@ async def cancel(request):
     return web.json_response({'state':'cancelled'})
 
 
+def delete_job(ident, session):
+    with C.db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?',
+                        (ident, session['uid'], session['chat'])).fetchone()
+        if not row:
+            raise web.HTTPNotFound()
+        job = dict(row)
+        if job['state'] == 'sending':
+            return failure(409, 'Сейчас файл отправляется в Telegram. Удалите запись после завершения отправки.')
+        if job['state'] != 'deleted':
+            C.transition(c, ident, job['state'], 'deleted', error=None, attempts=0, next_try=0)
+    # This UID owns the recording names. The worker removes the receipt and asks the ASR
+    # service to remove its folder and progress, then drops the row.
+    for path in (C.file_path(job), C.file_path(job, '.txt')):
+        path.unlink(missing_ok=True)
+    return web.json_response({'state': 'deleted'})
+
+
+async def delete(request):
+    s=await authorize(request);ident=request.match_info['id']
+    await blocking(owned_job,ident,s,True)
+    # Waits for an in-flight chunk or completion of the same recording.
+    async with locks.setdefault(ident,asyncio.Lock()):
+        return await blocking(delete_job,ident,s)
+
+
 async def index(request):return web.FileResponse(ASSETS/'index.html')
 async def asset(request):
     name=request.match_info['name']
@@ -580,7 +605,8 @@ def create_app():
         web.patch('/api/jobs/{id}',append),web.post('/api/jobs/{id}/complete',complete),
         web.get('/api/jobs/{id}/transcript',transcript),web.post('/api/jobs/{id}/retry',retry),
         web.post('/api/jobs/{id}/reprocess',reprocess),
-        web.post('/api/jobs/{id}/redeliver',redeliver),web.post('/api/jobs/{id}/cancel',cancel)])
+        web.post('/api/jobs/{id}/redeliver',redeliver),web.post('/api/jobs/{id}/cancel',cancel),
+        web.post('/api/jobs/{id}/delete',delete)])
     return app
 
 

@@ -137,6 +137,12 @@ def start(ident, now, retry=None):
         return True
 
 
+def forget(ident):
+    """Remove a member's transcript. secure_delete overwrites the freed pages."""
+    with db(True) as conn:
+        conn.execute('DELETE FROM results WHERE id=?', (ident,))
+
+
 def interrupted():
     """Receipts left at the ambiguous send boundary."""
     with db() as conn:

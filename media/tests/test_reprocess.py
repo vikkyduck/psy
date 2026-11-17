@@ -213,5 +213,69 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
 
 
+    async def test_member_deletes_recording_transcript_and_private_copies(self):
+        parent = await self.upload(self.group)
+        await self.finish(parent)
+        repeat = (await (await self.client.post("/api/jobs/" + parent + "/reprocess", headers=self.group)).json())["id"]
+        row = self.job(parent)
+        source = C.file_path(row)
+        legacy = C.file_path(row, ".txt")
+        legacy.write_bytes(b"older transcript copy")
+        path = "/api/jobs/" + parent
+        for headers, status in (({}, 401), (self.private, 404), (self.partner, 404)):
+            self.assertEqual((await self.client.post(path + "/delete", headers=headers)).status, status)
+        self.assertEqual((await self.client.post(path + "/delete", headers=self.group)).status, 200)
+        self.assertFalse(source.exists())
+        self.assertFalse(legacy.exists())
+        # The repeat keeps its own link to the audio and continues independently.
+        self.assertEqual(C.file_path(self.job(repeat)).read_bytes(), self.audio)
+        listing = (await (await self.client.get("/api/jobs", headers=self.group)).json())["jobs"]
+        self.assertEqual([job["id"] for job in listing], [repeat])
+        for route in ("/transcript", "/reprocess", "/retry", "/redeliver"):
+            method = self.client.get if route == "/transcript" else self.client.post
+            self.assertEqual((await method(path + route, headers=self.group, json={})).status, 404)
+        self.assertEqual((await self.client.post(path + "/delete", headers=self.group)).status, 200)
+        forgotten = []
+        async def forget(ident):
+            forgotten.append(ident)
+        with patch.object(asr_client, "forget", forget):
+            self.assertEqual(await worker.purge_step(), 1)
+        self.assertEqual(forgotten, [parent])
+        self.assertIsNone(receipts.get(parent))
+        with C.db() as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM jobs WHERE id=?", (parent,)).fetchone())
+        self.assertEqual((await self.client.post(path + "/delete", headers=self.group)).status, 404)
+        self.assertEqual(self.job(repeat)["state"], "queued")
+
+    async def test_deletion_waits_for_a_send_and_retries_unreachable_asr(self):
+        ident = await self.upload(self.private)
+        with C.db() as db:
+            db.execute("UPDATE jobs SET state='sending' WHERE id=?", (ident,))
+        response = await self.client.post("/api/jobs/" + ident + "/delete", headers=self.private)
+        self.assertEqual(response.status, 409)
+        self.assertIn("отправляется", (await response.json())["error"])
+        self.assertTrue(C.file_path(self.job(ident)).exists())
+        with C.db() as db:
+            db.execute("UPDATE jobs SET state='processing' WHERE id=?", (ident,))
+        self.assertEqual((await self.client.post("/api/jobs/" + ident + "/delete", headers=self.private)).status, 200)
+        async def unreachable(ident):
+            raise FileNotFoundError("socket")
+        with patch.object(asr_client, "forget", unreachable):
+            self.assertEqual(await worker.purge_step(), 0)
+        row = self.job(ident)
+        self.assertEqual((row["state"], row["attempts"]), ("deleted", 1))
+        self.assertGreater(row["next_try"], C.now())
+        # A decode of this recording that is still being cancelled is left alone.
+        with C.db() as db:
+            db.execute("UPDATE jobs SET next_try=0 WHERE id=?", (ident,))
+        worker._decoding.add(ident)
+        try:
+            with patch.object(asr_client, "forget", unreachable):
+                self.assertEqual(await worker.purge_step(), 0)
+            self.assertEqual(self.job(ident)["attempts"], 1)
+        finally:
+            worker._decoding.discard(ident)
+
+
 if __name__ == "__main__":
     unittest.main()

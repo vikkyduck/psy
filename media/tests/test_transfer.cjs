@@ -96,15 +96,16 @@ test('the actual UI needs one click, keeps the button locked during retry, and p
   const elements=new Map();const get=id=>{if(!elements.has(id))elements.set(id,new Element());return elements.get(id);};
   const f=fixture(5*MB+13),s=server();let failed=false;
   let prior={id:'finished',filename:'finished.wav',state:'done',delivery:'sent',size:123};
-  let repeat=null;
+  let repeat=null,deleted=[],asked=[];
   const context={console,AbortController,Blob,URL,crypto:webcrypto,setTimeout,clearTimeout,setInterval:()=>0,navigator:{},
     location:{search:''},URLSearchParams,
     document:{getElementById:get,createElement:()=>new Element(),addEventListener:()=>{},visibilityState:'hidden'},
-    window:{Telegram:{WebApp:{initData:'isolated-test-data',ready(){},expand(){},enableClosingConfirmation(){},disableClosingConfirmation(){}}}},
+    window:{confirm:q=>{asked.push(q);return true;},Telegram:{WebApp:{initData:'isolated-test-data',ready(){},expand(){},enableClosingConfirmation(){},disableClosingConfirmation(){}}}},
     fetch:async(path,o={})=>{
       if(path==='/api/auth')return Response.json({session:'isolated-test-session',chunk:4*MB,destination:'Test'});
       if(path==='/api/capacity')return Response.json({disk_low:true});
-      if((path==='/api/jobs'||path==='/api/jobs?count=20')&&!o.method)return Response.json({jobs:[prior,...[repeat,s.job].filter(Boolean)],more:false});
+      if((path==='/api/jobs'||path==='/api/jobs?count=20')&&!o.method)return Response.json({jobs:[prior,repeat,s.job].filter(j=>j&&!deleted.includes(j.id)),more:false});
+      if(path==='/api/jobs/finished/delete'&&o.method==='POST'){deleted.push('finished');return Response.json({state:'deleted'});}
       if(path==='/api/jobs/finished/reprocess'&&o.method==='POST'){
         prior={...prior,has_next:true};
         repeat={id:'revision',filename:prior.filename,size:prior.size,state:'queued',is_repeat:true};
@@ -136,4 +137,12 @@ test('the actual UI needs one click, keeps the button locked during retry, and p
   await get('send').onclick();assert.equal(s.creates,1);assert.equal(s.queued,1);
   const historyText=get('jobs').children.flatMap(x=>x.children.map(c=>c.textContent)).join(' ');
   assert.doesNotMatch(historyText,/выберите этот же файл/);
+  // A member removes a finished recording after an explicit confirmation.
+  const named=()=>get('jobs').children.filter(x=>x.children[0]?.textContent==='finished.wav');
+  assert.equal(named().length,2);
+  const remove=named()[0].children.find(x=>x.textContent==='Удалить с сервера');
+  await remove.onclick();
+  assert.deepEqual(deleted,['finished']);assert.match(asked[0],/нельзя/);
+  assert.match(get('notice').textContent,/удалены с сервера/);
+  assert.equal(named().length,1);
 });

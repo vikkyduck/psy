@@ -232,6 +232,9 @@ def claim_next():
     return job
 
 
+_decoding = set()
+
+
 def job_state(ident):
     with C.db() as c:
         row = c.execute('SELECT state FROM jobs WHERE id=?', (ident,)).fetchone()
@@ -241,6 +244,7 @@ def job_state(ident):
 async def supervise(http, job):
     """Run one decode; stop it as soon as the member deletes the recording."""
     task = asyncio.ensure_future(run_job(http, job))
+    _decoding.add(job['id'])
     try:
         while not task.done():
             await asyncio.wait({task}, timeout=WATCH_SECONDS)
@@ -256,6 +260,8 @@ async def supervise(http, job):
     except Exception as error:
         logging.error('Job failed: %s',type(error).__name__)
         fail(job, 'Не удалось завершить расшифровку. Можно повторить обработку.')
+    finally:
+        _decoding.discard(job['id'])
 
 
 async def transcription_loop(http):
@@ -315,6 +321,42 @@ async def delivery_loop(http):
             await asyncio.sleep(POLL_SECONDS)
 
 
+async def purge_step():
+    """Finish a member's deletion: the receipt, the ASR folder and progress, then the row.
+
+    A recording still being decoded here waits until its decode was cancelled, so a late
+    result cannot recreate the receipt after it was removed."""
+    with C.db() as c:
+        rows = [dict(row) for row in c.execute(
+            "SELECT id,attempts FROM jobs WHERE state='deleted' AND next_try<=? ORDER BY updated", (C.now(),))]
+    done = 0
+    for job in rows:
+        if job['id'] in _decoding:
+            continue
+        receipts.forget(job['id'])
+        try:
+            await asr_client.forget(job['id'])
+        except (OSError, ValueError, RuntimeError) as error:
+            logging.warning('ASR cleanup postponed: %s', type(error).__name__)
+            with C.db() as c:
+                c.execute("UPDATE jobs SET attempts=attempts+1,next_try=? WHERE id=? AND state='deleted'",
+                          (C.now() + min(MAX_BACKOFF, 10*2**min(job['attempts'], 8)), job['id']))
+            continue
+        with C.db() as c:
+            c.execute("DELETE FROM jobs WHERE id=? AND state='deleted'", (job['id'],))
+        done += 1
+    return done
+
+
+async def purge_loop():
+    while True:
+        try:
+            await purge_step()
+        except Exception as error:
+            logging.error('Deletion cleanup failed: %s', type(error).__name__)
+        await asyncio.sleep(POLL_SECONDS)
+
+
 async def main():
     C.initialize()
     receipts.initialize()
@@ -323,7 +365,7 @@ async def main():
         c.execute("UPDATE jobs SET state='queued' WHERE state='processing'")
     reconcile_sending()
     async with ClientSession(timeout=ClientTimeout(total=120)) as http:
-        await asyncio.gather(transcription_loop(http), delivery_loop(http))
+        await asyncio.gather(transcription_loop(http), delivery_loop(http), purge_loop())
 
 
 if __name__=='__main__':
