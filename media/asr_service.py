@@ -326,8 +326,6 @@ def transcribe(conn, job, alive):
                   text_bytes=len(data), sha256=sha)
     conn.settimeout(60)
     conn.sendall(json.dumps(header).encode() + b'\n' + data)
-    if acknowledged(conn):
-        remove_job(ident)
     return True
 
 
@@ -367,9 +365,12 @@ def serve(conn):
             while not DECODER.acquire(timeout=POLL_SECONDS):
                 alive()
             try:
-                transcribe(conn, job, alive)
+                sent = transcribe(conn, job, alive)
             finally:
                 DECODER.release()
+            # The next recording may decode while this worker stores the result.
+            if sent and acknowledged(conn):
+                remove_job(ident)
         finally:
             _running.pop(ident, None)
 
