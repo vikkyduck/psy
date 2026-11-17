@@ -82,7 +82,7 @@ def timer_problems(now, booted_for):
     problems, enabled = {}, set()
     for timer, gap in TIMERS.items():
         try:
-            info = properties(timer, "UnitFileState", "ActiveState", "LastTriggerUSec")
+            info = properties(timer, "UnitFileState", "ActiveState", "LastTriggerUSec", "ActiveEnterTimestamp")
         except Exception:
             problems["probe:" + timer] = f"Не удалось проверить таймер {timer}."
             continue
@@ -90,7 +90,9 @@ def timer_problems(now, booted_for):
             problems["timer:" + timer] = f"Таймер {timer} выключен или не установлен, его проверка не выполняется."
             continue
         enabled.add(timer)
-        last = timestamp(info.get("LastTriggerUSec", ""))
+        # A timer that never fired yet is measured from when it was started (a fresh install
+        # enables a nightly timer hours before its first run), not from boot.
+        last = timestamp(info.get("LastTriggerUSec", "")) or timestamp(info.get("ActiveEnterTimestamp", ""))
         idle = now - last if last else booted_for
         if idle > gap:
             problems["timer:" + timer] = f"Таймер {timer} не запускался больше {hours(gap)}."

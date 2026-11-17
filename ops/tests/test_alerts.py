@@ -159,6 +159,22 @@ class OwnerAlerts(unittest.TestCase):
             problems, _ = alerts.timer_problems(now, booted_for=7200)   # never ran since a long-ago boot
             self.assertIn('timer:psy-alerts.timer', problems)
 
+    def test_timer_enabled_after_boot_is_measured_from_its_start(self):
+        now = 2_000_000_000
+        stamp = lambda seconds_ago: time.strftime('%a %Y-%m-%d %H:%M:%S UTC', time.gmtime(now - seconds_ago))
+        def show(unit, *names):
+            info = {'UnitFileState': 'enabled', 'ActiveState': 'active', 'LastTriggerUSec': stamp(30)}
+            if unit == 'psy-restart-outdated.timer':
+                info.update(LastTriggerUSec='', ActiveEnterTimestamp=stamp(started))
+            return info
+        with patch.object(alerts, 'properties', side_effect=show):
+            started = 120          # enabled by an update two minutes ago, first run tonight
+            problems, _ = alerts.timer_problems(now, booted_for=300_000)
+            self.assertNotIn('timer:psy-restart-outdated.timer', problems)
+            started = 200_000      # enabled long ago and still never fired
+            problems, _ = alerts.timer_problems(now, booted_for=300_000)
+            self.assertIn('timer:psy-restart-outdated.timer', problems)
+
     def test_backup_age(self):
         with tempfile.TemporaryDirectory() as folder:
             marker = Path(folder) / 'last-success'

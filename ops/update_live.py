@@ -720,15 +720,16 @@ def main():
         check = run("/usr/bin/python3", "-I", str(GROUP_LIB / "preflight.py"), user="hermes", check=False)
         if check.returncode:
             roll_back("preflight: " + (check.stderr or check.stdout).strip())
+        # Enable new timers before the restarts: the per-minute alert check already runs the new
+        # code and would report a timer the release expects as disabled.
+        fresh = [t for t in new_timers([e.target for kind, e in todo if kind == "new"])
+                 if run("systemctl", "is-enabled", "--quiet", t, check=False).returncode]
+        backup.index["enabled"] = fresh
+        backup.note(units, reload_units)
+        for timer in fresh:
+            run("systemctl", "enable", "--now", timer)
+            print(f"  enabled {timer}")
         failed = restart(units)
-        if not failed:
-            fresh = [t for t in new_timers([e.target for kind, e in todo if kind == "new"])
-                     if run("systemctl", "is-enabled", "--quiet", t, check=False).returncode]
-            backup.index["enabled"] = fresh
-            backup.note(units, reload_units)
-            for timer in fresh:
-                run("systemctl", "enable", "--now", timer)
-                print(f"  enabled {timer}")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         roll_back(str(exc))
     if failed:
