@@ -5,7 +5,8 @@ import importlib
 import json
 import math
 import re
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import time
 from dataclasses import dataclass
@@ -259,6 +260,60 @@ class _ResumeModelJob(Exception):
     """Carry a deferred stage through manuscript editors that normally return partial output."""
     def __init__(self, issue):
         self.issue = issue
+
+
+class _Halted(Exception):
+    """A parallel sibling already ended this job. Stop before the next model call."""
+
+
+class _Halt:
+    """Shared by the stages of one job. After one stage defers or fails the job, no new
+    model call starts. Calls in flight finish and keep their checkpoints for the resume."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reason = None
+
+    def trip(self, reason):
+        with self._lock:
+            if self.reason is None:
+                self.reason = reason
+
+    def check(self):
+        reason = self.reason
+        if reason is None:
+            return
+        if isinstance(reason, _ResumeModelJob):
+            raise _ResumeModelJob(reason.issue)
+        raise _Halted()
+
+
+def _parallel(call, func, items, *, workers=3, tolerate=()):
+    """Run independent stages concurrently and return (result, tolerated issue) in input order.
+
+    The first other failure, including a deferred 429, cancels the stages not yet started
+    and halts the rest at their next model call; it is then raised for the whole job."""
+    halt = getattr(call, "halt", None)
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = [pool.submit(func, item) for item in items]
+    failure = None
+    try:
+        for future in as_completed(futures):
+            if future.cancelled() or failure is not None:
+                continue
+            error = future.exception()
+            if error is None or isinstance(error, tolerate):
+                continue
+            failure = error
+            if halt is not None:
+                halt.trip(error)
+            for other in futures:
+                other.cancel()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    if failure is not None:
+        raise failure
+    return [(None, f.exception()) if f.exception() is not None else (f.result(), None) for f in futures]
 
 
 def respond(turns, *, research=False, draw=False, model, question=None, checkpoints=None):
@@ -613,10 +668,10 @@ def _primary_sources(call, topic, *, read_main=False):
     if read_main:
         # Both readers start independently. Only the sanitised public topic or the
         # known primary title and its page locations reaches the dedicated reader.
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            original = pool.submit(_read_central_work, call, central_reading_subject(topic), reader)
-            notes = call(public, WEB_SYSTEM, web=True)
-            central, central_gaps, searches = original.result()
+        (original, _), (notes, _) = _parallel(call, lambda stage: stage(), (
+            partial(_read_central_work, call, central_reading_subject(topic), reader),
+            partial(call, public, WEB_SYSTEM, web=True)), workers=2)
+        central, central_gaps, searches = original
     else:
         notes = call(public, WEB_SYSTEM, web=True)
     if not notes.complete:
@@ -817,6 +872,8 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
         if saved is not None:
             return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]))
 
+    halt = _Halt()
+
     def call(messages, instructions, *, web=False, prose=False, key=None):
         # Replaying completed stages reconstructs the plan, source cards and edits locally.
         if checkpoints is not None and key is None:
@@ -824,6 +881,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
             saved = cached(key)
             if saved is not None:
                 return saved
+        halt.check()
 
         def save(result):
             checkpoints.put(key, {"text": result.text, "searches": result.searches,
@@ -846,7 +904,10 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
                     client, headers, messages, web, model, instructions=instructions, **options))
         except ModelIssue as exc:
             if checkpoints is not None and exc.retryable:
-                raise _ResumeModelJob(exc) from None
+                # Parallel siblings must not keep calling a model that just refused.
+                deferred = _ResumeModelJob(exc)
+                halt.trip(deferred)
+                raise deferred from None
             # A terminal error (including a provider refusal) invalidates speculative
             # output. Only a process interruption leaves a prefix to resume from.
             if saved_prefix:
@@ -868,6 +929,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
                 return saved, True
         return call(messages, instructions, prose=True, key=key), False
 
+    call.halt = halt
     write_prose = partial(_complete, partial(call, prose=True), model=model,
                           continuation_call=continuation_call if checkpoints is not None else None)
     dispatch = SYSTEM + DISPATCH
@@ -954,8 +1016,7 @@ def _recover_verified(call, result, sources, issue):
                 return _verify_draft(call, Result(section, [], 0), sources.text)
             except ModelIssue:
                 return Result("Сверку этого раздела по первоисточникам завершить не удалось.", [], 0, False)
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            recovered = list(pool.map(check, sections[1:]))
+        recovered = [section for section, _ in _parallel(call, check, sections[1:])]
         if any(section.complete for section in recovered):
             all_verified = result.complete and all(section.complete for section in recovered)
             text = "\n\n".join([sections[0], *(section.text for section in recovered)])
@@ -1005,8 +1066,7 @@ def _map_source(call, turns, question):
         if not result.complete:
             raise ModelIssue("timeout", "source_pass")
         return f"Фрагмент {index+1} из {len(pieces)}\n" + result.text
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        notes = list(pool.map(extract, range(len(pieces))))
+    notes = [note for note, _ in _parallel(call, extract, range(len(pieces)))]
     synthesis = ("Весь материал просмотрен по последовательным фрагментам. Ниже наблюдения из каждого, "
                  "сохрани локаторы, не выдавай их за полный дословный текст и отмечай ограничения вывода.\n"
                  + "\n\n".join(notes))
@@ -1121,19 +1181,17 @@ def _lecture(call, turns, minutes, *, write_prose=None):
 
     parts = []
     complete = True
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = [pool.submit(write, i) for i in range(len(sections))]
-        first_failure = None
-        for future in futures:
-            try:
-                result = future.result()
-            except ModelIssue as exc:
-                first_failure = first_failure or exc
-                complete = False
-                parts.append(None)
-            else:
-                parts.append(result.text)
-                complete &= result.complete
+    first_failure = None
+    # A section that ends with a model issue leaves a gap; a deferred 429 or any other
+    # failure stops the remaining sections and parks the job with the written ones saved.
+    for result, issue in _parallel(call, write, range(len(sections)), tolerate=ModelIssue):
+        if issue is not None:
+            first_failure = first_failure or issue
+            complete = False
+            parts.append(None)
+        else:
+            parts.append(result.text)
+            complete &= result.complete
     if not any(parts):
         if first_failure:
             raise first_failure
