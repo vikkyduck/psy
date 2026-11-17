@@ -110,8 +110,17 @@ def backup_problem(now, timer_enabled):
 
 
 def open_readonly(path):
-    """Read metadata without creating files. A WAL database between writes may have no -wal/-shm,
-    which a read-only mount cannot create; then it is fully checkpointed and read as a file."""
+    """Read metadata without ever creating files next to the bot's database. A WAL database that no
+    process holds open has no -wal/-shm, and a read-only open would try to create them (as root);
+    it is fully checkpointed then, so read the file itself."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("not a regular file")
+        header = stream.read(100)
+    if len(header) >= 20 and header[18] == 2 and not all(
+            os.path.exists(str(path) + side) for side in ("-wal", "-shm")):
+        return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
     db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
         db.execute("SELECT count(*) FROM sqlite_master").fetchone()
