@@ -696,12 +696,6 @@ def retry_delivery(ident, part, retry_at, *, root=ROOT, park=False):
         _finish_attempt(con, ident, part, "retry", None, retry_at, park=park)
 
 
-def outbound(ident, *, root=ROOT):
-    # Persist BEFORE non-idempotent Telegram delivery. An ambiguous send cannot be replayed safely.
-    with database(root) as con:
-        con.execute("UPDATE requests SET state='sending' WHERE id=? AND state='running'", (ident,))
-
-
 def settle(ident, success, *, root=ROOT):
     with database(root) as con:
         if success:

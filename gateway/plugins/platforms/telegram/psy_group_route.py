@@ -261,11 +261,8 @@ async def group_message(msg):
         if source:
             doc_id = await archive_source(uid, topic, msg, source)
     if msg.document and not source:
-        ext = (msg.document.file_name or "").lower().rsplit(".",1)[-1]
-        if ext in ("m4a","mp3","wav","mp4","flac","ogg","mov","mkv","opus","aac","webm"):
-            await upload_button(msg)
-        else:
-            await msg.reply_text("Для разбора пришлите текст в TXT, Markdown, CSV или фотографию в JPEG, PNG, WebP.")
+        # Recordings never get here: audio.metadata routed every audio or video document above.
+        await msg.reply_text("Для разбора пришлите текст в TXT, Markdown, CSV или фотографию в JPEG, PNG, WebP.")
         return
     if quoted and not source:
         doc_id, source, quote, quoted_turn = await quoted_material(uid, topic, quoted)

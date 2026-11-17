@@ -20,7 +20,7 @@ TRACKED = (
     "tools/transcription_tools.py",
 )
 MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_queue", "psy_group_route",
-           "psy_owner_recovery", "psy_source_evidence", "psy_group_store", "psy_instance", "psy_local_media",
+           "psy_owner_recovery", "psy_source_evidence", "psy_group_store", "psy_instance",
            "psy_upload_handoff", "psy_group_admin")
 ADDED = tuple(TELEGRAM + name + ".py" for name in MODULES) + (
     "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_codex_incident.py",

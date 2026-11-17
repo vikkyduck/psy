@@ -17,7 +17,7 @@ class Pending(unittest.TestCase):
             self.assertEqual(store.claim_next(root=root),(1,"demo1"))
             self.assertEqual(store.recover(root=root),6)
             self.assertEqual(store.claim_next(root=root),(1,"demo1"))
-            store.outbound(1,root=root)
+            self.assertEqual(store.begin_delivery(1,0,"part",root=root),("send",None))
             self.assertEqual(store.recover(root=root),5)
             self.assertEqual(store.claim_next(root=root),(2,"demo2"))
             with store.database(root) as c:

@@ -52,4 +52,11 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audio.metadata(m)[1],"Голосовое.ogg")
         m.sender_chat=S()
         self.assertIsNone(audio.metadata(m))
+    def test_long_recording_name_keeps_its_extension(self):
+        m=S(chat=S(id=audio.GROUP),from_user=S(id=51,is_bot=False),sender_chat=None,
+            document=S(file_name="лекция "*40+".M4A",file_size=1024))
+        name=audio.metadata(m)[1]
+        self.assertEqual((len(name),name[-4:]),(140,".M4A"))
+        m.document.file_name="notes "*40+".txt"
+        self.assertIsNone(audio.metadata(m))
 if __name__=="__main__":unittest.main()
