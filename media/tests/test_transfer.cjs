@@ -103,8 +103,8 @@ test('the actual UI needs one click, keeps the button locked during retry, and p
     window:{Telegram:{WebApp:{initData:'isolated-test-data',ready(){},expand(){},enableClosingConfirmation(){},disableClosingConfirmation(){}}}},
     fetch:async(path,o={})=>{
       if(path==='/api/auth')return Response.json({session:'isolated-test-session',chunk:4*MB,destination:'Test'});
-      if(path==='/api/capacity')return Response.json({member_limit_bytes:25*MB,member_low:true,member_upload_bytes:5*MB,disk_low:true});
-      if(path==='/api/jobs'&&!o.method)return Response.json({jobs:[prior,...[repeat,s.job].filter(Boolean)]});
+      if(path==='/api/capacity')return Response.json({disk_low:true});
+      if((path==='/api/jobs'||path==='/api/jobs?count=20')&&!o.method)return Response.json({jobs:[prior,...[repeat,s.job].filter(Boolean)],more:false});
       if(path==='/api/jobs/finished/reprocess'&&o.method==='POST'){
         prior={...prior,has_next:true};
         repeat={id:'revision',filename:prior.filename,size:prior.size,state:'queued',is_repeat:true};
@@ -119,8 +119,9 @@ test('the actual UI needs one click, keeps the button locked during retry, and p
   vm.runInNewContext(fs.readFileSync(require.resolve('../static/app.js'),'utf8'),context);
   for(let n=0;n<20&&get('upload').hidden;n++)await new Promise(r=>setTimeout(r,1));
   await new Promise(r=>setTimeout(r,5));
-  assert.match(get('capacity').textContent,/до 5 МиБ/);
+  // Only physical disk space is reported; there is no personal quota to show.
   assert.match(get('capacity').textContent,/места на сервере/);
+  assert.doesNotMatch(get('capacity').textContent,/лимит/i);
   const actions=()=>get('jobs').children.flatMap(card=>card.children);
   const action=actions().find(x=>x.textContent==='Расшифровать заново');
   await action.onclick();

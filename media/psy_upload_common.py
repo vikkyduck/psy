@@ -289,8 +289,8 @@ def validate_init(raw, token, current=None):
 
 def store_session(row):
     with db() as c:
+        # Only expiry removes a session: opening the Mini App again never logs out another window.
         c.execute('DELETE FROM sessions WHERE expires < ?', (now(),))
-        c.execute('DELETE FROM sessions WHERE uid=? AND hash NOT IN (SELECT hash FROM sessions WHERE uid=? ORDER BY expires DESC LIMIT 9)', (row['uid'],row['uid']))
         c.execute('INSERT INTO sessions(hash,uid,chat,thread,reply,expires,proof) VALUES(:hash,:uid,:chat,:thread,:reply,:expires,:proof)',row)
 
 

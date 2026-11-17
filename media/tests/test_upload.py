@@ -102,9 +102,9 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         r=await self.new_job(C.LIMIT+1,b'x'*65536);self.assertEqual(r.status,400)
         r=await self.new_job(65536,b'x'*65536,name='script.py');self.assertEqual(r.status,400)
         ids=[]
-        for i in range(3):
+        # No per-member count: every recording is accepted and waits its turn.
+        for i in range(8):
             r=await self.new_job(65536,b'x'*65536,name=f'{i}.wav');self.assertEqual(r.status,201);ids.append((await r.json())['id'])
-        r=await self.new_job(65536,b'x'*65536);self.assertEqual(r.status,409)
         r=await self.client.post('/api/jobs/'+ids[0]+'/cancel',headers=self.auth);self.assertEqual(r.status,200)
         r=await self.new_job(65536,b'x'*65536);self.assertEqual(r.status,201)
         r=await self.client.get('/assets/../../state.sqlite3');self.assertEqual(r.status,404)
@@ -363,7 +363,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(upload.done())
             self.assertEqual((await upload).status,200)
 
-    async def test_concurrent_retries_share_create_limit_preserve_results_and_queue_fairly(self):
+    async def test_concurrent_retries_queue_without_a_member_cap_and_preserve_results(self):
         import worker
         done=(await (await self.new_job(1,b'z',name='done.wav')).json())['id']
         saved=C.file_path({'id':done},'.txt')
@@ -383,13 +383,13 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         async def retry(ident,generation=0):
             return await self.client.post('/api/jobs/'+ident+'/retry',headers=self.auth,json={'retry_generation':generation})
         responses=await asyncio.gather(*(retry(ident) for ident in failed))
-        self.assertEqual(sorted(r.status for r in responses),[200,200,200,409])
-        accepted=next(ident for ident,r in zip(failed,responses) if r.status==200)
+        self.assertEqual([r.status for r in responses],[200]*4)
+        accepted=failed[0]
         self.assertEqual((await retry(accepted)).status,200)
-        self.assertEqual((await self.new_job(1,b'n',name='new.wav')).status,409)
+        self.assertEqual((await self.new_job(1,b'n',name='new.wav')).status,201)
         with C.db() as conn:
             active=conn.execute("SELECT * FROM jobs WHERE uid=? AND state='queued'",(C.OWNER,)).fetchall()
-            self.assertEqual(len(active),3)
+            self.assertEqual(len(active),4)
             self.assertTrue(all((j['retry_generation'],j['attempts'],j['next_try'],j['error'])==(1,0,0,None) for j in active))
             self.assertEqual(worker.next_ready_job(conn)['id'],already)
             conn.execute("UPDATE jobs SET state='failed' WHERE id=?",(accepted,))
@@ -443,40 +443,42 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get('/api/jobs/'+repeat+'/transcript',headers=self.auth)).status,404)
         self.assertEqual((await self.client.post(route,headers=auth)).status,200)
 
-    async def test_member_capacity_admits_once_and_preserves_accepted_work(self):
-        from storage_capacity import MAX_TRANSCRIPT_BYTES
-        quota = MAX_TRANSCRIPT_BYTES + 300
+    async def test_capacity_reports_only_disk_space_and_owner_keeps_group_without_membership(self):
         self.assertEqual((await self.client.get('/api/capacity')).status,401)
-        with patch.dict(os.environ, PSY_MEMBER_QUOTA_BYTES=str(quota)):
-            first,second = await asyncio.gather(*(self.new_job(200,b'a'*200,name=f'{i}.wav') for i in range(2)))
-            self.assertEqual(sorted([first.status,second.status]),[201,409])
-            accepted = first if first.status == 201 else second
-            ident = (await accepted.json())['id']
-            response = await self.client.get('/api/capacity', headers=self.auth)
-            info = await response.json()
-            self.assertEqual(set(info),{'member_limit_bytes','member_low','member_upload_bytes','disk_low'})
-            self.assertEqual((info['member_limit_bytes'],info['member_upload_bytes'],info['member_low']),(quota,0,True))
-            group = await self.client.post('/api/auth',json={'initData':signed(123,start_param='psy_group')})
-            other = {'X-Upload-Session':(await group.json())['session']}
-            capacity = await (await self.client.get('/api/capacity',headers=other)).json()
-            self.assertEqual(capacity['member_upload_bytes'],300)
-            with C.db() as conn:
-                conn.execute("UPDATE jobs SET state='failed' WHERE id=?",(ident,))
-            with patch.dict(os.environ, PSY_MEMBER_QUOTA_BYTES='1'):
-                response = await self.client.post('/api/jobs/'+ident+'/retry',headers=self.auth,
-                                                  json={'retry_generation':0})
-                self.assertEqual(response.status,200)
-                with C.db() as conn:
-                    conn.execute("UPDATE jobs SET state='done' WHERE id=?",(ident,))
-                self.seal(ident,b'fixture')
-                response = await self.client.post('/api/jobs/'+ident+'/reprocess',headers=self.auth)
-                self.assertEqual(response.status,409)
-                self.assertIn('лимита', (await response.json())['error'])
+        response = await self.client.get('/api/capacity', headers=self.auth)
+        self.assertEqual(await response.json(),{'disk_low':False})
+        # The owner has left the group: no membership lookup may block the group destination.
+        server.membership=self.oldmembership
+        with patch.object(server,'access_lookup',wraps=server.access_lookup) as lookups:
+            group=await self.client.post('/api/auth',json={'initData':signed(C.OWNER,start_param='psy_group')})
+            self.assertEqual(group.status,200)
+            self.assertEqual((await group.json())['destination'],'Группа')
+            auth={'X-Upload-Session':(await group.json())['session']}
+            ident=(await (await self.new_job(3,b'abc',auth=auth)).json())['id']
+            self.assertEqual((await self.client.patch('/api/jobs/'+ident,data=b'abc',headers={**auth,'Upload-Offset':'0'})).status,200)
+            self.assertEqual((await self.client.post('/api/jobs/'+ident+'/complete',headers=auth)).status,200)
+            self.assertNotIn('member',[call.args[0]['action'] for call in lookups.call_args_list])
+        import worker
+        with C.db() as c:
+            job=dict(c.execute('SELECT * FROM jobs WHERE id=?',(ident,)).fetchone())
+        self.assertEqual((job['chat'],job['state']),(C.GROUP,'queued'))
+        with patch.object(worker,'bot_call',side_effect=AssertionError('owner membership looked up')):
+            self.assertTrue(await worker.group_access(None,job))
+
+    async def test_listing_reaches_every_recording(self):
+        for i in range(23):
+            self.assertEqual((await self.new_job(1,bytes([65+i%26]),name=f'{i}.wav')).status,201)
+        first=await (await self.client.get('/api/jobs',headers=self.auth)).json()
+        self.assertEqual((len(first['jobs']),first['more']),(20,True))
+        everything=await (await self.client.get('/api/jobs?count=40',headers=self.auth)).json()
+        self.assertEqual((len(everything['jobs']),everything['more']),(23,False))
+        self.assertEqual((await self.client.get('/api/jobs?count=0',headers=self.auth)).status,400)
 
     async def test_disk_capacity_warns_before_rejecting_and_checks_space_on_retry(self):
         from types import SimpleNamespace
         from storage_capacity import MAX_TRANSCRIPT_BYTES
-        with patch('shutil.disk_usage',return_value=SimpleNamespace(free=C.RESERVE+MAX_TRANSCRIPT_BYTES+16)):
+        # A new recording needs its bytes, a transcript and the ASR service's private copy.
+        with patch('shutil.disk_usage',return_value=SimpleNamespace(free=C.RESERVE+MAX_TRANSCRIPT_BYTES+32)):
             res = await self.client.get('/api/capacity', headers=self.auth)
             self.assertTrue((await res.json())['disk_low'])
             self.assertEqual((await self.new_job(17,b'x'*17)).status,507)

@@ -14,7 +14,6 @@ from aiohttp.test_utils import TestClient, TestServer
 import asr_client
 import psy_upload_common as C
 import server
-import storage_capacity
 import worker
 import recording_receipts as receipts
 from test_upload import TOKEN, signed
@@ -45,8 +44,7 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
         for scoped in (
             patch.multiple(C, ROOT=root / "state", FILES=root / "files", HOME=root, OWNER=171, GROUP=-707),
             patch.object(C, "bot_settings", return_value=(TOKEN, str(upstream.make_url("/bot")))),
-            patch.dict(os.environ, PSY_ACCESS_SOCKET=str(broker_path), PSY_ASR_PROGRESS="",
-                       PSY_MEMBER_QUOTA_BYTES=str(4 * 1024 ** 3)),
+            patch.dict(os.environ, PSY_ACCESS_SOCKET=str(broker_path), PSY_ASR_PROGRESS=""),
             patch.object(asr_client, "transcribe_recording", self.recognize),
         ):
             scoped.start()
@@ -169,12 +167,18 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get(child_path + "/transcript", headers=headers)).status, 404)
             self.assertEqual((await self.client.post(child_path + "/reprocess", headers=headers)).status, 404)
             self.assertEqual((await (await self.client.get("/api/jobs", headers=headers)).json())["jobs"], [])
+        # The owner has left the group and keeps the group destination.
         self.member_ids.remove(C.OWNER)
-        self.assertEqual((await self.client.post(path + "/reprocess", headers=self.group)).status, 403)
-        self.assertEqual((await self.client.post(child_path + "/reprocess", headers=self.group)).status, 403)
+        self.assertEqual((await self.client.post(path + "/reprocess", headers=self.group)).status, 200)
+        self.assertEqual((await self.client.post(child_path + "/reprocess", headers=self.group)).status, 201)
         self.assertEqual(len(self.deliveries), 2)
+        partner = await self.upload(self.partner)
+        await self.finish(partner)
+        self.assertEqual(len(self.deliveries), 3)
+        self.member_ids.remove(172)
+        self.assertEqual((await self.client.post("/api/jobs/" + partner + "/reprocess", headers=self.partner)).status, 403)
 
-    async def test_legacy_recording_and_quota_for_repeat(self):
+    async def test_legacy_recording_repeat_without_member_quota(self):
         parent = await self.upload(self.private)
         await self.finish(parent)
         path = "/api/jobs/" + parent
@@ -183,18 +187,10 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
             db.execute("UPDATE jobs SET content_id=NULL,sha256=NULL WHERE id=?", (parent,))
         row = self.job(parent)
         text = receipts.get(row["id"],body=True)["body"]
-        minimum = len(self.audio) + len(text) + storage_capacity.MAX_TRANSCRIPT_BYTES
-        with patch.dict(os.environ, PSY_MEMBER_QUOTA_BYTES=str(minimum - 1)):
-            denied = await self.client.post(path + "/reprocess", headers=self.private)
-            self.assertEqual(denied.status, 409)
-            self.assertEqual(self.job(parent), row)
-            with C.db() as db:
-                self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 1)
-        with patch.dict(os.environ, PSY_MEMBER_QUOTA_BYTES=str(minimum)):
-            accepted = await self.client.post(path + "/reprocess", headers=self.private)
-            self.assertEqual(accepted.status, 201)
-            child = (await accepted.json())["id"]
-            await self.finish(child)
+        accepted = await self.client.post(path + "/reprocess", headers=self.private)
+        self.assertEqual(accepted.status, 201)
+        child = (await accepted.json())["id"]
+        await self.finish(child)
         self.assertEqual(self.job(child)["sha256"], hashlib.sha256(self.audio).hexdigest())
         self.assertEqual(self.job(parent), row)
         self.assertEqual(receipts.get(row["id"],body=True)["body"], text)

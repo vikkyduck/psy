@@ -102,7 +102,7 @@ if(typeof module!=='undefined'&&module.exports)module.exports={transferRecording
 
 if(typeof document!=='undefined'){
 const $=id=>document.getElementById(id),tg=window.Telegram?.WebApp;
-let session='',jobs=[],busy=false,paused=false,controller=null,chunk=1024*1024,activeJob=null,completedFile=null,wakeLock=null,refreshing=false;
+let session='',jobs=[],listCount=20,moreJobs=false,busy=false,paused=false,controller=null,chunk=1024*1024,activeJob=null,completedFile=null,wakeLock=null,refreshing=false;
 const labels={uploading:'Загружается',queued:'В очереди на расшифровку',processing:'Расшифровываем запись',delivery_pending:'Текст сохранен, ожидает отправки',sending:'Отправляем результат',done:'Обработка завершена',failed:'Обработка не завершена',cancelled:'Загрузка отменена'};
 function note(text){$('notice').textContent=text;}
 async function api(path,options={}){
@@ -115,22 +115,14 @@ async function api(path,options={}){
 async function refresh(){
   if(!session||refreshing)return;
   refreshing=true;const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),15000);
-  try{jobs=(await(await api('/api/jobs',{signal:ctrl.signal})).json()).jobs;render();}catch(e){if(e.status===401&&!busy)note('Срок входа истек. Закройте окно и откройте его кнопкой в Telegram.');}
+  try{const b=await(await api('/api/jobs?count='+listCount,{signal:ctrl.signal})).json();jobs=b.jobs;moreJobs=b.more===true;render();}catch(e){if(e.status===401&&!busy)note('Срок входа истек. Закройте окно и откройте его кнопкой в Telegram.');}
   finally{clearTimeout(timer);refreshing=false;}
 }
 async function refreshCapacity(){
   const ctrl=new AbortController(),timer=setTimeout(()=>ctrl.abort(),15000);
   try{
     const storage=await(await api('/api/capacity',{signal:ctrl.signal})).json();
-    const mib=bytes=>Math.floor(bytes/(1024**2)).toLocaleString('ru-RU');
-    const lines=['Личный лимит хранения: '+mib(storage.member_limit_bytes)+' МиБ.'];
-    if(storage.member_low){
-      lines.push(storage.member_upload_bytes
-        ? 'С учетом резерва на текст для новой записи доступно до '+mib(storage.member_upload_bytes)+' МиБ.'
-        : 'Личный лимит исчерпан для новых загрузок.');
-    }
-    if(storage.disk_low)lines.push('Свободного места на сервере может не хватить для записи размером 1 ГиБ.');
-    $('capacity').textContent=lines.join(' ');
+    $('capacity').textContent=storage.disk_low?'Свободного места на сервере может не хватить для записи размером 1 ГиБ.':'';
   }catch{$('capacity').textContent='Не удалось проверить свободное место.';}
   finally{clearTimeout(timer);}
 }
@@ -191,6 +183,11 @@ function render(){
       const b=document.createElement('button');b.className='secondary';b.textContent='Повторить обработку';b.onclick=async()=>{b.disabled=true;try{await api('/api/jobs/'+j.id+'/retry',{method:'POST',body:JSON.stringify({retry_generation:j.retry_generation})});await refresh();}catch(e){note(e.message);b.disabled=false;}};box.append(b);
     }
     $('jobs').append(box);
+  }
+  if(moreJobs){
+    const more=document.createElement('button');more.className='secondary';more.textContent='Показать более ранние записи';
+    more.onclick=async()=>{listCount+=20;more.disabled=true;await refresh();};
+    $('jobs').append(more);
   }
 }
 async function keepAwake(){

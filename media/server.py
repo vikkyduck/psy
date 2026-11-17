@@ -19,7 +19,7 @@ import weakref
 from aiohttp import web
 import psy_upload_common as C
 import recording_receipts as receipts
-from storage_capacity import MAX_TRANSCRIPT_BYTES, admission_reason, capacity_snapshot
+from storage_capacity import admission_reason, capacity_snapshot
 from queue_health import PROGRESS_WARNING_SECONDS, processing_age
 
 ASSETS = Path(__file__).parent / 'static'
@@ -28,6 +28,9 @@ locks = weakref.WeakValueDictionary()
 # SQLite, fsync and progress files block. They run here; each thread reuses one connection.
 STORAGE = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='psy-storage')
 TRANSCRIPT_PIECE = 64 * 1024
+# psy-member.socket accepts 24 connections (each one is a process). Further lookups wait
+# here for a free slot instead of being refused by systemd.
+BROKER_SLOTS = 16
 SECURITY_HEADERS = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
     'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org",
@@ -61,13 +64,32 @@ async def boundary(request, handler):
 
 
 async def membership(request, uid):
+    # The owner may have left the group and keeps the group destination regardless.
+    if uid == C.OWNER:
+        return True
     reply = await access_lookup({'action':'member','uid':uid})
     if type(reply.get('member')) is not bool:
         raise web.HTTPServiceUnavailable()
     return reply['member']
 
 
+_broker_slots = {}
+
+
+def broker_slots():
+    loop = asyncio.get_running_loop()
+    if loop not in _broker_slots:
+        _broker_slots.clear()
+        _broker_slots[loop] = asyncio.Semaphore(BROKER_SLOTS)
+    return _broker_slots[loop]
+
+
 async def access_lookup(payload):
+    async with broker_slots():
+        return await broker_exchange(payload)
+
+
+async def broker_exchange(payload):
     async def exchange():
         reader,writer=await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'],limit=16384)
         try:
@@ -168,17 +190,23 @@ def public_job(j):
     return public
 
 
-def job_listing(session):
+def job_listing(session, count):
     with C.db() as c:
         rows = c.execute("""SELECT j.*, EXISTS(SELECT 1 FROM jobs c WHERE c.reprocess_of=j.id) AS has_next
-                            FROM jobs j WHERE uid=? AND chat=? ORDER BY created DESC,j.rowid DESC LIMIT 20""",
-                         (session['uid'],session['chat'])).fetchall()
-    return [dict(public_job(r), has_next=bool(r['has_next']), is_repeat=r['reprocess_of'] is not None) for r in rows]
+                            FROM jobs j WHERE uid=? AND chat=? ORDER BY created DESC,j.rowid DESC LIMIT ?""",
+                         (session['uid'],session['chat'],count+1)).fetchall()
+    listing = [dict(public_job(r), has_next=bool(r['has_next']), is_repeat=r['reprocess_of'] is not None)
+               for r in rows[:count]]
+    return {'jobs': listing, 'more': len(rows) > count}
 
 
 async def jobs(request):
     s = await authorize(request)
-    return web.json_response({'jobs': await blocking(job_listing, s)})
+    # The page asks for more on demand; every recording stays reachable.
+    count = int(request.query.get('count', '20'))
+    if count < 1:
+        raise web.HTTPBadRequest()
+    return web.json_response(await blocking(job_listing, s, count))
 
 
 def busy_uploads():
@@ -195,37 +223,27 @@ def expire_drafts(conn, busy):
         conn.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?",(C.now(),draft['id']))
 
 
-def storage_status(conn, uid):
-    return capacity_snapshot(conn, C.FILES, uid, max_upload_bytes=C.LIMIT, reserve_bytes=C.RESERVE)
+def storage_status(conn):
+    return capacity_snapshot(conn, C.FILES, max_upload_bytes=C.LIMIT, reserve_bytes=C.RESERVE)
 
 
-def member_capacity(uid):
+def disk_capacity():
     with C.db() as conn:
-        conn.execute('BEGIN')
-        return storage_status(conn, uid)
+        return storage_status(conn)
 
 
 async def capacity(request):
-    session = await authorize(request)
-    snapshot = await blocking(member_capacity, session['uid'])
-    # Only this participant's quota and a fleet-wide low-space flag are public.
-    return web.json_response({
-        'member_limit_bytes': snapshot['member_limit_bytes'],
-        'member_low': snapshot['member_low'],
-        'member_upload_bytes': max(0, snapshot['member_available_bytes'] - MAX_TRANSCRIPT_BYTES),
-        'disk_low': snapshot['disk_low'],
-    })
+    await authorize(request)
+    snapshot = await blocking(disk_capacity)
+    # Only a fleet-wide low-space flag is public. There is no per-member quota.
+    return web.json_response({'disk_low': snapshot['disk_low']})
 
 
-def admission(conn, uid, additional_bytes, *, retry=False):
-    """Caller holds BEGIN IMMEDIATE through admission and reserve/requeue."""
-    outstanding=conn.execute("SELECT COUNT(*) FROM jobs WHERE uid=? AND state IN ('uploading','queued','processing')",(uid,)).fetchone()[0]
-    if outstanding>=3:
-        return failure(409,'У вас 3 активные записи. Завершите или отмените незаконченные загрузки.')
-    reason = admission_reason(storage_status(conn, uid), additional_bytes, retry=retry)
-    if reason == 'member_quota':
-        return failure(409, 'Личного лимита хранения недостаточно для этой записи и ее расшифровки.')
-    if reason == 'disk_capacity':
+def admission(conn, source_bytes, asr_bytes):
+    """Caller holds BEGIN IMMEDIATE through admission and reserve/requeue.
+
+    Any number of recordings may wait in the queue; only physical disk space can refuse."""
+    if admission_reason(storage_status(conn), source_bytes, asr_bytes) == 'disk_capacity':
         return failure(507, 'На сервере недостаточно места для записи и ее расшифровки.')
     return None
 
@@ -243,7 +261,7 @@ def create_job(s, proof, shape, fp, busy):
                                                language,content_id,C.now()-86400)).fetchone()
         if existing:
             return web.json_response(public_job(existing))
-        denied=admission(c,s['uid'],size)
+        denied=admission(c,size,size)
         if denied is not None:return denied
         c.execute('INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,fingerprint,language,state,created,updated,content_id,proof) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (ident,s['uid'],s['chat'],s['thread'],s['reply'],name,ext,size,fp,language,'uploading',C.now(),C.now(),content_id,proof['proof']))
@@ -418,7 +436,7 @@ def retry_job(ident, s, generation, busy):
         if generation<j['retry_generation'] or j['state']!='failed':
             return web.json_response({'state':j['state']})
         expire_drafts(c, busy)
-        denied=admission(c,s['uid'],0,retry=True)
+        denied=admission(c,0,j['size'])
         if denied is not None:return denied
         # A separate upload can already be processing the same verified recording.
         duplicate=c.execute("""SELECT id FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
@@ -459,7 +477,7 @@ def reprocess_job(parent, session, bound, busy):
         if original['state'] != 'done' or original['ext'] not in C.EXTENSIONS:
             return failure(409, 'Эту запись можно обработать заново после завершения расшифровки.')
         expire_drafts(conn, busy)
-        denied = admission(conn, session['uid'], 0)
+        denied = admission(conn, 0, original['size'])
         if denied is not None:
             return denied
         source = C.file_path(original)

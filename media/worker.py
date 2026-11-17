@@ -28,6 +28,9 @@ async def bot_call(http, method, payload):
 async def group_access(http, job):
     if job['chat'] != C.GROUP:
         return job['uid'] == C.OWNER and job['chat'] == C.OWNER
+    if job['uid'] == C.OWNER:
+        # The owner may have left the group and keeps the group destination regardless.
+        return True
     try:
         result = await bot_call(http, 'getChatMember', {'chat_id':str(C.GROUP), 'user_id':str(job['uid'])})
     except Exception as error:
@@ -61,17 +64,20 @@ def finish(job, delivery, message_id=None):
                   (delivery,message_id,C.now(),job['id']))
 
 
-def retry_later(job, stage, delay=0):
+ASR_ATTEMPTS = 8
+MAX_BACKOFF = 1800
+
+
+def retry_later(job, stage, delay=0, *, bounded=False):
+    """Back off and keep the job. Only a crashing local ASR stops after ASR_ATTEMPTS tries,
+    so one recording that kills the decoder cannot occupy it forever."""
     attempts = job['attempts'] + 1
-    if attempts >= 8:
-        if stage == 'delivery_pending':
-            finish(job, 'failed')
-        else:
-            with C.db() as c:
-                c.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
-                          ('Сервис временно недоступен. Можно повторить обработку.',C.now(),job['id']))
+    if bounded and attempts >= ASR_ATTEMPTS:
+        with C.db() as c:
+            c.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
+                      ('Сервис временно недоступен. Можно повторить обработку.',C.now(),job['id']))
         return
-    wait = max(min(1800, 10*2**(attempts-1)), max(0,delay))
+    wait = max(min(MAX_BACKOFF, 10*2**min(attempts-1, 8)), max(0,delay))
     with C.db() as c:
         c.execute('UPDATE jobs SET state=?,attempts=?,next_try=?,updated=?,queued_at_ns=? WHERE id=?',
                   (stage,attempts,C.now()+wait,C.now(),time.time_ns(),job['id']))
@@ -136,12 +142,9 @@ async def deliver(http, job):
         receipts.status(job['id'],'sent',msg)
         finish(job,'sent',msg)
     elif result.get('ok') is False and result.get('error_code') == 429:
+        # Telegram asked to slow down. The transcript is ready, so keep trying without a cap.
         count = record['attempts'] + 1
-        if count >= 8:
-            receipts.status(job['id'],'failed')
-            finish(job,'failed')
-            return
-        wait = max(10*2**(count-1),int((result.get('parameters') or {}).get('retry_after') or 0))
+        wait = max(min(MAX_BACKOFF, 10*2**min(count-1, 8)),int((result.get('parameters') or {}).get('retry_after') or 0))
         receipts.status(job['id'],'ready',next_try=C.now()+wait,attempt=count)
         retry_later({**job,'attempts':count-1},'delivery_pending',wait)
     else:
@@ -175,9 +178,12 @@ async def run_job(http, job):
                 'Распознавание остановлено после 45 минут без прогресса. Можно повторить обработку. '
                 'Если часть записи обработана, бот продолжит с сохраненного места.', C.now(), job['id']))
         return
-    except (MembershipUnavailable, ConnectionError, FileNotFoundError) as exc:
-        logging.warning('ASR temporarily unavailable: %s', type(exc).__name__)
+    except MembershipUnavailable:
         retry_later(job,'queued')
+        return
+    except (ConnectionError, FileNotFoundError) as exc:
+        logging.warning('ASR temporarily unavailable: %s', type(exc).__name__)
+        retry_later(job,'queued',bounded=True)
         return
     with C.db() as c:
         c.execute("""UPDATE jobs SET state='delivery_pending',duration=?,speech_detected=?,
