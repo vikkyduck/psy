@@ -63,24 +63,109 @@ class RedundantDropins(unittest.TestCase):
             self.assertEqual([p.name for p in kept], ["limits.conf"])
 
 
+class OwnerSide(unittest.TestCase):
+    """The checkout is written through owner_io; links planted there must not redirect anything."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.checkout = self.root / "checkout"
+        (self.checkout / "pkg").mkdir(parents=True)
+        self.outside = self.root / "outside.py"
+        self.outside.write_text("root-owned original")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def io(self, action, payload):
+        return live.owner_io(action, payload, root=self.checkout, user=None)
+
+    def write(self, path, data, mode=0o644):
+        import base64
+        return self.io("write", {"files": [{"path": str(path), "mode": mode, "data": base64.b64encode(data).decode()}]})
+
+    def test_old_temporary_name_planted_as_link_is_not_followed(self):
+        target = self.checkout / "pkg/auth.py"
+        target.write_text("old")
+        os.symlink(self.outside, self.checkout / "pkg/auth.py.psy-new")
+        self.write(target, b"new")
+        self.assertEqual(target.read_text(), "new")
+        self.assertEqual(self.outside.read_text(), "root-owned original")
+
+    def test_link_at_target_or_in_a_parent_is_refused(self):
+        os.symlink(self.outside, self.checkout / "pkg/linked.py")
+        with self.assertRaisesRegex(ValueError, "not a regular file"):
+            self.write(self.checkout / "pkg/linked.py", b"x")
+        with self.assertRaisesRegex(ValueError, "refused"):
+            self.io("read", {"paths": [str(self.checkout / "pkg/linked.py")]})
+        os.symlink(self.root, self.checkout / "redirect")
+        with self.assertRaisesRegex(ValueError, "not a plain directory"):
+            self.write(self.checkout / "redirect/outside.py", b"x")
+        with self.assertRaisesRegex(ValueError, "outside the checkout"):
+            self.write(self.checkout / "../outside.py", b"x")
+        self.assertEqual(self.outside.read_text(), "root-owned original")
+
+    def test_write_keeps_mode_and_read_reports_missing(self):
+        target = self.checkout / "pkg/kept.py"
+        target.write_text("old")
+        os.chmod(target, 0o600)
+        self.write(target, b"new", mode=0o644)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+        found = self.io("read", {"paths": [str(target), str(self.checkout / "pkg/none.py")]})
+        self.assertIsNone(found[str(self.checkout / "pkg/none.py")])
+        self.assertEqual(found[str(target)]["mode"], 0o600)
+
+
+class RootSide(unittest.TestCase):
+    def test_link_at_root_target_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside, target = Path(tmp) / "outside", Path(tmp) / "unit.service"
+            outside.write_text("keep")
+            os.symlink(outside, target)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                live.write(target, b"x", "root", 0o644)
+            self.assertEqual(outside.read_text(), "keep")
+
+    def test_directory_others_can_change_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp) / "shared"
+            shared.mkdir()
+            os.chmod(shared, 0o777)
+            with self.assertRaisesRegex(ValueError, "another account"):
+                live.write_plain(shared / "f", b"x", os.geteuid(), os.getegid(), 0o644)
+
+
 class BackupAndRestore(unittest.TestCase):
     def test_restore_returns_changed_and_removes_new_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            checkout = root / "checkout"
+            (checkout / "pkg").mkdir(parents=True)
             old, new = root / "srv/a.py", root / "srv/b.py"
+            mine, added = checkout / "pkg/c.py", checkout / "pkg/d.py"
             old.parent.mkdir()
             old.write_text("before")
             os.chmod(old, 0o640)
+            mine.write_text("checkout before")
+            os.chmod(mine, 0o600)
             with patch.object(live, "BACKUPS", root / "backups"):
-                backup = live.Backup("test")
-                backup.keep(old)
-                backup.keep(new)
+                backup = live.Backup("test", checkout=checkout, owner=None)
+                backup.keep([old, new, mine, added])
+                backup.note({"psy-upload"}, True)
                 old.write_text("after")
                 new.write_text("added")
-                backup.restore()
+                mine.write_text("checkout after")
+                added.write_text("new in checkout")
+                # A later `rollback` reads the same index from disk.
+                again = live.Backup(root=backup.root, checkout=checkout, owner=None)
+                self.assertEqual(again.index["units"], ["psy-upload"])
+                again.restore()
             self.assertEqual(old.read_text(), "before")
             self.assertEqual(old.stat().st_mode & 0o777, 0o640)
             self.assertFalse(new.exists())
+            self.assertEqual(mine.read_text(), "checkout before")
+            self.assertEqual(mine.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(added.exists())
 
     def test_plan_lists_only_differences(self):
         with tempfile.TemporaryDirectory() as tmp:

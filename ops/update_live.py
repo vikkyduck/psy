@@ -4,19 +4,28 @@ Run as root from the repository root on the bot host:
 
     python3 ops/update_live.py plan            # what would change; writes nothing
     python3 ops/update_live.py apply [--force]
+    python3 ops/update_live.py rollback /var/lib/psy-deploy/<backup>   # put a backup back by hand
 
 install-runtime stages an idle host; this is its counterpart for a running one. It installs the same
 files, derives the Hermes edits from gateway/hermes.patch at the pinned commit, and leaves the owner's
 profile (SOUL.md, skills), instance.env and private files alone. Drop-ins that only repeat what the
 shipped unit now says are retired. Changed files are saved under /var/lib/psy-deploy first; a failed
 preflight, service start or Telegram reconnect puts them back.
+
+Trust boundary: the Hermes checkout belongs to the hermes account, which also runs an agent with a
+terminal. Root never opens, writes, backs up or restores a path inside that checkout; a small helper
+does it as hermes, so a link planted there can only reach what hermes could already change. Files in
+root-owned directories are opened without following links, in directories that only root can modify.
 """
 import argparse
+import base64
+import errno
 import hashlib
 import importlib.util
 import json
 import os
-import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,6 +45,9 @@ RECORD = Path("/etc/psy/deployed")
 GROUP_DB = "/home/hermes/.hermes/vault/group-psy/group.sqlite3"
 UPLOAD_HEALTH = Path("/var/lib/psy-upload-health/state.json")
 UPLOAD_PYTHON = "/opt/psy-upload-venv/bin/python"
+# Copied before an apply as their own owners (never opened by root): a release may migrate them.
+DATABASES = (GROUP_DB, "/home/hermes/.hermes/vault/uploads/state.sqlite3",
+             "/var/lib/psy-recording-receipts/results.sqlite3")
 
 # Kept in step with install-runtime.
 MEDIA = ("access_broker", "asr_client", "asr_sandbox", "asr_service", "psy_upload_common", "queue_health",
@@ -73,10 +85,11 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def run(*cmd, user=None, check=True, text=True, env=None):
+def run(*cmd, user=None, check=True, text=True, env=None, input=None):
     if user:
         cmd = ("runuser", "-u", user, "--") + cmd
-    return subprocess.run(cmd, check=check, capture_output=True, text=text, timeout=120, cwd="/", env=env)
+    return subprocess.run(cmd, check=check, capture_output=True, text=text, timeout=120, cwd="/", env=env,
+                          input=input)
 
 
 def hermes_git(*args, text=True):
@@ -193,11 +206,200 @@ def retired_dropins(entries, systemd=SYSTEMD):
     return retire, kept
 
 
+# ---------- file access on both sides of the trust boundary ----------
+
+# Runs as the checkout owner. Reads, writes and removes files below the checkout root and refuses
+# links or odd file types on the way; even if it were fooled, it only has the owner's rights.
+OWNER_IO = r'''
+import base64, json, os, stat, sys
+action, root = sys.argv[1], os.path.realpath(sys.argv[2])
+payload = json.load(sys.stdin)
+
+def walk(path, create=False):
+    rel = os.path.relpath(path, root)
+    if rel == "." or rel.startswith(".." + os.sep) or rel == ".." or os.path.isabs(rel):
+        raise ValueError("outside the checkout: " + path)
+    current = root
+    for part in rel.split(os.sep)[:-1]:
+        current = os.path.join(current, part)
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir(current, 0o755)
+            info = os.lstat(current)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("not a plain directory: " + current)
+
+def read(path):
+    try:
+        walk(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file: " + path)
+        return {"data": base64.b64encode(handle.read()).decode(), "mode": stat.S_IMODE(info.st_mode)}
+
+def write(path, data, mode):
+    walk(path, create=True)
+    try:
+        old = os.lstat(path)
+    except FileNotFoundError:
+        old = None
+    if old is not None and not stat.S_ISREG(old.st_mode):
+        raise ValueError("not a regular file: " + path)
+    mode = stat.S_IMODE(old.st_mode) if old is not None else mode
+    folder, name = os.path.split(path)
+    tmp = os.path.join(folder, "." + name + ".psy-new-" + os.urandom(6).hex())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(base64.b64decode(data))
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+def remove(path):
+    try:
+        walk(path)
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+try:
+    if action == "read":
+        result = {path: read(path) for path in payload["paths"]}
+    elif action == "write":
+        for item in payload["files"]:
+            write(item["path"], item["data"], item["mode"])
+        result = {"ok": True}
+    elif action == "remove":
+        for path in payload["paths"]:
+            remove(path)
+        result = {"ok": True}
+    else:
+        raise ValueError("unknown action")
+except (OSError, ValueError) as exc:
+    json.dump({"error": f"{type(exc).__name__}: {exc}"}, sys.stdout)
+    sys.exit(1)
+json.dump(result, sys.stdout)
+'''
+
+
+def owner_io(action, payload, root=CHECKOUT, user="hermes"):
+    """Run OWNER_IO as `user` (None: as the caller, for tests) and return its JSON answer."""
+    result = run("/usr/bin/python3" if user else sys.executable, "-I", "-c", OWNER_IO, action, str(root),
+                 user=user, check=False, input=json.dumps(payload))
+    try:
+        answer = json.loads(result.stdout or "{}")
+    except ValueError:
+        answer = {}
+    if result.returncode or "error" in answer:
+        raise ValueError(f"checkout {action} refused: {answer.get('error') or result.stderr.strip() or 'no output'}")
+    return answer
+
+
+def in_checkout(target, root=CHECKOUT):
+    return str(target).startswith(str(root) + "/")
+
+
+def check_root_dir(directory):
+    """Every existing component is a real directory that no other account can rearrange."""
+    me = os.geteuid()
+    current = Path("/")
+    for part in Path(directory).parts[1:]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return  # created below by us, inside a checked parent
+        sticky_root = info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, me)
+                or (info.st_mode & 0o022 and not sticky_root)):
+            raise ValueError(f"{current} could be changed by another account; refusing to write below it")
+
+
+def read_plain(path):
+    """Bytes and stat of a regular file, or None; never follows a link at the last component."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"{path} is a symbolic link (a masked unit?); refusing to touch it") from None
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        return handle.read(), info
+
+
+def write_plain(target, data, uid, gid, mode):
+    target = Path(target)
+    check_root_dir(target.parent)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    check_root_dir(target.parent)
+    tmp = target.parent / f".{target.name}.psy-new-{os.urandom(6).hex()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fchown(handle.fileno(), uid, gid)
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def write(target, data, owner, mode):
+    """Install one root-side file; an existing file keeps its owner and mode."""
+    import pwd
+    current = read_plain(target)
+    if current is not None:
+        info = current[1]
+        uid, gid, mode = info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)
+    else:
+        account = pwd.getpwnam(owner)
+        uid, gid = account.pw_uid, account.pw_gid
+    write_plain(target, data, uid, gid, mode)
+
+
+def current_bytes(entries, root=CHECKOUT, user="hermes"):
+    """What each target holds now (None if missing), reading the checkout as its owner."""
+    inside = [str(e.target) for e in entries if in_checkout(e.target, root)]
+    found = owner_io("read", {"paths": inside}, root, user) if inside else {}
+    now = {}
+    for entry in entries:
+        if in_checkout(entry.target, root):
+            item = found.get(str(entry.target))
+            now[entry.target] = None if item is None else base64.b64decode(item["data"])
+        else:
+            plain = read_plain(entry.target)
+            now[entry.target] = None if plain is None else plain[0]
+    return now
+
+
 # ---------- plan ----------
 
-def plan(entries):
-    return [(("new" if not e.target.exists() else "update"), e) for e in entries
-            if not e.target.exists() or e.target.read_bytes() != e.data]
+def plan(entries, now=None):
+    now = current_bytes(entries) if now is None else now
+    return [(("new" if now[e.target] is None else "update"), e) for e in entries if now[e.target] != e.data]
 
 
 def units_for(target):
@@ -255,49 +457,124 @@ def busy():
 
 # ---------- apply ----------
 
-def write(target, data, owner, mode):
-    import pwd
-    account = pwd.getpwnam(owner)
-    if target.exists():
-        st = target.stat()
-        uid, gid, mode = st.st_uid, st.st_gid, st.st_mode & 0o7777
-    else:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        uid, gid = account.pw_uid, account.pw_gid
-    tmp = target.with_name(target.name + ".psy-new")
-    tmp.write_bytes(data)
-    os.chown(tmp, uid, gid)
-    os.chmod(tmp, mode)
-    os.replace(tmp, target)
-
-
 class Backup:
-    def __init__(self, label):
-        self.root = BACKUPS / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{label}"
-        self.root.mkdir(parents=True, mode=0o700)
-        self.saved, self.created = [], []
+    """Previous bytes, owner and mode of every target, plus an index a later `rollback` can replay.
 
-    def keep(self, target):
-        if target.exists():
-            copy = self.root / str(target).lstrip("/")
-            copy.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(target, copy)
-            st = target.stat()
-            os.chown(copy, st.st_uid, st.st_gid)
-            self.saved.append((target, copy))
+    Checkout files are read and put back through owner_io; root-side files never through a link.
+    """
+
+    INDEX = "backup.json"
+
+    def __init__(self, label=None, root=None, checkout=CHECKOUT, owner="hermes"):
+        self.checkout, self.owner = checkout, owner
+        if root is None:
+            check_root_dir(BACKUPS)
+            BACKUPS.mkdir(parents=True, exist_ok=True)
+            root = BACKUPS / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{label}"
+            root.mkdir(mode=0o711)  # traversable so owners can drop database copies in their own folder
+            self.index = {"saved": [], "created": [], "units": [], "reload": False}
         else:
-            self.created.append(target)
+            self.index = json.loads((Path(root) / self.INDEX).read_text())
+        self.root = Path(root)
+
+    def _save_index(self):
+        write_plain(self.root / self.INDEX, json.dumps(self.index, indent=1).encode(), os.geteuid(), os.getegid(), 0o600)
+
+    def note(self, units, reload_units):
+        self.index.update(units=sorted(units), reload=bool(reload_units))
+        self._save_index()
+
+    def keep(self, targets):
+        inside = [str(t) for t in targets if in_checkout(t, self.checkout)]
+        owned = owner_io("read", {"paths": inside}, self.checkout, self.owner) if inside else {}
+        for number, target in enumerate(targets):
+            if in_checkout(target, self.checkout):
+                item = owned.get(str(target))
+                data = None if item is None else base64.b64decode(item["data"])
+                meta = None if item is None else {"mode": item["mode"]}
+            else:
+                plain = read_plain(target)
+                data = None if plain is None else plain[0]
+                meta = None if plain is None else {"mode": stat.S_IMODE(plain[1].st_mode),
+                                                    "uid": plain[1].st_uid, "gid": plain[1].st_gid}
+            if data is None:
+                self.index["created"].append(str(target))
+                continue
+            copy = f"files/{number:04d}"
+            write_plain(self.root / copy, data, os.geteuid(), os.getegid(), 0o600)
+            self.index["saved"].append({"target": str(target), "copy": copy, **meta})
+        self._save_index()
 
     def restore(self):
-        for target, copy in self.saved:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            st = copy.stat()
-            tmp = target.with_name(target.name + ".psy-new")
-            shutil.copy2(copy, tmp)
-            os.chown(tmp, st.st_uid, st.st_gid)
-            os.replace(tmp, target)
-        for target in self.created:
-            target.unlink(missing_ok=True)
+        inside = [item for item in self.index["saved"] if in_checkout(item["target"], self.checkout)]
+        if inside:
+            owner_io("write", {"files": [{"path": item["target"], "mode": item["mode"],
+                                          "data": base64.b64encode((self.root / item["copy"]).read_bytes()).decode()}
+                                         for item in inside]}, self.checkout, self.owner)
+        for item in self.index["saved"]:
+            if not in_checkout(item["target"], self.checkout):
+                write_plain(item["target"], (self.root / item["copy"]).read_bytes(), item["uid"], item["gid"], item["mode"])
+        created_inside = [t for t in self.index["created"] if in_checkout(t, self.checkout)]
+        if created_inside:
+            owner_io("remove", {"paths": created_inside}, self.checkout, self.owner)
+        for target in self.index["created"]:
+            if not in_checkout(target, self.checkout):
+                check_root_dir(Path(target).parent)
+                Path(target).unlink(missing_ok=True)  # unlink never follows a link
+
+
+SNAPSHOT = """
+import sqlite3, sys
+source = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=30)
+target = sqlite3.connect(sys.argv[2])
+source.backup(target, pages=256, sleep=0.05)
+target.close(); source.close()
+"""
+
+
+def snapshot_databases(backup):
+    """Copy each database as the account that owns it into a folder only that account can write."""
+    import pwd
+    copies = []
+    for number, path in enumerate(DATABASES):
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid == 0:
+            print(f"note: not copying {path} (not a regular file owned by a service account)")
+            continue
+        user = pwd.getpwuid(info.st_uid).pw_name
+        folder = backup.root / f"db-{number}"
+        folder.mkdir(mode=0o700)
+        os.chown(folder, info.st_uid, info.st_gid)
+        result = run("/usr/bin/python3", "-I", "-c", SNAPSHOT, path, str(folder / Path(path).name), user=user, check=False)
+        if result.returncode:
+            raise ValueError(f"could not copy {path} before the update: "
+                             + (result.stderr.strip().splitlines() or ["no output"])[-1])
+        copies.append(str(folder / Path(path).name))
+    return copies
+
+
+class Log:
+    """stdout plus a file in the backup folder; a dropped SSH session must not stop the update."""
+
+    def __init__(self, stream):
+        self.stream, self.file = stream, None
+
+    def write(self, text):
+        if self.file:
+            self.file.write(text)
+            self.file.flush()
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        return len(text)
+
+    def flush(self):
+        pass
 
 
 def telegram_connected(since, deadline):
@@ -337,23 +614,38 @@ def commit_label():
         return "unknown"
 
 
+def roll_back_to(backup):
+    """Put a backup's files back and restart what it touched; the names still not running."""
+    backup.restore()
+    if backup.index.get("reload"):
+        run("systemctl", "daemon-reload", check=False)
+    units = set(backup.index.get("units") or ())
+    return restart(units) if units else []
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("action", choices=("plan", "apply"))
+    parser.add_argument("action", choices=("plan", "apply", "rollback"))
+    parser.add_argument("backup", nargs="?", help="for rollback: the /var/lib/psy-deploy folder to put back")
     parser.add_argument("--force", action="store_true", help="apply even while group or recording work is in progress")
     parser.add_argument("--commit", default=None, help="label for the record when the checkout has no .git")
     opts = parser.parse_args()
     if os.geteuid() != 0:
         sys.exit("Run as root on the PSY host.")
+    if opts.action == "rollback":
+        if not opts.backup or Path(opts.backup).resolve().parent != BACKUPS:
+            sys.exit(f"rollback needs a folder directly under {BACKUPS}")
+        still = roll_back_to(Backup(root=Path(opts.backup).resolve()))
+        sys.exit(f"still not running: {', '.join(still)}" if still else f"Restored {opts.backup}.")
     import pwd
     try:
         sums = release_sums()
         check_group_manifest(sums)
         entries = system_entries(pwd.getpwnam("hermes").pw_uid) + gateway_entries(sums)
         check_instance()
+        todo = plan(entries)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
         sys.exit(f"refused: {exc}")
-    todo = plan(entries)
     retire, kept = retired_dropins(entries)
     for kind, entry in todo:
         print(f"  {kind:<7} {entry.target}  <- {entry.source}")
@@ -376,35 +668,52 @@ def main():
     if reasons and not opts.force:
         sys.exit("refused, work in progress: " + "; ".join(reasons) + ". Retry later or pass --force.")
 
+    # From here on a dropped SSH session must not leave the host half-updated.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    sys.stdout = Log(sys.stdout)
     commit = opts.commit or commit_label()
-    backup = Backup(commit[:12])
-    for target in targets:
-        backup.keep(target)
+    try:
+        backup = Backup(commit[:12])
+        sys.stdout.file = os.fdopen(os.open(backup.root / "apply.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                                            | os.O_NOFOLLOW, 0o600), "a", encoding="utf-8")
+        backup.keep(targets)
+        backup.note(units, reload_units)
+        for copy in snapshot_databases(backup):
+            print(f"  database copy {copy}")
+    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"refused before changing anything: {exc}")
+    print(f"Previous files: {backup.root} (put back by hand with: python3 ops/update_live.py rollback {backup.root})")
 
     def roll_back(reason):
         print(f"FAILED: {reason}\nRestoring the previous files from {backup.root}")
-        backup.restore()
-        if reload_units:
-            run("systemctl", "daemon-reload", check=False)
-        still = restart(units) if units else []
+        still = roll_back_to(backup)
         sys.exit("rolled back" + (f"; still not running: {', '.join(still)}" if still else ""))
 
     try:
+        inside = [e for _, e in todo if in_checkout(e.target)]
+        if inside:
+            owner_io("write", {"files": [{"path": str(e.target), "mode": e.mode,
+                                          "data": base64.b64encode(e.data).decode()} for e in inside]})
         for _, entry in todo:
-            write(entry.target, entry.data, entry.owner, entry.mode)
+            if not in_checkout(entry.target):
+                write(entry.target, entry.data, entry.owner, entry.mode)
         for conf in retire:
+            check_root_dir(conf.parent)
             conf.unlink()
         if reload_units:
             run("systemctl", "daemon-reload")
-        check = run("/usr/bin/python3", "-I", str(GROUP_LIB / "preflight.py"), check=False)
+        # As the service runs it: the gateway's ExecStartPre has no root rights either.
+        check = run("/usr/bin/python3", "-I", str(GROUP_LIB / "preflight.py"), user="hermes", check=False)
         if check.returncode:
             roll_back("preflight: " + (check.stderr or check.stdout).strip())
         failed = restart(units)
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         roll_back(str(exc))
     if failed:
         roll_back("not running after restart: " + ", ".join(failed))
-    RECORD.write_text(f"commit={commit}\nupdated_at={backup.root.name[:16]}\nchanges={len(targets)}\nbackup={backup.root}\n")
+    record = read_plain(RECORD)
+    write_plain(RECORD, f"commit={commit}\nupdated_at={backup.root.name[:16]}\nchanges={len(targets)}\nbackup={backup.root}\n".encode(),
+                0, 0, stat.S_IMODE(record[1].st_mode) if record else 0o644)
     print(f"Updated to {commit[:12]}: {len(targets)} change(s), restarted {', '.join(u for u in SERVICES if u in units) or 'nothing'}. "
           f"Previous files: {backup.root}")
 
