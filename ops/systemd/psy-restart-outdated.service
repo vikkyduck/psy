@@ -9,6 +9,9 @@ ExecStart=/usr/bin/python3 -I /usr/local/libexec/psy-restart-outdated.py
 TimeoutStartSec=20min
 Nice=10
 UMask=0077
+# When the services were first seen outdated: a run alerts after 48 h without an idle night.
+StateDirectory=psy-restart-outdated
+StateDirectoryMode=0700
 PrivateTmp=true
 ProtectSystem=full
 NoNewPrivileges=true

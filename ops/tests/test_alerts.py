@@ -192,6 +192,17 @@ class OwnerAlerts(unittest.TestCase):
             finally:
                 store.chmod(0o700)
 
+    def test_failed_group_jobs_are_reported_for_the_operator(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'group.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.executescript('CREATE TABLE requests(id INTEGER,state TEXT); CREATE TABLE job_progress(request_id INTEGER,updated REAL,stage TEXT);')
+                db.executemany('INSERT INTO requests VALUES(?,?)', [(1,'failed'),(2,'failed'),(3,'queued')])
+            messages = alerts.group_status(path, 100)
+            self.assertEqual(len(messages), 1)
+            self.assertIn('ошибки: 2', messages[0])
+            self.assertIn('psy_group_admin.py', messages[0])
+
     def test_only_running_stale_jobs_alert_without_disclosing_content(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'group.sqlite3'

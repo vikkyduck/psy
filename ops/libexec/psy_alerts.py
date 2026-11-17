@@ -143,6 +143,8 @@ def group_status(path, now):
                               WHERE r.state='running' AND p.updated<?""", (now - 420,)).fetchone()[0]
         # Queued jobs may intentionally wait for OAuth or Telegram flood control.
         uncertain = db.execute("SELECT count(*) FROM requests WHERE state='uncertain'").fetchone()[0]
+        # Kept with their text and checkpoints after an unexpected defect, until the operator acts.
+        failed = db.execute("SELECT count(*) FROM requests WHERE state='failed'").fetchone()[0]
         retrying = 0
         if "model_retries" in tables:
             retrying = db.execute("""SELECT count(*) FROM requests r JOIN model_retries m ON m.request_id=r.id
@@ -154,6 +156,9 @@ def group_status(path, now):
         messages.append(f"Задания группы без признаков прогресса более 7 минут: {stalled}.")
     if uncertain:
         messages.append(f"Задания с неподтвержденным результатом отправки: {uncertain}. Нужна проверка доставки.")
+    if failed:
+        messages.append(f"Задания группы, остановленные из-за ошибки: {failed}. "
+                        "Список и решение: psy_group_admin.py list от имени hermes.")
     if retrying:
         messages.append(f"Сохраненные задания после сбоя модели: {retrying}. ПСИ ожидает повторного обращения к модели или уже выполняет его.")
     return messages
