@@ -28,6 +28,20 @@ CapabilityBoundingSet=
 RestrictSUIDSGID=true
 LockPersonality=true
 PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+# The decoder applies its own Landlock ruleset (@sandbox). OpenMP and FFmpeg may set CPU
+# affinity (@resources). No MemoryDenyWriteExecute: CTranslate2's oneDNN backend JIT-compiles kernels.
+SystemCallFilter=@system-service @sandbox
+SystemCallFilter=~@privileged
 Nice=5
 CPUWeight=50
 MemoryHigh=550M

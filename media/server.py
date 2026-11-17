@@ -1,5 +1,8 @@
 """Authenticated streaming uploads. No polling consumer and no public file directory."""
 import asyncio
+import concurrent.futures
+import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -16,14 +19,30 @@ import time
 import weakref
 from aiohttp import web
 import psy_upload_common as C
-import recording_grant as grants
 import recording_receipts as receipts
-from storage_capacity import MAX_TRANSCRIPT_BYTES, admission_reason, capacity_snapshot
+from storage_capacity import admission_reason, capacity_snapshot
 from queue_health import PROGRESS_WARNING_SECONDS, processing_age
 
 ASSETS = Path(__file__).parent / 'static'
 TLS = Path('/etc/psy-upload/tls/current')
 locks = weakref.WeakValueDictionary()
+# SQLite, fsync and progress files block. They run here; each thread reuses one connection.
+STORAGE = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='psy-storage')
+TRANSCRIPT_PIECE = 64 * 1024
+# psy-member.socket accepts 24 connections (each one is a process). Further lookups wait
+# here for a free slot instead of being refused by systemd.
+BROKER_SLOTS = 16
+# /healthz is public: it connects to the broker socket (which starts a process) at most this often.
+HEALTH_TTL = 30
+_broker_answered = [float('-inf')]
+SECURITY_HEADERS = {
+    'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org",
+}
+
+
+async def blocking(fn, *args, **kwargs):
+    return await asyncio.get_running_loop().run_in_executor(STORAGE, functools.partial(fn, *args, **kwargs))
 
 
 def failure(status, message):
@@ -43,20 +62,38 @@ async def boundary(request, handler):
     except Exception as e:
         logging.error('Upload request failed: %s', type(e).__name__)
         response = failure(503, 'Сервис временно занят. Попробуйте еще раз.')
-    response.headers.update({'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
-        'Referrer-Policy': 'no-referrer',
-        'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"})
+    if not response.prepared:
+        response.headers.update(SECURITY_HEADERS)
     return response
 
 
 async def membership(request, uid):
+    # The owner may have left the group and keeps the group destination regardless.
+    if uid == C.OWNER:
+        return True
     reply = await access_lookup({'action':'member','uid':uid})
     if type(reply.get('member')) is not bool:
         raise web.HTTPServiceUnavailable()
     return reply['member']
 
 
+_broker_slots = {}
+
+
+def broker_slots():
+    loop = asyncio.get_running_loop()
+    if loop not in _broker_slots:
+        _broker_slots.clear()
+        _broker_slots[loop] = asyncio.Semaphore(BROKER_SLOTS)
+    return _broker_slots[loop]
+
+
 async def access_lookup(payload):
+    async with broker_slots():
+        return await broker_exchange(payload)
+
+
+async def broker_exchange(payload):
     async def exchange():
         reader,writer=await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'],limit=16384)
         try:
@@ -72,6 +109,7 @@ async def access_lookup(payload):
             raise ValueError('invalid response')
     except (KeyError,OSError,ValueError,asyncio.TimeoutError):
         raise web.HTTPServiceUnavailable() from None
+    _broker_answered[0] = time.monotonic()
     if reply.get('status')==401:raise web.HTTPUnauthorized()
     if reply.get('status')==403:raise web.HTTPForbidden()
     if reply.get('status')!=200:raise web.HTTPServiceUnavailable()
@@ -79,7 +117,7 @@ async def access_lookup(payload):
 
 
 async def authorize(request):
-    s = C.get_session(request.headers.get('X-Upload-Session', ''))
+    s = await blocking(C.get_session, request.headers.get('X-Upload-Session', ''))
     if not s:
         raise web.HTTPUnauthorized()
     if s['chat']==C.GROUP:
@@ -95,17 +133,20 @@ async def auth(request):
         raise web.HTTPRequestEntityTooLarge(max_size=20000, actual_size=request.content_length or 0)
     body = await request.json()
     raw = body.get('initData')
+    # Each broker lookup starts a process. Junk that cannot carry a valid signature stops here.
+    if not C.plausible_init(raw):
+        raise web.HTTPUnauthorized()
     ticket = None
     if body.get('ticket'):
         launch = await access_lookup({'action':'init','init_data':raw})
-        ticket = C.get_ticket(body['ticket'],launch['uid'])
+        ticket = await blocking(C.get_ticket, body['ticket'], launch['uid'])
         if not ticket:
             raise web.HTTPForbidden()
     reply = await access_lookup({'action':'login','init_data':raw,'ticket':ticket})
     session = reply['session']
     if session['chat'] == C.GROUP and not await membership(request, session['uid']):
         raise web.HTTPForbidden()
-    C.store_session(session)
+    await blocking(C.store_session, session)
     return web.json_response({'session':reply['secret'],'destination':'Группа' if session['chat']==C.GROUP else 'Личная переписка с PSY','limit':C.LIMIT,'chunk':C.CHUNK})
 
 
@@ -124,10 +165,10 @@ def authorized_result(job, session, body=False):
 
 
 
-def owned_job(ident, session):
+def owned_job(ident, session, deleted=False):
     with C.db() as c:
         row = c.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?', (ident, session['uid'], session['chat'])).fetchone()
-    if not row:
+    if not row or (row['state'] == 'deleted' and not deleted):
         raise web.HTTPNotFound()
     return dict(row)
 
@@ -154,56 +195,86 @@ def public_job(j):
     return public
 
 
+def job_listing(session, count):
+    with C.db() as c:
+        rows = c.execute("""SELECT j.*, EXISTS(SELECT 1 FROM jobs c WHERE c.reprocess_of=j.id AND c.state!='deleted') AS has_next
+                            FROM jobs j WHERE uid=? AND chat=? AND state!='deleted'
+                            ORDER BY created DESC,j.rowid DESC LIMIT ?""",
+                         (session['uid'],session['chat'],count+1)).fetchall()
+    listing = [dict(public_job(r), has_next=bool(r['has_next']), is_repeat=r['reprocess_of'] is not None)
+               for r in rows[:count]]
+    return {'jobs': listing, 'more': len(rows) > count}
+
+
 async def jobs(request):
     s = await authorize(request)
-    with C.db() as c:
-        rows = c.execute("""SELECT j.*, EXISTS(SELECT 1 FROM jobs c WHERE c.reprocess_of=j.id) AS has_next
-                            FROM jobs j WHERE uid=? AND chat=? ORDER BY created DESC,j.rowid DESC LIMIT 20""",
-                         (s['uid'],s['chat'])).fetchall()
-    return web.json_response({'jobs': [dict(public_job(r), has_next=bool(r['has_next']),
-                                             is_repeat=r['reprocess_of'] is not None) for r in rows]})
+    # The page asks for more on demand; every recording stays reachable.
+    count = int(request.query.get('count', '20'))
+    if count < 1:
+        raise web.HTTPBadRequest()
+    return web.json_response(await blocking(job_listing, s, count))
 
 
-def expire_drafts(conn):
-    # An in-flight PATCH/complete owns its lock even while its HTTP body stalls.
+def busy_uploads():
+    """Snapshot on the event loop; an in-flight PATCH/complete owns its lock even while its body stalls."""
+    return frozenset(ident for ident, lock in list(locks.items()) if lock.locked())
+
+
+def expire_drafts(conn, busy):
     stale=conn.execute("SELECT id,ext FROM jobs WHERE state='uploading' AND updated<?",
                        (C.now()-C.DRAFT_TTL,)).fetchall()
     for draft in stale:
-        lock=locks.get(draft['id'])
-        if lock and lock.locked():continue
+        if draft['id'] in busy:continue
         C.file_path(draft).unlink(missing_ok=True)
-        conn.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?",(C.now(),draft['id']))
+        C.transition(conn, draft['id'], 'uploading', 'cancelled')
 
 
-def storage_status(conn, uid):
-    return capacity_snapshot(conn, C.FILES, uid, max_upload_bytes=C.LIMIT, reserve_bytes=C.RESERVE)
+def storage_status(conn):
+    return capacity_snapshot(conn, C.FILES, max_upload_bytes=C.LIMIT, reserve_bytes=C.RESERVE)
+
+
+def disk_capacity():
+    with C.db() as conn:
+        return storage_status(conn)
 
 
 async def capacity(request):
-    session = await authorize(request)
-    with C.db() as conn:
-        conn.execute('BEGIN')
-        snapshot = storage_status(conn, session['uid'])
-    # Only this participant's quota and a fleet-wide low-space flag are public.
-    return web.json_response({
-        'member_limit_bytes': snapshot['member_limit_bytes'],
-        'member_low': snapshot['member_low'],
-        'member_upload_bytes': max(0, snapshot['member_available_bytes'] - MAX_TRANSCRIPT_BYTES),
-        'disk_low': snapshot['disk_low'],
-    })
+    await authorize(request)
+    snapshot = await blocking(disk_capacity)
+    # Only a fleet-wide low-space flag is public. There is no per-member quota.
+    return web.json_response({'disk_low': snapshot['disk_low']})
 
 
-def admission(conn, uid, additional_bytes, *, retry=False):
-    """Caller holds BEGIN IMMEDIATE through admission and reserve/requeue."""
-    outstanding=conn.execute("SELECT COUNT(*) FROM jobs WHERE uid=? AND state IN ('uploading','queued','processing')",(uid,)).fetchone()[0]
-    if outstanding>=3:
-        return failure(409,'У вас 3 активные записи. Завершите или отмените незаконченные загрузки.')
-    reason = admission_reason(storage_status(conn, uid), additional_bytes, retry=retry)
-    if reason == 'member_quota':
-        return failure(409, 'Личного лимита хранения недостаточно для этой записи и ее расшифровки.')
-    if reason == 'disk_capacity':
+def admission(conn, source_bytes, asr_bytes):
+    """Caller holds BEGIN IMMEDIATE through admission and reserve/requeue.
+
+    Any number of recordings may wait in the queue; only physical disk space can refuse."""
+    if admission_reason(storage_status(conn), source_bytes, asr_bytes) == 'disk_capacity':
         return failure(507, 'На сервере недостаточно места для записи и ее расшифровки.')
     return None
+
+
+def create_job(s, proof, shape, fp, busy):
+    name, size, language, content_id, ext = (shape[k] for k in ('filename','size','language','content_id','ext'))
+    ident = proof['id']
+    with C.db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        expire_drafts(c, busy)
+        existing = c.execute("""SELECT * FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
+            AND filename=? AND size=? AND language=? AND content_id=? AND proof IS NOT NULL AND (state IN
+            ('uploading','queued','processing','delivery_pending','sending') OR (state='done' AND updated>?))
+            ORDER BY created DESC LIMIT 1""", (s['uid'],s['chat'],s['thread'],s['reply'],name,size,
+                                               language,content_id,C.now()-86400)).fetchone()
+        if existing:
+            return web.json_response(public_job(existing))
+        denied=admission(c,size,size)
+        if denied is not None:return denied
+        c.execute('INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,fingerprint,language,state,created,updated,content_id,proof) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (ident,s['uid'],s['chat'],s['thread'],s['reply'],name,ext,size,fp,language,'uploading',C.now(),C.now(),content_id,proof['proof']))
+        p=C.file_path({'id':ident,'ext':ext})
+        with p.open('xb'):
+            pass
+    return web.json_response({'id':ident,'offset':0}, status=201)
 
 
 async def create(request):
@@ -226,34 +297,48 @@ async def create(request):
     content_id = b['content_id']
     shape = dict(filename=name,ext=ext,size=size,language=language,content_id=content_id)
     proof = (await bound_request(request,s,'bind',shape=shape))['job']
-    ident = proof['id']
+    return await blocking(create_job, s, proof, shape, fp, busy_uploads())
+
+
+def open_chunk(path, offset):
+    """None if committed bytes are missing; otherwise a handle positioned after them."""
+    f = path.open('r+b')
+    try:
+        if os.fstat(f.fileno()).st_size < offset:
+            f.close()
+            return None
+        f.truncate(offset)
+        f.seek(offset)
+        return f
+    except BaseException:
+        f.close()
+        raise
+
+
+def seal_chunk(f, j, offset, received):
+    f.flush()
+    os.fsync(f.fileno())
+    if offset==0:
+        f.seek(0)
+        actual=hashlib.sha256(f.read(min(65536,j['size']))).hexdigest()
+        if actual!=j['fingerprint']:
+            raise ValueError('Wrong recording')
     with C.db() as c:
-        c.execute('BEGIN IMMEDIATE')
-        expire_drafts(c)
-        existing = c.execute("""SELECT * FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
-            AND filename=? AND size=? AND language=? AND content_id=? AND proof IS NOT NULL AND (state IN
-            ('uploading','queued','processing','delivery_pending','sending') OR (state='done' AND updated>?))
-            ORDER BY created DESC LIMIT 1""", (s['uid'],s['chat'],s['thread'],s['reply'],name,size,
-                                               language,content_id,C.now()-86400)).fetchone()
-        if existing:
-            return web.json_response(public_job(existing))
-        denied=admission(c,s['uid'],size)
-        if denied is not None:return denied
-        c.execute('INSERT INTO jobs(id,uid,chat,thread,reply,filename,ext,size,fingerprint,language,state,created,updated,content_id,proof) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            (ident,s['uid'],s['chat'],s['thread'],s['reply'],name,ext,size,fp,language,'uploading',C.now(),C.now(),content_id,proof['proof']))
-        p=C.file_path({'id':ident,'ext':ext})
-        with p.open('xb'):
-            pass
-    return web.json_response({'id':ident,'offset':0}, status=201)
+        c.execute("UPDATE jobs SET offset=?,updated=? WHERE id=? AND state='uploading'",(offset+received,C.now(),j['id']))
+
+
+def rewind(path, offset):
+    with path.open('r+b') as f:
+        f.truncate(offset)
 
 
 async def append(request):
     s=await authorize(request)
     ident=request.match_info['id']
-    owned_job(ident,s)
+    await blocking(owned_job,ident,s)
     lock=locks.setdefault(ident,asyncio.Lock())
     async with lock:
-        j=owned_job(ident,s)
+        j=await blocking(owned_job,ident,s)
         if j['state']!='uploading':
             return failure(409,'Загрузка уже завершена.')
         length=request.content_length
@@ -262,45 +347,45 @@ async def append(request):
             return web.json_response({'error':'Сверьте позицию загрузки.','offset':j['offset']},status=409)
         if length is None or not 0<length<=C.CHUNK or offset+length>j['size']:
             return failure(413,'Недопустимый размер части файла.')
-        if shutil.disk_usage(C.FILES).free-length<C.RESERVE:
+        if (await blocking(shutil.disk_usage,C.FILES)).free-length<C.RESERVE:
             return failure(507,'Недостаточно места для продолжения загрузки.')
         p=C.file_path(j)
-        if p.stat().st_size<offset:
+        f=await asyncio.to_thread(open_chunk,p,offset)
+        if f is None:
             return failure(409,'Файл поврежден. Начните новую загрузку.')
         received=0
         try:
-            with p.open('r+b') as f:
-                f.truncate(offset)
-                f.seek(offset)
+            try:
                 async for data in request.content.iter_chunked(256*1024):
                     received+=len(data)
                     if received>length:
                         raise ValueError('Excess data')
-                    f.write(data)
+                    await asyncio.to_thread(f.write,data)
                 if received!=length:
                     raise ValueError('Incomplete chunk')
-                f.flush();os.fsync(f.fileno())
-            if offset==0:
-                with p.open('rb') as f:
-                    actual=hashlib.sha256(f.read(min(65536,j['size']))).hexdigest()
-                if actual!=j['fingerprint']:
-                    raise ValueError('Wrong recording')
-            with C.db() as c:
-                c.execute('UPDATE jobs SET offset=?,updated=? WHERE id=?',(offset+received,C.now(),ident))
+                await blocking(seal_chunk,f,j,offset,received)
+            finally:
+                f.close()
         except BaseException:
-            with p.open('r+b') as f:f.truncate(offset)
+            # Synchronous on purpose: it must also run when this task is being cancelled.
+            rewind(p,offset)
             raise
         return web.json_response({'offset':offset+received})
 
 
+def move(ident, before, after, **fields):
+    with C.db() as c:
+        return C.transition(c, ident, before, after, **fields)
+
+
 async def complete(request):
     s=await authorize(request);ident=request.match_info['id']
-    owned_job(ident,s)
+    await blocking(owned_job,ident,s)
     async with locks.setdefault(ident,asyncio.Lock()):
-        j=owned_job(ident,s)
+        j=await blocking(owned_job,ident,s)
         if j['state']!='uploading':
-            return web.json_response(public_job(j))
-        if j['offset']!=j['size'] or C.file_path(j).stat().st_size!=j['size']:
+            return web.json_response(await blocking(public_job,j))
+        if j['offset']!=j['size'] or (await blocking(C.file_path(j).stat)).st_size!=j['size']:
             return failure(409,'Сначала завершите загрузку файла.')
         if s['chat']==C.GROUP and not await membership(request,s['uid']):
             return failure(403,'Нет доступа к группе.')
@@ -308,27 +393,65 @@ async def complete(request):
             return failure(426,'Откройте обновленную мини-апку и выберите исходный файл заново.')
         sha, actual = await asyncio.to_thread(C.file_hashes, C.file_path(j))
         if actual != j['content_id']:
-            with C.db() as c:
-                c.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?", (C.now(), ident))
-            C.file_path(j).unlink(missing_ok=True)
+            await blocking(move, ident, 'uploading', 'cancelled')
+            await blocking(C.file_path(j).unlink, missing_ok=True)
             return failure(422,'Контрольная сумма файла не совпала. Выберите исходную запись заново.')
-        with C.db() as c:c.execute("UPDATE jobs SET state='queued',sha256=?,updated=?,queued_at_ns=? WHERE id=?",
-                                   (sha,C.now(),time.time_ns(),ident))
+        await blocking(move, ident, 'uploading', 'queued', sha256=sha, queued_at_ns=time.time_ns())
     return web.json_response({'state':'queued'})
 
 
 async def transcript(request):
-    s=await authorize(request);j=owned_job(request.match_info['id'],s)
+    s=await authorize(request);j=await blocking(owned_job,request.match_info['id'],s)
     await bound_request(request,s,'session')
-    _,result = authorized_result(j,s,body=True)
-    return web.Response(body=result['body'],content_type='text/plain',charset='utf-8',
-                        headers={'Content-Disposition':'attachment; filename="transcript.txt"'})
+    await blocking(authorized_result,j,s)
+    size = await blocking(receipts.body_size, j['id'])
+    if not size:
+        raise web.HTTPNotFound()
+    # Stream bounded pieces; neither the server nor the database read lock waits for a slow client.
+    response = web.StreamResponse(headers={**SECURITY_HEADERS, 'Content-Type':'text/plain; charset=utf-8',
+                                           'Content-Disposition':'attachment; filename="transcript.txt"'})
+    response.content_length = size
+    await response.prepare(request)
+    for offset in range(0, size, TRANSCRIPT_PIECE):
+        try:
+            piece = await blocking(receipts.read_body, j['id'], offset, TRANSCRIPT_PIECE)
+        except (LookupError, sqlite3.Error) as error:
+            # Removed or unreadable mid-download: cut the connection instead of a short "success".
+            logging.warning('Transcript download interrupted: %s', type(error).__name__)
+            if request.transport is not None:
+                request.transport.close()
+            return response
+        await response.write(piece)
+    await response.write_eof()
+    return response
 
+
+
+def retry_job(ident, s, generation, busy):
+    with C.db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        j=c.execute("SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?",(ident,s['uid'],s['chat'])).fetchone()
+        if not j:raise web.HTTPNotFound()
+        if generation>j['retry_generation'] or j['state'] in ('uploading','cancelled'):raise web.HTTPConflict()
+        if generation<j['retry_generation'] or j['state']!='failed':
+            return web.json_response({'state':j['state']})
+        expire_drafts(c, busy)
+        denied=admission(c,0,j['size'])
+        if denied is not None:return denied
+        # A separate upload can already be processing the same verified recording.
+        duplicate=c.execute("""SELECT id FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
+            AND filename=? AND size=? AND language=? AND content_id=? AND state IN
+            ('uploading','queued','processing','delivery_pending','sending') LIMIT 1""",
+            tuple(j[k] for k in ('uid','chat','thread','reply','filename','size','language','content_id'))).fetchone()
+        if duplicate:return failure(409,'Эта запись уже поставлена в очередь.')
+        C.transition(c, ident, 'failed', 'queued', error=None, attempts=0, next_try=0,
+                     retry_generation=j['retry_generation']+1, queued_at_ns=time.time_ns())
+    return web.json_response({'state':'queued'})
 
 
 async def retry(request):
     s=await authorize(request);ident=request.match_info['id']
-    owned_job(ident,s)
+    await blocking(owned_job,ident,s)
     generation=0
     if request.can_read_body:
         if request.content_length is None or request.content_length>512:raise web.HTTPBadRequest()
@@ -337,40 +460,10 @@ async def retry(request):
         if type(generation) is not int or generation<0:raise web.HTTPBadRequest()
     if s['chat']==C.GROUP and not await membership(request,s['uid']):raise web.HTTPForbidden()
     async with locks.setdefault(ident,asyncio.Lock()):
-        with C.db() as c:
-            c.execute('BEGIN IMMEDIATE')
-            j=c.execute("SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?",(ident,s['uid'],s['chat'])).fetchone()
-            if not j:raise web.HTTPNotFound()
-            if generation>j['retry_generation'] or j['state'] in ('uploading','cancelled'):raise web.HTTPConflict()
-            if generation<j['retry_generation'] or j['state']!='failed':
-                return web.json_response({'state':j['state']})
-            expire_drafts(c)
-            denied=admission(c,s['uid'],0,retry=True)
-            if denied is not None:return denied
-            # A separate upload can already be processing the same verified recording.
-            duplicate=c.execute("""SELECT id FROM jobs WHERE uid=? AND chat=? AND thread IS ? AND reply IS ?
-                AND filename=? AND size=? AND language=? AND content_id=? AND state IN
-                ('uploading','queued','processing','delivery_pending','sending') LIMIT 1""",
-                tuple(j[k] for k in ('uid','chat','thread','reply','filename','size','language','content_id'))).fetchone()
-            if duplicate:return failure(409,'Эта запись уже поставлена в очередь.')
-            c.execute("""UPDATE jobs SET state='queued',error=NULL,attempts=0,next_try=0,
-                      retry_generation=retry_generation+1,updated=?,queued_at_ns=? WHERE id=?""",
-                      (C.now(),time.time_ns(),ident))
-    return web.json_response({'state':'queued'})
+        return await blocking(retry_job, ident, s, generation, busy_uploads())
 
 
-async def reprocess(request):
-    session = await authorize(request)
-    parent = request.match_info['id']
-    owned_job(parent, session)
-    if session['chat'] == C.GROUP and not await membership(request, session['uid']):
-        raise web.HTTPForbidden()
-    original = owned_job(parent, session)
-    if original['state'] != 'done':
-        return failure(409,'Запись еще обрабатывается.')
-    origin,_ = authorized_result(original,session)
-    shape = {k:origin[k] for k in ('filename','ext','size','language','content_id')}
-    bound = (await bound_request(request,session,'bind',shape=shape,parent=origin))['job']
+def reprocess_job(parent, session, bound, busy):
     with C.db() as conn:
         conn.execute('BEGIN IMMEDIATE')
         original = conn.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?',
@@ -378,12 +471,14 @@ async def reprocess(request):
         if not original:
             raise web.HTTPNotFound()
         previous = conn.execute('SELECT * FROM jobs WHERE reprocess_of=?', (parent,)).fetchone()
+        if previous and previous['state'] == 'deleted':
+            return failure(409, 'Предыдущая повторная расшифровка еще удаляется. Попробуйте через минуту.')
         if previous:
             return web.json_response(public_job(previous))
         if original['state'] != 'done' or original['ext'] not in C.EXTENSIONS:
             return failure(409, 'Эту запись можно обработать заново после завершения расшифровки.')
-        expire_drafts(conn)
-        denied = admission(conn, session['uid'], 0)
+        expire_drafts(conn, busy)
+        denied = admission(conn, 0, original['size'])
         if denied is not None:
             return denied
         source = C.file_path(original)
@@ -418,35 +513,76 @@ async def reprocess(request):
         return web.json_response({'id':ident,'state':'queued'}, status=201)
 
 
+async def reprocess(request):
+    session = await authorize(request)
+    parent = request.match_info['id']
+    await blocking(owned_job, parent, session)
+    if session['chat'] == C.GROUP and not await membership(request, session['uid']):
+        raise web.HTTPForbidden()
+    original = await blocking(owned_job, parent, session)
+    if original['state'] != 'done':
+        return failure(409,'Запись еще обрабатывается.')
+    origin,_ = await blocking(authorized_result, original, session)
+    shape = {k:origin[k] for k in ('filename','ext','size','language','content_id')}
+    bound = (await bound_request(request,session,'bind',shape=shape,parent=origin))['job']
+    return await blocking(reprocess_job, parent, session, bound, busy_uploads())
+
+
 async def redeliver(request):
     s=await authorize(request)
     data=await request.json()
     confirmed = isinstance(data,dict) and data.get('confirm_possible_duplicate') is True
     ident=request.match_info['id']
     async with locks.setdefault(ident,asyncio.Lock()):
-        job=owned_job(ident,s)
+        job=await blocking(owned_job,ident,s)
         if job['state']=='delivery_pending':
             return web.json_response({'state':'delivery_pending'})
         if (job['state']!='done' or job['delivery']=='sent'
                 or (job['delivery']=='unknown' and not confirmed)):
             return failure(409,'Сначала проверьте, был ли файл доставлен.')
-        origin,_ = authorized_result(job,s)
+        origin,_ = await blocking(authorized_result,job,s)
         retry = (await bound_request(request,s,'redeliver',job=origin,confirmed=confirmed))['retry']
-        with C.db() as c:
-            c.execute("""UPDATE jobs SET state='delivery_pending',delivery=NULL,attempts=0,
-                        next_try=0,updated=?,retry_proof=? WHERE id=? AND state='done'""",(C.now(),json.dumps(retry),ident))
+        await blocking(move, ident, 'done', 'delivery_pending', delivery=None, attempts=0, next_try=0,
+                       retry_proof=json.dumps(retry))
     return web.json_response({'state':'delivery_pending'})
 
 
 async def cancel(request):
     s=await authorize(request);ident=request.match_info['id']
-    owned_job(ident,s)
+    await blocking(owned_job,ident,s)
     async with locks.setdefault(ident,asyncio.Lock()):
-        j=owned_job(ident,s)
+        j=await blocking(owned_job,ident,s)
         if j['state']!='uploading':raise web.HTTPConflict()
-        with C.db() as c:c.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?",(C.now(),ident))
-        C.file_path(j).unlink(missing_ok=True)
+        await blocking(move, ident, 'uploading', 'cancelled')
+        await blocking(C.file_path(j).unlink, missing_ok=True)
     return web.json_response({'state':'cancelled'})
+
+
+def delete_job(ident, session):
+    with C.db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = c.execute('SELECT * FROM jobs WHERE id=? AND uid=? AND chat=?',
+                        (ident, session['uid'], session['chat'])).fetchone()
+        if not row:
+            raise web.HTTPNotFound()
+        job = dict(row)
+        if job['state'] == 'sending':
+            return failure(409, 'Сейчас файл отправляется в Telegram. Удалите запись после завершения отправки.')
+        if job['state'] != 'deleted':
+            C.transition(c, ident, job['state'], 'deleted', error=None, attempts=0, next_try=0)
+    # This UID owns the recording names. The worker removes the receipt and asks the ASR
+    # service to remove its folder and progress, then drops the row.
+    for path in (C.file_path(job), C.file_path(job, '.txt')):
+        path.unlink(missing_ok=True)
+    return web.json_response({'state': 'deleted'})
+
+
+async def delete(request):
+    s=await authorize(request);ident=request.match_info['id']
+    await blocking(owned_job,ident,s,True)
+    # Waits for an in-flight chunk or completion of the same recording.
+    async with locks.setdefault(ident,asyncio.Lock()):
+        return await blocking(delete_job,ident,s)
 
 
 async def index(request):return web.FileResponse(ASSETS/'index.html')
@@ -454,12 +590,50 @@ async def asset(request):
     name=request.match_info['name']
     if name not in ('app.js','style.css'):raise web.HTTPNotFound()
     return web.FileResponse(ASSETS/name)
-async def health(request):return web.json_response({'ok':True})
+def state_database_opens():
+    """A new connection to the existing file (never creating one) that can read the job table."""
+    uri = (C.ROOT / 'state.sqlite3').resolve().as_uri() + '?mode=rw'
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3)) as conn:
+        conn.execute('SELECT 1 FROM jobs LIMIT 1').fetchall()
+    return True
+
+
+async def broker_reachable(app):
+    probe = app['broker_probe']
+    now = time.monotonic()
+    if now - _broker_answered[0] < HEALTH_TTL:
+        return True
+    if probe['until'] > now:
+        return probe['ok']
+    async with probe['lock']:
+        if probe['until'] > time.monotonic():
+            return probe['ok']
+        try:
+            async with asyncio.timeout(3):
+                _, writer = await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'])
+                writer.close()
+                await writer.wait_closed()
+            ok = True
+        except (OSError, KeyError, TimeoutError):
+            ok = False
+        probe.update(ok=ok, until=time.monotonic() + HEALTH_TTL)
+        return ok
+
+
+async def health(request):
+    """Unauthenticated and without details: the state database opens and the broker answers."""
+    try:
+        database = await asyncio.wait_for(blocking(state_database_opens), 5)
+    except Exception:
+        database = False
+    ok = database and await broker_reachable(request.app)
+    return web.json_response({'ok': ok}, status=200 if ok else 503)
 
 
 async def lifecycle(app):
-    C.initialize()
+    await blocking(C.initialize)
     app['members']={}
+    app['broker_probe']={'ok':False,'until':float('-inf'),'lock':asyncio.Lock()}
     yield
 
 
@@ -472,7 +646,8 @@ def create_app():
         web.patch('/api/jobs/{id}',append),web.post('/api/jobs/{id}/complete',complete),
         web.get('/api/jobs/{id}/transcript',transcript),web.post('/api/jobs/{id}/retry',retry),
         web.post('/api/jobs/{id}/reprocess',reprocess),
-        web.post('/api/jobs/{id}/redeliver',redeliver),web.post('/api/jobs/{id}/cancel',cancel)])
+        web.post('/api/jobs/{id}/redeliver',redeliver),web.post('/api/jobs/{id}/cancel',cancel),
+        web.post('/api/jobs/{id}/delete',delete)])
     return app
 
 

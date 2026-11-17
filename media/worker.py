@@ -1,4 +1,7 @@
-"""Durable local ASR and Telegram delivery. A confirmed rejection is safe to retry."""
+"""Durable local ASR and Telegram delivery. A confirmed rejection is safe to retry.
+
+Transcription and delivery are separate loops: a decode that runs for hours never delays a
+finished transcript or a member's "send again". Queued recordings are taken in member turns."""
 import asyncio
 import json
 import logging
@@ -11,8 +14,17 @@ import recording_grant as grants
 import recording_receipts as receipts
 
 from aiohttp import ClientSession, ClientTimeout, FormData
-from asr_client import ASRStalled
+import asr_client
+from asr_client import ASRDeadline, ASRStalled
 import psy_upload_common as C
+
+POLL_SECONDS = 4
+# How often a running decode checks whether its recording was deleted.
+WATCH_SECONDS = 5
+ASR_ATTEMPTS = 8
+MAX_BACKOFF = 1800
+BEFORE_DELIVERY = ('queued', 'processing')
+DELIVERY = ('delivery_pending', 'sending')
 
 
 class MembershipUnavailable(Exception):
@@ -28,6 +40,9 @@ async def bot_call(http, method, payload):
 async def group_access(http, job):
     if job['chat'] != C.GROUP:
         return job['uid'] == C.OWNER and job['chat'] == C.OWNER
+    if job['uid'] == C.OWNER:
+        # The owner may have left the group and keeps the group destination regardless.
+        return True
     try:
         result = await bot_call(http, 'getChatMember', {'chat_id':str(C.GROUP), 'user_id':str(job['uid'])})
     except Exception as error:
@@ -38,7 +53,6 @@ async def group_access(http, job):
 
 
 async def transcribe(job):
-    from asr_client import transcribe_recording
     if (not grants.valid_job(job) or job['ext'] not in C.EXTENSIONS
             or (job['chat'] != C.GROUP and (job['uid'] != C.OWNER or job['chat'] != C.OWNER))):
         raise ValueError('Unverified recording grant')
@@ -46,35 +60,44 @@ async def transcribe(job):
     # the signed content digest on its own private audio snapshot before decoding.
     with tempfile.TemporaryDirectory(dir=receipts.root()) as directory:
         output = Path(directory) / 'result.txt'
-        result = await transcribe_recording(job, output)
-        if result.get('complete') is not True:
+        stored = {}
+
+        async def persist(header):
+            # Saved before the service is told it may delete its copy and journal.
+            data = receipts.read_regular(output)
+            receipts.save(job, header, data)
+            stored['text_size'] = len(data)
+
+        result = await asr_client.transcribe_recording(job, output, persist)
+        if result.get('complete') is not True or 'text_size' not in stored:
             raise ValueError('Incomplete output')
-        data = receipts.read_regular(output)
-        receipts.save(job,result,data)
-        result['text_size'] = len(data)
+        result['text_size'] = stored['text_size']
     return result
 
 
+def move(job, before, after, **fields):
+    with C.db() as c:
+        return C.transition(c, job['id'], before, after, **fields)
+
+
+def fail(job, error):
+    move(job, BEFORE_DELIVERY, 'failed', error=error)
+
+
 def finish(job, delivery, message_id=None):
-    with C.db() as c:
-        c.execute("UPDATE jobs SET state='done',delivery=?,message_id=?,updated=? WHERE id=?",
-                  (delivery,message_id,C.now(),job['id']))
+    move(job, DELIVERY, 'done', delivery=delivery, message_id=message_id)
 
 
-def retry_later(job, stage, delay=0):
+def retry_later(job, stage, delay=0, *, bounded=False):
+    """Back off and keep the job. Only a crashing local ASR stops after ASR_ATTEMPTS tries,
+    so one recording that kills the decoder cannot occupy it forever."""
     attempts = job['attempts'] + 1
-    if attempts >= 8:
-        if stage == 'delivery_pending':
-            finish(job, 'failed')
-        else:
-            with C.db() as c:
-                c.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
-                          ('Сервис временно недоступен. Можно повторить обработку.',C.now(),job['id']))
+    if bounded and attempts >= ASR_ATTEMPTS:
+        fail(job, 'Сервис временно недоступен. Можно повторить обработку.')
         return
-    wait = max(min(1800, 10*2**(attempts-1)), max(0,delay))
-    with C.db() as c:
-        c.execute('UPDATE jobs SET state=?,attempts=?,next_try=?,updated=?,queued_at_ns=? WHERE id=?',
-                  (stage,attempts,C.now()+wait,C.now(),time.time_ns(),job['id']))
+    wait = max(min(MAX_BACKOFF, 10*2**min(attempts-1, 8)), max(0,delay))
+    move(job, DELIVERY if stage == 'delivery_pending' else BEFORE_DELIVERY, stage,
+         attempts=attempts, next_try=C.now()+wait, queued_at_ns=time.time_ns())
 
 
 async def deliver(http, job):
@@ -94,7 +117,8 @@ async def deliver(http, job):
         return
     if state == 'ready' and record['next_try'] > C.now():
         with C.db() as conn:
-            conn.execute('UPDATE jobs SET next_try=? WHERE id=?',(record['next_try'],job['id']))
+            conn.execute("UPDATE jobs SET next_try=? WHERE id=? AND state='delivery_pending'",
+                         (record['next_try'],job['id']))
         return
     try:
         allowed = await group_access(http, origin)
@@ -104,6 +128,9 @@ async def deliver(http, job):
     if not allowed:
         receipts.status(job['id'],'access_revoked')
         finish(job,'access_revoked')
+        return
+    # Claim the job before the receipt: a member's deletion and this send cannot both win.
+    if not move(job, 'delivery_pending', 'sending'):
         return
     if not receipts.start(job['id'],C.now(),retry):
         finish(job,'unknown' if state == 'sending' else state,record['message_id'])
@@ -122,9 +149,6 @@ async def deliver(http, job):
         form.add_field('reply_parameters',json.dumps({'message_id':origin['reply'],'allow_sending_without_reply':True}))
     with io.BytesIO(record['body']) as text_file:
         form.add_field('document',text_file,filename='Расшифровка.txt',content_type='text/plain; charset=utf-8')
-        # Persist the ambiguous boundary before doing the non-idempotent HTTP call.
-        with C.db() as c:
-            c.execute("UPDATE jobs SET state='sending',updated=? WHERE id=?", (C.now(),job['id']))
         try:
             result = await bot_call(http,'sendDocument',form)
         except Exception:
@@ -136,12 +160,9 @@ async def deliver(http, job):
         receipts.status(job['id'],'sent',msg)
         finish(job,'sent',msg)
     elif result.get('ok') is False and result.get('error_code') == 429:
+        # Telegram asked to slow down. The transcript is ready, so keep trying without a cap.
         count = record['attempts'] + 1
-        if count >= 8:
-            receipts.status(job['id'],'failed')
-            finish(job,'failed')
-            return
-        wait = max(10*2**(count-1),int((result.get('parameters') or {}).get('retry_after') or 0))
+        wait = max(min(MAX_BACKOFF, 10*2**min(count-1, 8)),int((result.get('parameters') or {}).get('retry_after') or 0))
         receipts.status(job['id'],'ready',next_try=C.now()+wait,attempt=count)
         retry_later({**job,'attempts':count-1},'delivery_pending',wait)
     else:
@@ -156,72 +177,196 @@ async def run_job(http, job):
         await deliver(http,job)
         return
     if not grants.valid_job(job):
-        with C.db() as conn:
-            conn.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
-                         ('У записи нет подтвержденного источника. Загрузите исходный файл заново.',C.now(),job['id']))
+        fail(job, 'У записи нет подтвержденного источника. Загрузите исходный файл заново.')
         return
     saved = receipts.get(job['id'])
     if saved:
-        with C.db() as conn:
-            conn.execute("UPDATE jobs SET state='delivery_pending',updated=? WHERE id=?",(C.now(),job['id']))
+        move(job, BEFORE_DELIVERY, 'delivery_pending')
         return
     try:
         if not await group_access(http,job):
             raise PermissionError('Access revoked')
         result = await transcribe(job)
     except ASRStalled:
-        with C.db() as c:
-            c.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?", (
-                'Распознавание остановлено после 45 минут без прогресса. Можно повторить обработку. '
-                'Если часть записи обработана, бот продолжит с сохраненного места.', C.now(), job['id']))
+        fail(job, 'Распознавание остановлено после 45 минут без прогресса. Можно повторить обработку. '
+                  'Если часть записи обработана, бот продолжит с сохраненного места.')
         return
-    except (MembershipUnavailable, ConnectionError, FileNotFoundError) as exc:
-        logging.warning('ASR temporarily unavailable: %s', type(exc).__name__)
+    except ASRDeadline:
+        # Not an error: the journal holds every finished minute. Requeue behind other members.
+        move(job, BEFORE_DELIVERY, 'queued', next_try=0, queued_at_ns=time.time_ns(), error=None)
+        return
+    except MembershipUnavailable:
         retry_later(job,'queued')
         return
-    with C.db() as c:
-        c.execute("""UPDATE jobs SET state='delivery_pending',duration=?,speech_detected=?,
-                     attempts=0,next_try=0,updated=?,text_size=?,sha256=? WHERE id=?""",
-                  (result['duration'],result.get('speech_detected'),C.now(),result['text_size'],result.get('sha256'),job['id']))
+    except (ConnectionError, FileNotFoundError) as exc:
+        logging.warning('ASR temporarily unavailable: %s', type(exc).__name__)
+        retry_later(job,'queued',bounded=True)
+        return
+    move(job, BEFORE_DELIVERY, 'delivery_pending', duration=result['duration'],
+         speech_detected=result.get('speech_detected'), attempts=0, next_try=0,
+         text_size=result['text_size'], sha256=result.get('sha256'))
 
 
 def next_ready_job(conn):
-    return conn.execute("""SELECT * FROM jobs WHERE state IN ('queued','delivery_pending')
-        AND next_try<=? ORDER BY (state='delivery_pending') DESC,
+    """The oldest ready recording of the member whose last decode started longest ago."""
+    return conn.execute("""SELECT * FROM jobs j WHERE state='queued' AND next_try<=?
+        ORDER BY coalesce((SELECT max(p.started_at) FROM jobs p WHERE p.uid=j.uid),0),
         coalesce(queued_at_ns,updated*1000000000),created,id LIMIT 1""",(C.now(),)).fetchone()
+
+
+def next_delivery(conn):
+    return conn.execute("""SELECT * FROM jobs WHERE state='delivery_pending' AND next_try<=?
+        ORDER BY coalesce(queued_at_ns,updated*1000000000),created,id LIMIT 1""",(C.now(),)).fetchone()
+
+
+def claim_next():
+    with C.db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row = next_ready_job(c)
+        if row is None:
+            return None
+        job = dict(row)
+        if not C.transition(c, job['id'], 'queued', 'processing', started_at=C.now()):
+            return None
+    job['state'] = 'processing'
+    return job
+
+
+_decoding = set()
+
+
+def job_state(ident):
+    with C.db() as c:
+        row = c.execute('SELECT state FROM jobs WHERE id=?', (ident,)).fetchone()
+    return row['state'] if row else None
+
+
+async def supervise(http, job):
+    """Run one decode; stop it as soon as the member deletes the recording."""
+    task = asyncio.ensure_future(run_job(http, job))
+    _decoding.add(job['id'])
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=WATCH_SECONDS)
+            if not task.done() and job_state(job['id']) != 'processing':
+                # Closing the ASR connection makes the service abort the orphaned decoder.
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                return
+        task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    except Exception as error:
+        logging.error('Job failed: %s',type(error).__name__)
+        fail(job, 'Не удалось завершить расшифровку. Можно повторить обработку.')
+    finally:
+        _decoding.discard(job['id'])
+
+
+async def transcription_loop(http):
+    while True:
+        try:
+            job = claim_next()
+        except Exception as error:
+            logging.error('Queue unavailable: %s', type(error).__name__)
+            job = None
+        if job is None:
+            await asyncio.sleep(POLL_SECONDS)
+            continue
+        await supervise(http, job)
+
+
+def reconcile_sending():
+    """Settle sends interrupted without a final status. Called only between deliveries, when
+    nothing is in flight, because the receipt and the job are updated in two databases."""
+    with C.db() as c:
+        stuck = [dict(row) for row in c.execute("SELECT * FROM jobs WHERE state='sending'")]
+    for job in stuck:
+        record = receipts.get(job['id'])
+        if record is not None and record['delivery'] == 'ready':
+            # Claimed, but the receipt never reached the send boundary.
+            move(job, 'sending', 'delivery_pending', next_try=0)
+            continue
+        receipts.settle(job['id'])
+        final = 'unknown' if record is None or record['delivery'] == 'sending' else record['delivery']
+        finish(job, final, record['message_id'] if record else None)
+    for ident in receipts.interrupted():
+        receipts.settle(ident)
+
+
+async def delivery_step(http):
+    reconcile_sending()
+    with C.db() as c:
+        row = next_delivery(c)
+    if row is None:
+        return False
+    job = dict(row)
+    try:
+        await deliver(http, job)
+    except Exception as error:
+        logging.error('Delivery failed: %s',type(error).__name__)
+        finish(job, 'unknown' if job_state(job['id']) == 'sending' else 'failed')
+    return True
+
+
+async def delivery_loop(http):
+    while True:
+        try:
+            busy = await delivery_step(http)
+        except Exception as error:
+            logging.error('Delivery queue unavailable: %s', type(error).__name__)
+            busy = False
+        if not busy:
+            await asyncio.sleep(POLL_SECONDS)
+
+
+async def purge_step():
+    """Finish a member's deletion: the receipt, the ASR folder and progress, then the row.
+
+    A recording still being decoded here waits until its decode was cancelled, so a late
+    result cannot recreate the receipt after it was removed."""
+    with C.db() as c:
+        rows = [dict(row) for row in c.execute(
+            "SELECT id,attempts FROM jobs WHERE state='deleted' AND next_try<=? ORDER BY updated", (C.now(),))]
+    done = 0
+    for job in rows:
+        if job['id'] in _decoding:
+            continue
+        receipts.forget(job['id'])
+        try:
+            await asr_client.forget(job['id'])
+        except (OSError, ValueError, RuntimeError) as error:
+            logging.warning('ASR cleanup postponed: %s', type(error).__name__)
+            with C.db() as c:
+                c.execute("UPDATE jobs SET attempts=attempts+1,next_try=? WHERE id=? AND state='deleted'",
+                          (C.now() + min(MAX_BACKOFF, 10*2**min(job['attempts'], 8)), job['id']))
+            continue
+        with C.db() as c:
+            c.execute("DELETE FROM jobs WHERE id=? AND state='deleted'", (job['id'],))
+        done += 1
+    return done
+
+
+async def purge_loop():
+    while True:
+        try:
+            await purge_step()
+        except Exception as error:
+            logging.error('Deletion cleanup failed: %s', type(error).__name__)
+        await asyncio.sleep(POLL_SECONDS)
 
 
 async def main():
     C.initialize()
     receipts.initialize()
-    with receipts.db(True) as db:
-        db.execute("UPDATE results SET delivery='unknown' WHERE delivery='sending'")
     with C.db() as c:
-        c.execute("UPDATE jobs SET state='queued' WHERE state='processing'")
-        c.execute("UPDATE jobs SET state='delivery_pending',next_try=0 WHERE state='sending'")
+        # This process is the only decoder client; its previous connection is gone.
+        for row in c.execute("SELECT id FROM jobs WHERE state='processing'").fetchall():
+            C.transition(c, row['id'], 'processing', 'queued')
+    reconcile_sending()
     async with ClientSession(timeout=ClientTimeout(total=120)) as http:
-        while True:
-            with C.db() as c:
-                c.execute('BEGIN IMMEDIATE')
-                row = next_ready_job(c)
-                job = dict(row) if row else None
-                if job and job['state']=='queued':
-                    c.execute("UPDATE jobs SET state='processing',updated=? WHERE id=?",(C.now(),job['id']))
-            if not job:
-                await asyncio.sleep(4)
-                continue
-            try:
-                await run_job(http,job)
-            except Exception as error:
-                logging.error('Job failed: %s',type(error).__name__)
-                if job['state']=='delivery_pending':
-                    with C.db() as c:
-                        state = c.execute('SELECT state FROM jobs WHERE id=?',(job['id'],)).fetchone()['state']
-                    finish(job,'unknown' if state=='sending' else 'failed')
-                else:
-                    with C.db() as c:
-                        c.execute("UPDATE jobs SET state='failed',error=?,updated=? WHERE id=?",
-                                  ('Не удалось завершить расшифровку. Можно повторить обработку.',C.now(),job['id']))
+        await asyncio.gather(transcription_loop(http), delivery_loop(http), purge_loop())
 
 
 if __name__=='__main__':

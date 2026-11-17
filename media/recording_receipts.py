@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import threading
 
 import recording_grant as grant
 from storage_capacity import MAX_TRANSCRIPT_BYTES
@@ -14,12 +15,38 @@ def root():
     return Path(os.environ.get('PSY_RECEIPT_ROOT', '/var/lib/psy-recording-receipts'))
 
 
+_readers = threading.local()
+
+
+def _reader():
+    """Reused read-only connection per thread. The web UID cannot write here, so this stays
+    a rollback-journal database and every read ends its transaction promptly."""
+    path = root() / 'results.sqlite3'
+    cached = getattr(_readers, 'conn', None)
+    if cached is None or cached[0] != path:
+        if cached is not None:
+            cached[1].close()
+        conn = sqlite3.connect(path.as_uri() + '?mode=ro', timeout=10, uri=True)
+        conn.row_factory = sqlite3.Row
+        cached = _readers.conn = (path, conn)
+    return cached[1]
+
+
 @contextlib.contextmanager
 def db(write=False):
-    path = root() / 'results.sqlite3'
-    target = str(path) if write else path.as_uri() + '?mode=ro'
-    conn = sqlite3.connect(target, timeout=10, uri=not write)
+    if not write:
+        conn = _reader()
+        try:
+            with conn:
+                yield conn
+        finally:
+            if conn.in_transaction:
+                conn.rollback()
+        return
+    conn = sqlite3.connect(str(root() / 'results.sqlite3'), timeout=10)
     conn.row_factory = sqlite3.Row
+    # Deleted transcripts must not linger in free pages.
+    conn.execute('PRAGMA secure_delete=ON')
     try:
         with conn:
             yield conn
@@ -34,6 +61,8 @@ def initialize():
             duration REAL NOT NULL, speech INTEGER NOT NULL, delivery TEXT NOT NULL,
             message_id INTEGER, next_try INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0)""")
         conn.execute('CREATE TABLE IF NOT EXISTS used_retry(nonce TEXT PRIMARY KEY)')
+        # The delivery column follows the body, so scanning it would read every transcript.
+        conn.execute('CREATE INDEX IF NOT EXISTS results_delivery ON results(delivery)')
     (root() / 'results.sqlite3').chmod(0o640)
 
 
@@ -67,6 +96,24 @@ def get(ident, *, body=False):
     return dict(row) if row else None
 
 
+def body_size(ident):
+    with db() as conn:
+        row = conn.execute('SELECT length(body) FROM results WHERE id=?', (ident,)).fetchone()
+    return None if row is None else row[0]
+
+
+def read_body(ident, offset, size):
+    """One bounded piece of a transcript, looked up by id inside the same read transaction."""
+    with db() as conn:
+        conn.execute('BEGIN')
+        row = conn.execute('SELECT rowid FROM results WHERE id=?', (ident,)).fetchone()
+        if row is None:
+            raise LookupError('Transcript removed')
+        with conn.blobopen('results', 'body', row[0], readonly=True) as blob:
+            blob.seek(offset)
+            return blob.read(size)
+
+
 def start(ident, now, retry=None):
     with db(True) as conn:
         conn.execute('BEGIN IMMEDIATE')
@@ -88,6 +135,24 @@ def start(ident, now, retry=None):
             return False
         conn.execute("UPDATE results SET delivery='sending' WHERE id=?",(ident,))
         return True
+
+
+def forget(ident):
+    """Remove a member's transcript. secure_delete overwrites the freed pages."""
+    with db(True) as conn:
+        conn.execute('DELETE FROM results WHERE id=?', (ident,))
+
+
+def interrupted():
+    """Receipts left at the ambiguous send boundary."""
+    with db() as conn:
+        return [row[0] for row in conn.execute("SELECT id FROM results WHERE delivery='sending'")]
+
+
+def settle(ident):
+    """Telegram may or may not have received it: only an explicit confirmation sends again."""
+    with db(True) as conn:
+        conn.execute("UPDATE results SET delivery='unknown' WHERE id=? AND delivery='sending'", (ident,))
 
 
 def status(ident, state, msg=None, *, next_try=0, attempt=0):

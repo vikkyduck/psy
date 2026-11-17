@@ -15,7 +15,6 @@ def main():
             PSY_BOT_USERNAME='fixture_bot', PSY_PUBLIC_URL='https://fixture.invalid',
             HERMES_HOME=temp, PSY_UPLOAD_ROOT=temp+'/state', PSY_UPLOAD_FILES=temp+'/files',
             PSY_ASR_PROGRESS=temp+'/progress', PSY_ACCESS_SOCKET=temp+'/member.sock',
-            PSY_MEMBER_QUOTA_BYTES=str(4*1024**3),
         )
         os.environ['CREDENTIALS_DIRECTORY'] = temp+'/fixture-credentials'
         Path(os.environ['CREDENTIALS_DIRECTORY']).mkdir()
