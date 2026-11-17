@@ -33,17 +33,19 @@ def main():
         source = base / 'silence.wav'
         job = base / 'job'
         job.mkdir(mode=0o700)
-        output = job / 'result.txt'
+        attempt = job / 'attempt-smoke'
+        attempt.mkdir(mode=0o700)
+        output = attempt / 'result.txt'
         with wave.open(str(source), 'wb') as wav:
             wav.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
             wav.writeframes(bytes(2 * 16000 * 2))
         env = dict(PATH='/usr/bin:/bin', HOME=str(job), HERMES_HOME=str(job),
-                   TMPDIR=str(job), PSY_WHISPER_MODEL=str(model), PSY_ASR_STANDALONE='1',
-                   PSY_ASR_INPUT=str(base), PSY_ASR_OUTPUT=str(job),
-                   PSY_ASR_PROGRESS_FILE=str(job / 'progress.json'), HF_HUB_OFFLINE='1',
+                   TMPDIR=str(attempt), PSY_WHISPER_MODEL=str(model), PSY_ASR_STANDALONE='1',
+                   PSY_ASR_INPUT=str(base), PSY_ASR_OUTPUT=str(attempt),
+                   PSY_ASR_PROGRESS_FILE=str(attempt / 'progress.json'), HF_HUB_OFFLINE='1',
                    OMP_NUM_THREADS='1', OPENBLAS_NUM_THREADS='1')
         run = subprocess.run([sys.executable, '-I', str(MEDIA/'asr_sandbox.py'),
-                              str(source), str(output), 'auto'], cwd=job, env=env,
+                              str(source), str(output), 'auto', str(job)], cwd=job, env=env,
                              capture_output=True, text=True, timeout=300)
         if run.returncode:
             raise RuntimeError(run.stderr[-1500:])

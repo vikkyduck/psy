@@ -56,8 +56,11 @@ def restrict(source, jobdir):
 
 
 if __name__ == '__main__':
-    source, target, language = sys.argv[1:]
-    jobdir = Path(target).parent
+    # The job folder holds the resumable journal; the target sits in a fresh per-attempt folder below it.
+    source, target, language, *state = sys.argv[1:]
+    jobdir = Path(state[0]) if state else Path(target).parent
+    if len(state) > 1 or not Path(target).resolve().is_relative_to(jobdir.resolve()):
+        raise SystemExit('Output must stay inside the job folder')
     restrict(Path(source), jobdir)
     os.execv(sys.executable, [sys.executable,'-I',str(Path(__file__).with_name('transcribe.py')),source,
                              '--output',target,'--language',language])
