@@ -324,6 +324,45 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(C.plausible_init(raw,now-20),extra)
 
 
+    async def test_transcript_streams_in_bounded_pieces(self):
+        ident=(await (await self.new_job(1,b'x')).json())['id']
+        with C.db() as c:
+            c.execute("UPDATE jobs SET state='done',delivery='sent' WHERE id=?",(ident,))
+        body=''.join(f'[00:00:{i%60:02d}] строка {i}\n' for i in range(40000)).encode()
+        self.seal(ident,body)
+        with patch.object(server,'TRANSCRIPT_PIECE',8192),patch.object(receipts,'read_body',wraps=receipts.read_body) as reads:
+            response=await self.client.get('/api/jobs/'+ident+'/transcript',headers=self.auth)
+            self.assertEqual(response.status,200)
+            self.assertEqual(await response.read(),body)
+        self.assertEqual(reads.call_count,-(-len(body)//8192))
+        self.assertEqual(response.headers['X-Content-Type-Options'],'nosniff')
+        self.assertEqual(response.headers['Cache-Control'],'no-store')
+        self.assertEqual(int(response.headers['Content-Length']),len(body))
+        # A transcript removed during a download ends the connection instead of a short success.
+        def removed(*args):raise LookupError('gone')
+        with patch.object(receipts,'read_body',removed):
+            response=await self.client.get('/api/jobs/'+ident+'/transcript',headers=self.auth)
+            with self.assertRaises(Exception):
+                await response.read()
+        self.assertEqual((await self.client.get('/api/jobs',headers=self.auth)).status,200)
+
+    async def test_slow_disk_flush_does_not_stall_other_requests(self):
+        import time
+        ident=(await (await self.new_job(65536,b'x'*65536)).json())['id']
+        real=os.fsync
+        def slow(fd):
+            time.sleep(0.8);real(fd)
+        with patch('os.fsync',slow):
+            upload=asyncio.ensure_future(self.client.patch('/api/jobs/'+ident,data=b'x'*65536,
+                                                           headers={**self.auth,'Upload-Offset':'0'}))
+            await asyncio.sleep(0.25)
+            started=time.monotonic()
+            listing=await self.client.get('/api/jobs',headers=self.auth)
+            self.assertEqual(listing.status,200)
+            self.assertLess(time.monotonic()-started,0.5)
+            self.assertFalse(upload.done())
+            self.assertEqual((await upload).status,200)
+
     async def test_concurrent_retries_share_create_limit_preserve_results_and_queue_fairly(self):
         import worker
         done=(await (await self.new_job(1,b'z',name='done.wav')).json())['id']
