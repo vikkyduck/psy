@@ -29,6 +29,10 @@ install -m 0644 "$ops/libexec/psy_healthcheck.py" /usr/local/libexec/psy-healthc
 install -m 0644 "$ops/libexec/psy_alerts.py" /usr/local/libexec/psy-alerts.py
 install -m 0644 "$ops/libexec/psy_vault_archive.py" /usr/local/libexec/psy-vault-archive.py
 install -m 0644 "$ops/libexec/upload_healthcheck.py" /usr/local/libexec/psy-upload-healthcheck.py
+install -m 0644 "$ops/libexec/psy_restart_outdated.py" /usr/local/libexec/psy-restart-outdated.py
+# needrestart leaves the bot alone; psy-restart-outdated.timer restarts it at night when idle.
+install -d -m 0755 /etc/needrestart/conf.d
+install -m 0644 "$ops/needrestart/50-psy.conf" /etc/needrestart/conf.d/50-psy.conf
 install -m 0755 "$ops/libexec/deploy-cert" /usr/local/libexec/psy-upload-deploy-cert
 # Units from ops/inventory.json. Audio priority only controlled an optional build and is not
 # installed; the backup units come from install-backup below.

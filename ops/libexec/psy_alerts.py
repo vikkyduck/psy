@@ -28,12 +28,13 @@ STATE = Path("/var/lib/psy-alerts")
 HOME = Path("/home/hermes/.hermes")
 CORE = ("hermes-gateway", "psy-upload", "psy-upload-worker", "psy-asr")
 CHECKS = ("psy-healthcheck", "psy-upload-health", "psy-codex-auth",
-          "psy-upload-cert-renew", "psy-backup", "psy-vault-archive")
+          "psy-upload-cert-renew", "psy-backup", "psy-vault-archive", "psy-restart-outdated")
 # Every timer the bot relies on, with the longest normal gap between two of its runs.
 TIMERS = {
     "psy-alerts.timer": 600, "psy-healthcheck.timer": 600, "psy-upload-health.timer": 600,
     "psy-vault-archive.timer": 3600, "psy-codex-auth.timer": 3 * 3600,
     "psy-upload-cert-renew.timer": 14 * 3600, "psy-backup.timer": 27 * 3600,
+    "psy-restart-outdated.timer": 25 * 3600,
 }
 BACKUP_SUCCESS = Path("/var/lib/psy-backup/last-success")
 BACKUP_MAX_AGE = 26 * 3600

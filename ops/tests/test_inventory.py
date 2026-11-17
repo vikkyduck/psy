@@ -6,6 +6,7 @@ import re
 import unittest
 
 import psy_alerts
+import psy_restart_outdated
 
 OPS = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('inventory', OPS / 'inventory.py')
@@ -59,6 +60,14 @@ class Inventory(unittest.TestCase):
         self.assertEqual(sorted(inventory.INVENTORY['restart_order']),
                          sorted(n for n, u in UNITS.items() if u['kind'] == 'daemon'))
         self.assertEqual(inventory.INVENTORY['restart_order'][-1], 'hermes-gateway.service')
+        self.assertEqual(list(psy_restart_outdated.RESTART_ORDER), inventory.INVENTORY['restart_order'])
+
+    def test_needrestart_defers_every_daemon(self):
+        text = (OPS / 'needrestart/50-psy.conf').read_text()
+        patterns = re.findall(r'qr\((.+?)\)\} = 0;', text)
+        for name, unit in UNITS.items():
+            if unit['kind'] == 'daemon':
+                self.assertTrue(any(re.search(p.replace('\\.', '\\.'), name) for p in patterns), name)
 
     def test_queries(self):
         idle = inventory.query('idle')
