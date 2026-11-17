@@ -14,6 +14,7 @@ EXPECTED = NATIVE | {
     "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py",
     "psy_source_evidence.py", "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py",
     "psy_group_queue.py", "psy_owner_recovery.py", "psy_local_media.py", "psy_upload_handoff.py",
+    "psy_group_admin.py",
 }
 
 def verify():

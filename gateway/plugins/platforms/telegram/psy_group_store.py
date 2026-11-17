@@ -264,6 +264,32 @@ def document(uid, topic, ident, *, root=ROOT):
                            (uid, topic, ident)).fetchone()
 
 
+def forget(uid, topic, ident, *, root=ROOT, request_key=None):
+    """Delete a member's own stored document in this topic. Return whether it existed."""
+    with database(root) as con:
+        # Overwrite the freed pages instead of leaving the file's bytes in the free list.
+        con.execute("PRAGMA secure_delete=ON")
+        con.execute("BEGIN IMMEDIATE")
+        if request_key is not None and _previous_write(con, request_key, uid, topic, "deletion") is not None:
+            return True
+        if con.execute("DELETE FROM documents WHERE uid=? AND topic=? AND id=?", (uid, topic, ident)).rowcount != 1:
+            return False
+        # A later file can reuse the row ID. No reply, selection or discussion may then point to
+        # it. The member's turns about the deleted file stay together under a negative marker.
+        for table in ("message_sources", "current_sources", "source_events"):
+            con.execute(f"UPDATE {table} SET doc_id=NULL WHERE uid=? AND topic=? AND doc_id=?", (uid, topic, ident))
+        con.execute("""UPDATE turn_sources SET doc_id=? WHERE doc_id=? AND turn_id IN
+                       (SELECT id FROM turns WHERE uid=? AND topic=?)""", (-ident, ident, uid, topic))
+        _record_write(con, request_key, topic, "deletion", ident)
+    try:
+        # Drop the deleted bytes from the -wal file too. A busy reader only postpones this.
+        with database(root) as con:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error:
+        pass
+    return True
+
+
 def set_current(uid, topic, doc_id, message_id, *, root=ROOT):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
@@ -411,7 +437,18 @@ class Checkpoints:
             con.execute("""INSERT INTO checkpoints(request_id,key,value) VALUES(?,?,?)
                            ON CONFLICT(request_id,key) DO UPDATE SET value=excluded.value""",
                         (self.ident, key, encoded))
+            if key == ANSWER and value is not None:
+                # The final answer supersedes every model stage that produced it.
+                _drop_stages(con, self.ident)
             con.execute("INSERT OR REPLACE INTO job_progress VALUES(?,?,?)", (self.ident, time.time(), "checkpoint"))
+
+
+ANSWER = "route:answer:v1"
+_STAGES = "(key GLOB 'model:*' OR key GLOB 'prose:*')"
+
+
+def _drop_stages(con, ident):
+    con.execute(f"DELETE FROM checkpoints WHERE request_id=? AND {_STAGES}", (ident,))
 
 
 def _schedule_request(con, ident, payload):
@@ -672,7 +709,10 @@ def settle(ident, success, *, root=ROOT):
                            SELECT id,? FROM requests WHERE id=?""", (time.time(), ident))
             con.execute("DELETE FROM requests WHERE id=?", (ident,))
         else:
-            con.execute("UPDATE requests SET state='uncertain',body='' WHERE id=?", (ident,))
+            # Keep the request text for an operator requeue, and the answer if there is one.
+            con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
+            if con.execute("SELECT 1 FROM checkpoints WHERE request_id=? AND key=?", (ident, ANSWER)).fetchone():
+                _drop_stages(con, ident)
 
 
 def fail(ident, *, root=ROOT):
@@ -684,8 +724,59 @@ def fail(ident, *, root=ROOT):
 def recover(*, root=ROOT):
     with database(root) as con:
         con.execute("UPDATE requests SET state='queued' WHERE state='running'")
-        con.execute("UPDATE requests SET state='uncertain',body='' WHERE state='sending'")
+        con.execute("UPDATE requests SET state='uncertain' WHERE state='sending'")
         return con.execute("SELECT count(*) FROM requests WHERE state='queued'").fetchone()[0]
+
+
+# Operator view of jobs that need a decision. Metadata only: never message text or answers.
+def jobs(*, root=ROOT, include_all=False):
+    with database(root) as con:
+        return con.execute(f"""SELECT r.id,r.state,r.uid,coalesce(s.topic,0),length(r.body)>0,
+                 (SELECT count(*) FROM checkpoints c WHERE c.request_id=r.id),
+                 (SELECT coalesce(sum(length(c.value)),0) FROM checkpoints c WHERE c.request_id=r.id),
+                 EXISTS(SELECT 1 FROM checkpoints c WHERE c.request_id=r.id AND c.key=?),
+                 (SELECT count(*) FROM delivery_parts p WHERE p.request_id=r.id AND p.state='confirmed'),
+                 (SELECT count(*) FROM delivery_parts p WHERE p.request_id=r.id AND p.state!='confirmed'),
+                 m.attempts,m.retry_at,a.wait_kind,g.updated,g.stage
+               FROM requests r LEFT JOIN schedule s ON s.request_id=r.id
+               LEFT JOIN model_retries m ON m.request_id=r.id LEFT JOIN model_attempts a ON a.request_id=r.id
+               LEFT JOIN job_progress g ON g.request_id=r.id
+               WHERE ? OR r.state IN ('uncertain','failed') OR m.request_id IS NOT NULL
+               ORDER BY r.id""", (ANSWER, include_all)).fetchall()
+
+
+def resolve(ident, action, *, root=ROOT, now=None):
+    """Settle a job the gateway will not finish by itself. Running jobs are never touched.
+
+    delivered: the member has the answer; finish it like a completed job.
+    requeue: run it again from its checkpoints; an ambiguous part is sent again.
+    drop: abandon it without an answer, also when it waits for a retry."""
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT state,body FROM requests WHERE id=?", (ident,)).fetchone()
+        if row is None:
+            raise LookupError("No such group request")
+        current, body = row
+        allowed = {"delivered": ("uncertain", "failed"), "requeue": ("uncertain", "failed"),
+                   "drop": ("uncertain", "failed", "queued")}[action]
+        if current not in allowed:
+            raise ValueError(f"A {current} request cannot be marked {action}")
+        if action == "requeue":
+            if not body:
+                raise ValueError("The request text was not kept, so it cannot run again")
+            if current == "failed":
+                # Only the error notice was sent. Replace it with the real answer.
+                con.execute("DELETE FROM delivery_parts WHERE request_id=?", (ident,))
+                con.execute("DELETE FROM checkpoints WHERE request_id=? AND key='outbound.single_text'", (ident,))
+            else:
+                con.execute("DELETE FROM delivery_parts WHERE request_id=? AND state='sending'", (ident,))
+            con.execute("UPDATE model_retries SET retry_at=0 WHERE request_id=?", (ident,))
+            con.execute("UPDATE delivery_parts SET retry_at=0 WHERE request_id=? AND state='retry'", (ident,))
+            con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+            return
+        con.execute("INSERT OR REPLACE INTO completed_updates(id,completed_at) VALUES(?,?)",
+                    (ident, time.time() if now is None else now))
+        con.execute("DELETE FROM requests WHERE id=?", (ident,))
 
 
 def lease(*, root=ROOT):

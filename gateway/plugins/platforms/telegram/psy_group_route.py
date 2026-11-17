@@ -17,7 +17,8 @@ UPLOAD_START = re.compile(r"/start(?:@" + re.escape(BOT_USERNAME) + r")? upload_
 HELLO = ("В этой группе я отвечаю на сообщения, исследую публичные источники и разбираю записи. "
          "Ответьте на файл расшифровки, чтобы обсудить его. /audio открывает загрузку до 1 ГБ. "
          "/files показывает Ваши сохраненные в этой группе материалы. /get НОМЕР возвращает выбранный файл. "
-         "/read НОМЕР ВОПРОС открывает его для разбора. /research ВОПРОС запускает поиск по источникам. "
+         "/read НОМЕР ВОПРОС открывает его для разбора. /delete НОМЕР удаляет его из Ваших материалов. "
+         "/research ВОПРОС запускает поиск по источникам. "
          "/image ОПИСАНИЕ создает изображение через Codex.")
 MAX_TEXT = 8 * 1024**2
 MAX_IMAGE = 5 * 1024**2
@@ -216,6 +217,18 @@ async def group_message(msg):
     if command == "/files":
         rows = await asyncio.to_thread(store.listing, uid, topic)
         await msg.reply_text("\n".join(f"{ident}. {name}" for ident,name in rows)[:4000] or "У Вас пока нет сохраненных материалов в этой теме.")
+        return
+    if command == "/delete":
+        numeral = param.partition(" ")[0]
+        if not re.fullmatch("[1-9][0-9]{0,9}", numeral):
+            await msg.reply_text("Укажите номер из /files.")
+            return
+        # A replayed job finds its own receipt instead of reporting the file as missing.
+        receipt = getattr(msg, "ident", None)
+        deleted = await asyncio.to_thread(store.forget, uid, topic, int(numeral),
+                                          request_key=(receipt, "delete") if type(receipt) is int else None)
+        await msg.reply_text(f"Материал {numeral} удален из Ваших материалов." if deleted else
+                             "Материал с этим номером в Вашем кабинете не найден.")
         return
     doc_id = None
     source = None
