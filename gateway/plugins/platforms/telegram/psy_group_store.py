@@ -1,5 +1,6 @@
 """A member's group materials and conversations. No filename from a message is opened."""
 import contextlib
+import importlib
 import json
 import math
 import os
@@ -353,6 +354,23 @@ class GroupJobParked(Exception):
     """Durably queued to resume when a long-work slot becomes available."""
 
 
+class GroupJobFailed(Exception):
+    """An unexpected error was reported to the member. Keep the job for the operator."""
+
+
+def transient(exc):
+    """Storage, disk and network failures. The job's checkpoints remain valid for a retry."""
+    if isinstance(exc, (sqlite3.Error, OSError)):
+        return True
+    try:
+        errors = importlib.import_module("telegram.error")
+    except ImportError:
+        return False
+    retry, network, rejected = (getattr(errors, name, ()) for name in ("RetryAfter", "NetworkError", "BadRequest"))
+    # PTB derives BadRequest from NetworkError, but a rejected request does not heal by waiting.
+    return isinstance(exc, retry) or (isinstance(exc, network) and not isinstance(exc, rejected))
+
+
 class Checkpoints:
     """Private JSON stages for one queued update. Each thread opens its own connection."""
 
@@ -611,6 +629,12 @@ def settle(ident, success, *, root=ROOT):
             con.execute("DELETE FROM requests WHERE id=?", (ident,))
         else:
             con.execute("UPDATE requests SET state='uncertain',body='' WHERE id=?", (ident,))
+
+
+def fail(ident, *, root=ROOT):
+    """After an unexpected error was reported, keep the request and its checkpoints for the operator."""
+    with database(root) as con:
+        con.execute("UPDATE requests SET state='failed' WHERE id=? AND state IN ('running','sending')", (ident,))
 
 
 def recover(*, root=ROOT):

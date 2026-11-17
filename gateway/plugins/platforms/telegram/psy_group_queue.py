@@ -89,6 +89,15 @@ class Outbound:
             except Exception as exc:
                 log.info("group retry notice unavailable: %s", type(exc).__name__)
 
+    async def defer_failure(self):
+        """Requeue after a storage or network failure. Saved stages and delivered parts stay valid."""
+        notify = await committed_call(store.wait_for_model, self.ident, "infrastructure", None)
+        if notify and not self.part:
+            try:
+                await self.msg.reply_text("Запрос сохранен. PSY продолжит его автоматически.")
+            except Exception as exc:
+                log.info("group retry notice unavailable: %s", type(exc).__name__)
+
     def _destination(self):
         return [self.msg.chat.id, self.msg.from_user.id,
                 self.msg.message_thread_id if self.msg.is_topic_message else None, self.msg.message_id]
@@ -216,6 +225,21 @@ async def ensure_vault(bot):
     await committed_call(store.bind_instance, BOT, GROUP)
 
 
+async def durable(app, func, *args, **kwargs):
+    """Commit a queue decision, waiting out storage failures instead of losing the job."""
+    delay = 1
+    while True:
+        try:
+            return await committed_call(func, *args, **kwargs)
+        except Exception as exc:
+            # On shutdown the job stays running in SQLite and startup recovery requeues it.
+            if not store.transient(exc) or not app.running:
+                raise
+            log.warning("group queue write failed (%s); retrying in %ds", type(exc).__name__, delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 60)
+
+
 async def run_job(app, wake, ident, body):
     from .psy_group_route import process_group
     try:
@@ -241,11 +265,21 @@ async def run_job(app, wake, ident, body):
     except asyncio.CancelledError:
         # Startup restores pre-send work and quarantines possible duplicate deliveries.
         raise
+    except store.GroupJobFailed:
+        await durable(app, store.fail, ident)
+    except DeliveryUncertain:
+        await durable(app, store.settle, ident, False)
     except Exception as exc:
+        if store.transient(exc):
+            # Even recording the retry failed inside the job. Keep every checkpoint.
+            log.warning("group job deferred after %s", type(exc).__name__)
+            await durable(app, store.wait_for_model, ident, "infrastructure", None)
+            return
         log.warning("group job stopped: %s", type(exc).__name__)
-        await committed_call(store.settle, ident, False)
+        await durable(app, store.settle, ident, False)
     else:
-        await committed_call(store.settle, ident, True)
+        # A real answer or a known user-facing error reached the member.
+        await durable(app, store.settle, ident, True)
 
 
 async def work(app, wake):

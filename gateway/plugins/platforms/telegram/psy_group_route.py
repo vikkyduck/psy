@@ -412,8 +412,17 @@ async def process_group(msg):
         fn = tb.tb_frame.f_code.co_name if tb else "unknown"
         log.warning("group request failed class=%s function=%s line=%d elapsed=%.1fs",
                     type(exc).__name__, fn, tb.tb_lineno if tb else 0, time.monotonic() - start)
+        queued = getattr(msg, "defer_failure", None)
+        if queued is not None and store.transient(exc):
+            # A locked or full database, a disk error or a dropped Telegram download says
+            # nothing about the request. Keep its checkpoints and run it again later.
+            await queued()
+            raise store.GroupJobParked() from None
         safe = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else None
         await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
+        if queued is not None and safe is None:
+            # The member was told. The operator can still requeue it from its checkpoints.
+            raise store.GroupJobFailed() from None
 
 
 UNLINKED_REPLY = ("В этой теме у Вас нет привязки этого сообщения к исходному материалу. "
