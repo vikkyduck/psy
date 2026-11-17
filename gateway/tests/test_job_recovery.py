@@ -289,7 +289,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.message.reply_text.assert_not_awaited()
         self.assertEqual(store.state(self.ident), "uncertain")
 
-    async def test_generated_manuscript_delivered_when_archive_is_full(self):
+    async def test_generated_manuscript_delivered_when_disk_reserve_is_reached(self):
         manuscript = "текст главы. " * 700
         sent = []
         async def document(*, document, **kwargs):
@@ -300,7 +300,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         cp = store.Checkpoints(self.ident)
         cp.put("route:input:v1", job)
         cp.put("route:answer:v1", {"text":manuscript, "images":[]})
-        with patch.object(store, "MEMBER_LIMIT", 10), patch.object(route, "respond") as provider:
+        with patch.object(store, "DISK_RESERVE", 1 << 62), patch.object(route, "respond") as provider:
             await queue.run_job(self.app, asyncio.Event(), *store.claim_next())
         provider.assert_not_called()
         self.assertEqual(sent, [manuscript.encode()])

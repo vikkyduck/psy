@@ -341,8 +341,8 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             await asyncio.to_thread(store.archive, uid, topic, name, kind, data, **receipt(key))
         except store.ArchiveFull:
             # The durable answer and per-part receipts still carry the exact payload.
-            # The archive quota must not discard work that already finished.
-            log.info("group answer archive quota reached")
+            # A nearly full disk must not discard work that already finished.
+            log.info("group answer not archived: disk reserve reached")
 
     if text:
         if len(text) <= 4000:

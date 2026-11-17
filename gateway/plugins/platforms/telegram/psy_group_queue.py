@@ -425,8 +425,5 @@ async def accept(app,update):
     if not any(k in filtered for k in ("text","caption","photo","document","voice","audio","video","video_note")):
         return
     data=json.dumps({"update_id":update.update_id,"message":filtered},ensure_ascii=False)
-    status=await asyncio.to_thread(store.pending,msg.from_user.id,update.update_id,data)
-    if status=="full":
-        await msg.reply_text("В очереди уже есть несколько запросов. Дождитесь ответа и повторите.")
-    else:
-        schedule(app)
+    await asyncio.to_thread(store.pending,msg.from_user.id,update.update_id,data)
+    schedule(app)

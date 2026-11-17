@@ -17,8 +17,9 @@ def _hermes_home():
 
 
 ROOT = _hermes_home() / "vault" / "group-psy"
-MEMBER_LIMIT = 128 * 1024**2
-TOTAL_LIMIT = 512 * 1024**2
+# Members' files and answers have no quota. Only the physical disk is protected: keep this
+# much free for the system, the -wal file and recordings (the uploader keeps the same reserve).
+DISK_RESERVE = 768 * 1024**2
 MAX_LONG_JOBS = 2
 AUTH_WAITS = ("signin", "access_wait")
 # Several worker threads and the operator CLI share one file. A writer waits for the
@@ -171,6 +172,19 @@ class ArchiveFull(ValueError):
     pass
 
 
+def _free_bytes(con):
+    # The filesystem that holds this database file, wherever its root is configured.
+    path = con.execute("PRAGMA database_list").fetchone()[2]
+    info = os.statvfs(os.path.dirname(path) or ".")
+    return info.f_bavail * info.f_frsize
+
+
+def _ensure_space(con, size):
+    # The new row is written to the -wal file first and later checkpointed into the database.
+    if _free_bytes(con) < DISK_RESERVE + 2 * size:
+        raise ArchiveFull("В хранилище недостаточно места для нового файла.")
+
+
 def _bind(con, uid, topic, message_id, doc_id, turn_id):
     if type(message_id) is int and message_id > 0:
         con.execute("""INSERT INTO message_sources(uid,topic,message_id,doc_id,turn_id) VALUES (?,?,?,?,?)
@@ -229,10 +243,7 @@ def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT, request
             if existing:
                 _record_write(con, request_key, topic, "document", existing[0])
                 return existing[0]
-        member, total = con.execute("""SELECT coalesce(sum(CASE WHEN uid=? THEN length(data)
-                      ELSE 0 END),0), coalesce(sum(length(data)),0) FROM documents""", (uid,)).fetchone()
-        if member + len(data) > MEMBER_LIMIT or total + len(data) > TOTAL_LIMIT:
-            raise ArchiveFull("В хранилище недостаточно места для нового файла.")
+        _ensure_space(con, len(data))
         cursor = con.execute("INSERT INTO documents(uid,topic,name,kind,data) VALUES (?,?,?,?,?)",
                              (uid, topic, name[:140], kind, data))
         doc_id = cursor.lastrowid
@@ -432,10 +443,8 @@ def pending(uid, ident, payload, *, root=ROOT):
             return "existing"
         if con.execute("SELECT 1 FROM requests WHERE id=?", (ident,)).fetchone():
             return "existing"
-        count, own = con.execute("""SELECT count(*),coalesce(sum(uid=?),0)
-                                    FROM requests WHERE state IN ('queued','running','sending')""",(uid,)).fetchone()
-        if count>=12 or own>=4 or len(payload)>300000:
-            return "full"
+        # Every request is queued, however many a member or the group already has waiting.
+        # Concurrency is bounded only by the workers that claim them.
         con.execute("INSERT INTO requests(id,uid,body,state) VALUES(?,?,?,'queued')",(ident,uid,payload))
         _schedule_request(con, ident, payload)
         return "queued"
@@ -460,7 +469,7 @@ _CLAIMABLE = """(s.long_job=0 OR (SELECT count(*) FROM requests a JOIN schedule 
 def claim_next(*, root=ROOT, now=None):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
-        # A pre-upgrade live queue has no schedule rows yet. At most 12 jobs can be admitted.
+        # A pre-upgrade live queue has no schedule rows yet.
         for ident, body in con.execute("""SELECT r.id,r.body FROM requests r LEFT JOIN schedule s
                                           ON s.request_id=r.id WHERE s.request_id IS NULL AND
                                           r.state IN ('queued','running','sending')""").fetchall():
