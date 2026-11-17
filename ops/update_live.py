@@ -447,6 +447,15 @@ def check_instance():
 
 # Opened read-write as its owner: a read-only open of a WAL database fails while no other process
 # holds it, and only the owner may create its -shm file.
+def check_backup_config():
+    """psy-backup reads its destination from a file that ops/install-backup creates; a host whose
+    backup predates that file would fail its next nightly run after this update."""
+    enabled = not run("systemctl", "is-enabled", "--quiet", "psy-backup.timer", check=False).returncode
+    if enabled and read_plain("/etc/psy-backup/destination.env") is None:
+        raise ValueError("psy-backup.timer is enabled but /etc/psy-backup/destination.env is missing; "
+                         "set PSY_BACKUP_DEST there (see ops/backup/destination.env.example) first")
+
+
 GROUP_PROBE = """
 import sqlite3, sys
 db = sqlite3.connect(sys.argv[1], timeout=30)
@@ -657,6 +666,7 @@ def main():
         check_group_manifest(sums)
         entries = system_entries(pwd.getpwnam("hermes").pw_uid) + gateway_entries(sums)
         check_instance()
+        check_backup_config()
         todo = plan(entries)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
         sys.exit(f"refused: {exc}")

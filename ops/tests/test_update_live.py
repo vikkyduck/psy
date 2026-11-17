@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -48,6 +49,15 @@ class ReleaseInventory(unittest.TestCase):
         for name in alerted:
             self.assertEqual(entries[f"/etc/systemd/system/{name}.d/owner-alert.conf"],
                              b"[Unit]\nOnFailure=psy-alert@%n.service\n")
+
+    def test_enabled_backup_needs_its_destination_file(self):
+        timer = lambda code: (lambda *cmd, **kw: subprocess.CompletedProcess(cmd, code, "", ""))
+        with patch.object(live, "read_plain", return_value=None):
+            with patch.object(live, "run", side_effect=timer(0)):     # psy-backup.timer enabled
+                with self.assertRaisesRegex(ValueError, "destination.env"):
+                    live.check_backup_config()
+            with patch.object(live, "run", side_effect=timer(1)):     # no backup configured here
+                live.check_backup_config()
 
     def test_only_new_runtime_timers_are_enabled(self):
         systemd = live.SYSTEMD
