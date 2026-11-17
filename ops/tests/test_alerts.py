@@ -130,6 +130,16 @@ class OwnerAlerts(unittest.TestCase):
                 (credentials / 'telegram').write_text('absent')   # SetCredential= placeholder
                 self.assertEqual(alerts.token(), profile)
 
+    def test_fifo_planted_as_profile_env_does_not_block(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fifo = Path(folder) / '.env'
+            os.mkfifo(fifo)
+            with patch.dict(alerts.os.environ, {'PSY_TELEGRAM_CREDENTIAL_FILE': str(fifo)}):
+                alerts.os.environ.pop('TELEGRAM_BOT_TOKEN', None)
+                alerts.os.environ.pop('CREDENTIALS_DIRECTORY', None)
+                with self.assertRaises(OSError):
+                    alerts.token()
+
     def test_timers_disabled_or_late_are_reported(self):
         now = 2_000_000_000
         def show(unit, *names):

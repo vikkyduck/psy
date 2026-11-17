@@ -7,4 +7,22 @@ Type=oneshot
 ExecStart=/usr/bin/python3 -I /usr/local/libexec/psy-upload-healthcheck.py
 # Covers one restart of the uploader (it stops within 50 s) and the probes around it.
 TimeoutStartSec=200
+StateDirectory=psy-upload-health
+StateDirectoryMode=0700
 UMask=0077
+# nsenter joins the uploader's mount namespace and runuser drops to its account there, so the
+# capabilities, namespaces and devices stay as they are; the rest is closed.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

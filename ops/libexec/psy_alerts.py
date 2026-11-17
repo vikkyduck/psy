@@ -18,6 +18,7 @@ import re
 import socket
 import sqlite3
 import ssl
+import stat
 import subprocess
 import time
 import urllib.error
@@ -225,6 +226,15 @@ def collect(previous, now):
     return problems, counters
 
 
+def read_regular(path, limit=1 << 20):
+    """Read a small regular file without following a link or blocking on a FIFO."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError("not a regular file")
+        return stream.read(limit).decode("utf-8", errors="replace")
+
+
 def token():
     """The root-only systemd credential first, then the environment, then the profile .env."""
     directory = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -239,7 +249,7 @@ def token():
     if supplied:
         return supplied
     credential = Path(os.environ.get("PSY_TELEGRAM_CREDENTIAL_FILE", str(HOME / ".env")))
-    for line in credential.read_text().splitlines():
+    for line in read_regular(credential).splitlines():
         key, separator, value = line.partition("=")
         if separator and key.strip() == "TELEGRAM_BOT_TOKEN":
             value = value.strip().strip("\"'")

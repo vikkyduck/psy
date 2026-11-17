@@ -20,6 +20,16 @@ ExecStop=-/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes --run-module gate
 ExecStopPost=-/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes --run-module gateway.cgroup_cleanup
 Restart=always
 RestartSec=5
+# A start that keeps failing (for example the preflight) backs off from 5 s to 2 min instead of
+# retrying every 5 s forever. NRestarts still counts each attempt for psy-alerts.
+RestartSteps=5
+RestartMaxDelaySec=2min
+# Under global memory pressure the kernel picks the recognizer (psy-asr, default 0) and other
+# helpers before the bot. This is not a limit: no MemoryMax, the owner's agent keeps all memory.
+OOMScoreAdjust=-300
+# The kernel killing one of the agent's child processes (a terminal command, a browser) must not
+# stop the whole bot; if the bot's own process dies, Restart= brings it back.
+OOMPolicy=continue
 RestartForceExitStatus=75
 SuccessExitStatus=75
 RestartPreventExitStatus=78
