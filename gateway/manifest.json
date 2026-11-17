@@ -19,7 +19,7 @@
     "plugins/platforms/telegram/psy_local_media.py": "42814edab41d81e1c90fa4b69a8aa8415705397e2c7093fb70811e9d0c48df6d",
     "plugins/platforms/telegram/psy_owner_recovery.py": "44ee334cf17806c6628148d79e28019406c9f801355729ebcb3b3dfa5eb6398d",
     "plugins/platforms/telegram/psy_source_evidence.py": "5c6c3d3b87c1beb6dc7c3243df47c9daaf08b928d79af37d7d2e1fdfb116ea70",
-    "plugins/platforms/telegram/psy_upload_handoff.py": "149e98dc08a77d753b31a18410122513da6d02aaa2c2021976fccde679b89576",
+    "plugins/platforms/telegram/psy_upload_handoff.py": "aa871401fbb9b360fa586347f105c8a9c1c16c30b0008023d88b6a5cee163a0f",
     "plugins/platforms/telegram/update_admission.py": "4bfc788deb2a61869c2cff56ec519b51d05fd90e179688f8b7177b10e3cf4ec6",
     "tools/transcription_tools.py": "dcb54798d0b21be57e75e2060e919ac2b9e1f6ade1d63d907f2ef39ac0842139"
   }

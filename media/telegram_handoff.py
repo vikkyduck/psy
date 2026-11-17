@@ -1,8 +1,46 @@
 """Limited upload handoff; it never grants general DM or administration access."""
+import importlib.machinery
+import importlib.util
+from pathlib import Path
 import sys
-sys.path.insert(0,'/opt/psy-upload')
-import psy_upload_common as C
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+
+UPLOAD = Path('/opt/psy-upload')
+
+
+class _UploaderModules:
+    """Resolves the uploader's own top-level imports from its directory, after every other finder."""
+    def __init__(self, directory):
+        self.directory = str(directory)
+
+    def find_spec(self, name, path=None, target=None):
+        if path is not None or '.' in name:
+            return None
+        return importlib.machinery.PathFinder.find_spec(name, [self.directory])
+
+
+def load(directory=UPLOAD):
+    """Load psy_upload_common by explicit path. This runs inside the gateway process, so the
+    uploader directory never enters sys.path, where its modules could shadow gateway imports."""
+    name = 'psy_upload_common'
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, Path(directory)/(name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    finder = _UploaderModules(directory)
+    sys.meta_path.append(finder)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    finally:
+        sys.meta_path.remove(finder)
+    return module
+
+
+C = load()
 
 
 def allowed_source(msg):
