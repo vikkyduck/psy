@@ -2,6 +2,7 @@
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -47,6 +48,16 @@ class SourceContext(unittest.IsolatedAsyncioTestCase):
 
     def input(self):
         return self.response.call_args.args[0][-1]["content"]
+
+    async def test_configuration_is_read_off_the_event_loop(self):
+        on_loop = []
+        def load_config():
+            on_loop.append(threading.current_thread() is threading.main_thread())
+            return {"model": {"provider": "openai-codex", "default": "fixture"}}
+        with patch.object(sys.modules["hermes_cli.config"], "load_config", load_config):
+            await route.group_message(self.msg("Простой вопрос"))
+        self.assertEqual(on_loop, [False])
+        self.response.assert_called_once()
 
     async def test_full_document_and_persistent_continuation_after_history_truncation(self):
         body = "Первый факт\n" + "ф"*220001 + "\nПоследний факт"

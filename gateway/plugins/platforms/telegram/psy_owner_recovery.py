@@ -8,6 +8,8 @@ import time
 from hermes_cli import psy_codex_incident as incident
 from hermes_cli import psy_codex_policy as policy
 
+from .psy_instance import BOT, OWNER
+
 ISSUER = "https://auth.openai.com"
 DEVICE_URL = ISSUER + "/codex/device"
 CALLBACK = "psy_codex:"
@@ -29,7 +31,6 @@ _filter = _PrivacyFilter()
 
 
 async def private_send(app, text, **kwargs):
-    from .psy_group_route import OWNER
     token = _private_io.set(True)
     try:
         return await app.bot.send_message(chat_id=OWNER, text=text, protect_content=True, **kwargs)
@@ -293,7 +294,7 @@ def start(app):
 
 
 async def handle(app, update):
-    from .psy_group_route import BOT, OWNER, scope
+    from .psy_group_route import scope
     query = getattr(update, "callback_query", None)
     data = getattr(query, "data", None)
     msg = getattr(update, "message", None)

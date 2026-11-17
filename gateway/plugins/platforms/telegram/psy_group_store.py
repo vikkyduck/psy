@@ -1,29 +1,33 @@
 """A member's group materials and conversations. No filename from a message is opened."""
 import contextlib
+import importlib
 import json
 import math
 import os
 import sqlite3
+import stat
+import threading
 import time
 from pathlib import Path
 
-ROOT = Path("/home/hermes/.hermes/vault/group-psy")
-MEMBER_LIMIT = 128 * 1024**2
-TOTAL_LIMIT = 512 * 1024**2
+
+def _hermes_home():
+    configured = os.environ.get("HERMES_HOME", "").strip()
+    return Path(os.path.expanduser(configured)) if configured else Path("/home/hermes/.hermes")
+
+
+ROOT = _hermes_home() / "vault" / "group-psy"
+# Members' files and answers have no quota. Only the physical disk is protected: keep this
+# much free for the system, the -wal file and recordings (the uploader keeps the same reserve).
+DISK_RESERVE = 768 * 1024**2
 MAX_LONG_JOBS = 2
 AUTH_WAITS = ("signin", "access_wait")
+# Several worker threads and the operator CLI share one file. A writer waits for the
+# lock instead of failing a job after a short contention spike.
+BUSY_SECONDS = 30
+SCHEMA_VERSION = 1
 
-
-@contextlib.contextmanager
-def database(root=ROOT):
-    root.mkdir(parents=True, mode=0o700, exist_ok=True)
-    database_path = root / "group.sqlite3"
-    fd = os.open(database_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    os.close(fd)
-    con = sqlite3.connect(database_path, timeout=5)
-    try:
-        con.execute("PRAGMA foreign_keys = ON")
-        con.executescript("""
+_SCHEMA = """
             CREATE TABLE IF NOT EXISTS instance_binding (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), bot INTEGER NOT NULL, chat INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS model_retries (
@@ -80,7 +84,58 @@ def database(root=ROOT):
             CREATE TABLE IF NOT EXISTS current_sources (
               uid INTEGER NOT NULL, topic INTEGER NOT NULL, doc_id INTEGER,
               PRIMARY KEY(uid,topic));
-        """)
+"""
+
+# Database files this process has already prepared, by path and file identity.
+_prepared = {}
+_prepare_lock = threading.Lock()
+
+
+def _connect(path):
+    con = sqlite3.connect(path, timeout=BUSY_SECONDS)
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def _prepare(root, path):
+    """Create the private file, switch it to WAL once and apply the schema version."""
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    con = _connect(path)
+    try:
+        # WAL is persistent in the file. Readers no longer block the writer that
+        # records a job's progress, and the -wal/-shm files inherit the 0600 mode.
+        if con.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            con.execute("PRAGMA journal_mode=WAL")
+        if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            con.executescript(_SCHEMA + f"PRAGMA user_version={SCHEMA_VERSION};")
+    finally:
+        con.close()
+    return info.st_dev, info.st_ino
+
+
+def _ready(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and _prepared.get(str(path)) == (info.st_dev, info.st_ino)
+
+
+@contextlib.contextmanager
+def database(root=ROOT):
+    database_path = root / "group.sqlite3"
+    if not _ready(database_path):
+        # A replaced or deleted file is prepared again, never followed through a symlink.
+        with _prepare_lock:
+            if not _ready(database_path):
+                _prepared[str(database_path)] = _prepare(root, database_path)
+    con = _connect(database_path)
+    try:
         yield con
         con.commit()
     finally:
@@ -92,6 +147,13 @@ def bind_instance(bot, chat, *, root=ROOT, adopt_legacy=False):
     if type(bot) is not int or bot <= 0 or type(chat) is not int or chat >= 0:
         raise ValueError("Invalid group vault identity")
     with database(root) as con:
+        # Every accepted update confirms the binding. It is written once and never changes,
+        # so only the first binding needs the write lock.
+        bound = con.execute("SELECT bot,chat FROM instance_binding WHERE singleton=1").fetchone()
+        if bound == (bot, chat):
+            return
+        if bound is not None:
+            raise RuntimeError("Group vault identity mismatch")
         con.execute("BEGIN IMMEDIATE")
         bound = con.execute("SELECT bot,chat FROM instance_binding WHERE singleton=1").fetchone()
         if bound == (bot, chat):
@@ -108,6 +170,19 @@ def bind_instance(bot, chat, *, root=ROOT, adopt_legacy=False):
 
 class ArchiveFull(ValueError):
     pass
+
+
+def _free_bytes(con):
+    # The filesystem that holds this database file, wherever its root is configured.
+    path = con.execute("PRAGMA database_list").fetchone()[2]
+    info = os.statvfs(os.path.dirname(path) or ".")
+    return info.f_bavail * info.f_frsize
+
+
+def _ensure_space(con, size):
+    # The new row is written to the -wal file first and later checkpointed into the database.
+    if _free_bytes(con) < DISK_RESERVE + 2 * size:
+        raise ArchiveFull("В хранилище недостаточно места для нового файла.")
 
 
 def _bind(con, uid, topic, message_id, doc_id, turn_id):
@@ -168,10 +243,7 @@ def archive(uid, topic, name, kind, data, *, message_id=None, root=ROOT, request
             if existing:
                 _record_write(con, request_key, topic, "document", existing[0])
                 return existing[0]
-        member, total = con.execute("""SELECT coalesce(sum(CASE WHEN uid=? THEN length(data)
-                      ELSE 0 END),0), coalesce(sum(length(data)),0) FROM documents""", (uid,)).fetchone()
-        if member + len(data) > MEMBER_LIMIT or total + len(data) > TOTAL_LIMIT:
-            raise ArchiveFull("В хранилище недостаточно места для нового файла.")
+        _ensure_space(con, len(data))
         cursor = con.execute("INSERT INTO documents(uid,topic,name,kind,data) VALUES (?,?,?,?,?)",
                              (uid, topic, name[:140], kind, data))
         doc_id = cursor.lastrowid
@@ -190,6 +262,32 @@ def document(uid, topic, ident, *, root=ROOT):
     with database(root) as con:
         return con.execute("SELECT name,kind,data FROM documents WHERE uid=? AND topic=? AND id=?",
                            (uid, topic, ident)).fetchone()
+
+
+def forget(uid, topic, ident, *, root=ROOT, request_key=None):
+    """Delete a member's own stored document in this topic. Return whether it existed."""
+    with database(root) as con:
+        # Overwrite the freed pages instead of leaving the file's bytes in the free list.
+        con.execute("PRAGMA secure_delete=ON")
+        con.execute("BEGIN IMMEDIATE")
+        if request_key is not None and _previous_write(con, request_key, uid, topic, "deletion") is not None:
+            return True
+        if con.execute("DELETE FROM documents WHERE uid=? AND topic=? AND id=?", (uid, topic, ident)).rowcount != 1:
+            return False
+        # A later file can reuse the row ID. No reply, selection or discussion may then point to
+        # it. The member's turns about the deleted file stay together under a negative marker.
+        for table in ("message_sources", "current_sources", "source_events"):
+            con.execute(f"UPDATE {table} SET doc_id=NULL WHERE uid=? AND topic=? AND doc_id=?", (uid, topic, ident))
+        con.execute("""UPDATE turn_sources SET doc_id=? WHERE doc_id=? AND turn_id IN
+                       (SELECT id FROM turns WHERE uid=? AND topic=?)""", (-ident, ident, uid, topic))
+        _record_write(con, request_key, topic, "deletion", ident)
+    try:
+        # Drop the deleted bytes from the -wal file too. A busy reader only postpones this.
+        with database(root) as con:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error:
+        pass
+    return True
 
 
 def set_current(uid, topic, doc_id, message_id, *, root=ROOT):
@@ -289,8 +387,31 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         return turn_id
 
 
+# Job outcomes shared by the route, the queue and the model pipelines. They live here because
+# every group module already imports the store, and the store imports none of them.
+class DeliveryUncertain(Exception):
+    """A Telegram send may have reached the group without a receipt. It is never repeated."""
+
+
 class GroupJobParked(Exception):
     """Durably queued to resume when a long-work slot becomes available."""
+
+
+class GroupJobFailed(Exception):
+    """An unexpected error was reported to the member. Keep the job for the operator."""
+
+
+def transient(exc):
+    """Storage, disk and network failures. The job's checkpoints remain valid for a retry."""
+    if isinstance(exc, (sqlite3.Error, OSError)):
+        return True
+    try:
+        errors = importlib.import_module("telegram.error")
+    except ImportError:
+        return False
+    retry, network, rejected = (getattr(errors, name, ()) for name in ("RetryAfter", "NetworkError", "BadRequest"))
+    # PTB derives BadRequest from NetworkError, but a rejected request does not heal by waiting.
+    return isinstance(exc, retry) or (isinstance(exc, network) and not isinstance(exc, rejected))
 
 
 class Checkpoints:
@@ -322,7 +443,18 @@ class Checkpoints:
             con.execute("""INSERT INTO checkpoints(request_id,key,value) VALUES(?,?,?)
                            ON CONFLICT(request_id,key) DO UPDATE SET value=excluded.value""",
                         (self.ident, key, encoded))
+            if key == ANSWER and value is not None:
+                # The final answer supersedes every model stage that produced it.
+                _drop_stages(con, self.ident)
             con.execute("INSERT OR REPLACE INTO job_progress VALUES(?,?,?)", (self.ident, time.time(), "checkpoint"))
+
+
+ANSWER = "route:answer:v1"
+_STAGES = "(key GLOB 'model:*' OR key GLOB 'prose:*')"
+
+
+def _drop_stages(con, ident):
+    con.execute(f"DELETE FROM checkpoints WHERE request_id=? AND {_STAGES}", (ident,))
 
 
 def _schedule_request(con, ident, payload):
@@ -354,10 +486,8 @@ def pending(uid, ident, payload, *, root=ROOT):
             return "existing"
         if con.execute("SELECT 1 FROM requests WHERE id=?", (ident,)).fetchone():
             return "existing"
-        count, own = con.execute("""SELECT count(*),coalesce(sum(uid=?),0)
-                                    FROM requests WHERE state IN ('queued','running','sending')""",(uid,)).fetchone()
-        if count>=12 or own>=4 or len(payload)>300000:
-            return "full"
+        # Every request is queued, however many a member or the group already has waiting.
+        # Concurrency is bounded only by the workers that claim them.
         con.execute("INSERT INTO requests(id,uid,body,state) VALUES(?,?,?,'queued')",(ident,uid,payload))
         _schedule_request(con, ident, payload)
         return "queued"
@@ -382,7 +512,7 @@ _CLAIMABLE = """(s.long_job=0 OR (SELECT count(*) FROM requests a JOIN schedule 
 def claim_next(*, root=ROOT, now=None):
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
-        # A pre-upgrade live queue has no schedule rows yet. At most 12 jobs can be admitted.
+        # A pre-upgrade live queue has no schedule rows yet.
         for ident, body in con.execute("""SELECT r.id,r.body FROM requests r LEFT JOIN schedule s
                                           ON s.request_id=r.id WHERE s.request_id IS NULL AND
                                           r.state IN ('queued','running','sending')""").fetchall():
@@ -423,6 +553,23 @@ def admit_long(ident, *, root=ROOT):
         return True
 
 
+def runnable(*, root=ROOT, now=None):
+    """Whether claim_next would start a queued request now. Read-only, for the periodic check."""
+    now = time.time() if now is None else now
+    with database(root) as con:
+        return con.execute(f"""SELECT 1 FROM requests r LEFT JOIN schedule s ON s.request_id=r.id
+              WHERE r.state='queued' AND (s.request_id IS NULL OR ({_CLAIMABLE}
+                AND NOT EXISTS (SELECT 1 FROM delivery_parts p WHERE p.request_id=r.id
+                                AND p.state='retry' AND p.retry_at>?)
+                AND NOT EXISTS (SELECT 1 FROM model_retries m WHERE m.request_id=r.id AND m.retry_at>?)))
+              LIMIT 1""", (MAX_LONG_JOBS, now, now)).fetchone() is not None
+
+
+def has_running(*, root=ROOT):
+    with database(root) as con:
+        return con.execute("SELECT 1 FROM requests WHERE state IN ('running','sending') LIMIT 1").fetchone() is not None
+
+
 def next_retry_delay(*, root=ROOT, now=None):
     now = time.time() if now is None else now
     with database(root) as con:
@@ -443,28 +590,46 @@ def owns_running_job(ident, uid, *, root=ROOT):
 
 
 def wait_for_model(ident, kind, reset=None, *, root=ROOT, now=None):
-    """Commit retry before any best-effort notice. A restart cannot lose chapters or repeat the notice."""
+    """Commit retry before any best-effort notice. A restart cannot lose chapters or repeat the notice.
+
+    kind is a model issue, or "infrastructure" after a storage or network failure."""
     now = time.time() if now is None else now
     with database(root) as con:
         con.execute("BEGIN IMMEDIATE")
         if not con.execute("SELECT 1 FROM requests WHERE id=? AND state='running'", (ident,)).fetchone():
             raise RuntimeError("Group request is not running")
-        row = con.execute("SELECT attempts FROM model_retries WHERE request_id=?", (ident,)).fetchone()
-        attempts = (row[0] if row else 0) + 1
-        delay = min(1800, (300 if kind in ("signin","quota") else 60) * 2 ** min(attempts-1, 5))
-        due = now + delay
-        if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
-            due = max(due, reset)
-        con.execute("UPDATE model_attempts SET wait_kind=? WHERE request_id=?", (kind, ident))
-        if kind in AUTH_WAITS:
-            recovered = con.execute("""SELECT 1 FROM model_attempts
-                                       WHERE request_id=? AND auth_revision <
-                                       (SELECT max(revision) FROM auth_recoveries)""", (ident,)).fetchone()
-            if recovered:
-                due = now
-        con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
-        con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
-        return row is None
+        return _retry_later(con, ident, kind, reset, now)
+
+
+def interrupt(ident, *, root=ROOT, now=None):
+    """Recover one job whose worker task ended unexpectedly, as a restart would, after a delay."""
+    now = time.time() if now is None else now
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        current = con.execute("SELECT state FROM requests WHERE id=?", (ident,)).fetchone()
+        if current == ("sending",):
+            con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
+        elif current == ("running",):
+            _retry_later(con, ident, "infrastructure", None, now)
+
+
+def _retry_later(con, ident, kind, reset, now):
+    row = con.execute("SELECT attempts FROM model_retries WHERE request_id=?", (ident,)).fetchone()
+    attempts = (row[0] if row else 0) + 1
+    delay = min(1800, (300 if kind in ("signin","quota") else 60) * 2 ** min(attempts-1, 5))
+    due = now + delay
+    if kind == "quota" and type(reset) in (int,float) and now < reset <= now + 32*86400:
+        due = max(due, reset)
+    con.execute("UPDATE model_attempts SET wait_kind=? WHERE request_id=?", (kind, ident))
+    if kind in AUTH_WAITS:
+        recovered = con.execute("""SELECT 1 FROM model_attempts
+                                   WHERE request_id=? AND auth_revision <
+                                   (SELECT max(revision) FROM auth_recoveries)""", (ident,)).fetchone()
+        if recovered:
+            due = now
+    con.execute("INSERT OR REPLACE INTO model_retries VALUES(?,?,?)", (ident, attempts, due))
+    con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+    return row is None
 
 
 def release_auth_waits(incident, *, root=ROOT):
@@ -537,12 +702,6 @@ def retry_delivery(ident, part, retry_at, *, root=ROOT, park=False):
         _finish_attempt(con, ident, part, "retry", None, retry_at, park=park)
 
 
-def outbound(ident, *, root=ROOT):
-    # Persist BEFORE non-idempotent Telegram delivery. An ambiguous send cannot be replayed safely.
-    with database(root) as con:
-        con.execute("UPDATE requests SET state='sending' WHERE id=? AND state='running'", (ident,))
-
-
 def settle(ident, success, *, root=ROOT):
     with database(root) as con:
         if success:
@@ -550,14 +709,74 @@ def settle(ident, success, *, root=ROOT):
                            SELECT id,? FROM requests WHERE id=?""", (time.time(), ident))
             con.execute("DELETE FROM requests WHERE id=?", (ident,))
         else:
-            con.execute("UPDATE requests SET state='uncertain',body='' WHERE id=?", (ident,))
+            # Keep the request text for an operator requeue, and the answer if there is one.
+            con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
+            if con.execute("SELECT 1 FROM checkpoints WHERE request_id=? AND key=?", (ident, ANSWER)).fetchone():
+                _drop_stages(con, ident)
+
+
+def fail(ident, *, root=ROOT):
+    """After an unexpected error was reported, keep the request and its checkpoints for the operator."""
+    with database(root) as con:
+        con.execute("UPDATE requests SET state='failed' WHERE id=? AND state IN ('running','sending')", (ident,))
 
 
 def recover(*, root=ROOT):
     with database(root) as con:
         con.execute("UPDATE requests SET state='queued' WHERE state='running'")
-        con.execute("UPDATE requests SET state='uncertain',body='' WHERE state='sending'")
+        con.execute("UPDATE requests SET state='uncertain' WHERE state='sending'")
         return con.execute("SELECT count(*) FROM requests WHERE state='queued'").fetchone()[0]
+
+
+# Operator view of jobs that need a decision. Metadata only: never message text or answers.
+def jobs(*, root=ROOT, include_all=False):
+    with database(root) as con:
+        return con.execute(f"""SELECT r.id,r.state,r.uid,coalesce(s.topic,0),length(r.body)>0,
+                 (SELECT count(*) FROM checkpoints c WHERE c.request_id=r.id),
+                 (SELECT coalesce(sum(length(c.value)),0) FROM checkpoints c WHERE c.request_id=r.id),
+                 EXISTS(SELECT 1 FROM checkpoints c WHERE c.request_id=r.id AND c.key=?),
+                 (SELECT count(*) FROM delivery_parts p WHERE p.request_id=r.id AND p.state='confirmed'),
+                 (SELECT count(*) FROM delivery_parts p WHERE p.request_id=r.id AND p.state!='confirmed'),
+                 m.attempts,m.retry_at,a.wait_kind,g.updated,g.stage
+               FROM requests r LEFT JOIN schedule s ON s.request_id=r.id
+               LEFT JOIN model_retries m ON m.request_id=r.id LEFT JOIN model_attempts a ON a.request_id=r.id
+               LEFT JOIN job_progress g ON g.request_id=r.id
+               WHERE ? OR r.state IN ('uncertain','failed') OR m.request_id IS NOT NULL
+               ORDER BY r.id""", (ANSWER, include_all)).fetchall()
+
+
+def resolve(ident, action, *, root=ROOT, now=None):
+    """Settle a job the gateway will not finish by itself. Running jobs are never touched.
+
+    delivered: the member has the answer; finish it like a completed job.
+    requeue: run it again from its checkpoints; an ambiguous part is sent again.
+    drop: abandon it without an answer, also when it waits for a retry."""
+    with database(root) as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT state,body FROM requests WHERE id=?", (ident,)).fetchone()
+        if row is None:
+            raise LookupError("No such group request")
+        current, body = row
+        allowed = {"delivered": ("uncertain", "failed"), "requeue": ("uncertain", "failed"),
+                   "drop": ("uncertain", "failed", "queued")}[action]
+        if current not in allowed:
+            raise ValueError(f"A {current} request cannot be marked {action}")
+        if action == "requeue":
+            if not body:
+                raise ValueError("The request text was not kept, so it cannot run again")
+            if current == "failed":
+                # Only the error notice was sent. Replace it with the real answer.
+                con.execute("DELETE FROM delivery_parts WHERE request_id=?", (ident,))
+                con.execute("DELETE FROM checkpoints WHERE request_id=? AND key='outbound.single_text'", (ident,))
+            else:
+                con.execute("DELETE FROM delivery_parts WHERE request_id=? AND state='sending'", (ident,))
+            con.execute("UPDATE model_retries SET retry_at=0 WHERE request_id=?", (ident,))
+            con.execute("UPDATE delivery_parts SET retry_at=0 WHERE request_id=? AND state='retry'", (ident,))
+            con.execute("UPDATE requests SET state='queued' WHERE id=?", (ident,))
+            return
+        con.execute("INSERT OR REPLACE INTO completed_updates(id,completed_at) VALUES(?,?)",
+                    (ident, time.time() if now is None else now))
+        con.execute("DELETE FROM requests WHERE id=?", (ident,))
 
 
 def lease(*, root=ROOT):

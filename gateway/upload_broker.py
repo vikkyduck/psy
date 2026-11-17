@@ -36,11 +36,9 @@ def issue(request, database=DATABASE):
     now, token = int(time.time()), secrets.token_urlsafe(32)
     with sqlite3.connect("file:" + database + "?mode=rw", uri=True, timeout=5) as c:
         c.execute("BEGIN IMMEDIATE")
+        # Expired sessions go first. A member may open any number of uploads; only the
+        # gateway's own UID reaches this socket and each grant lives five minutes.
         c.execute("DELETE FROM sessions WHERE expires<?", (now,))
-        n = c.execute("SELECT count(*) FROM sessions WHERE uid=? AND chat=? AND expires<?",
-                      (uid,GROUP,now+301)).fetchone()[0]
-        if n >= 24:
-            raise ValueError()
         grant = recording_grant.session(token,dict(uid=uid,chat=GROUP,thread=thread,reply=reply),now+300)
         c.execute("INSERT INTO sessions(hash,uid,chat,thread,reply,expires,proof) VALUES(:hash,:uid,:chat,:thread,:reply,:expires,:proof)",grant)
     return token
