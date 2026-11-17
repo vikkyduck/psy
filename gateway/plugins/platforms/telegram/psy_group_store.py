@@ -4,26 +4,28 @@ import json
 import math
 import os
 import sqlite3
+import stat
+import threading
 import time
 from pathlib import Path
 
-ROOT = Path("/home/hermes/.hermes/vault/group-psy")
+
+def _hermes_home():
+    configured = os.environ.get("HERMES_HOME", "").strip()
+    return Path(os.path.expanduser(configured)) if configured else Path("/home/hermes/.hermes")
+
+
+ROOT = _hermes_home() / "vault" / "group-psy"
 MEMBER_LIMIT = 128 * 1024**2
 TOTAL_LIMIT = 512 * 1024**2
 MAX_LONG_JOBS = 2
 AUTH_WAITS = ("signin", "access_wait")
+# Several worker threads and the operator CLI share one file. A writer waits for the
+# lock instead of failing a job after a short contention spike.
+BUSY_SECONDS = 30
+SCHEMA_VERSION = 1
 
-
-@contextlib.contextmanager
-def database(root=ROOT):
-    root.mkdir(parents=True, mode=0o700, exist_ok=True)
-    database_path = root / "group.sqlite3"
-    fd = os.open(database_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    os.close(fd)
-    con = sqlite3.connect(database_path, timeout=5)
-    try:
-        con.execute("PRAGMA foreign_keys = ON")
-        con.executescript("""
+_SCHEMA = """
             CREATE TABLE IF NOT EXISTS instance_binding (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), bot INTEGER NOT NULL, chat INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS model_retries (
@@ -80,7 +82,58 @@ def database(root=ROOT):
             CREATE TABLE IF NOT EXISTS current_sources (
               uid INTEGER NOT NULL, topic INTEGER NOT NULL, doc_id INTEGER,
               PRIMARY KEY(uid,topic));
-        """)
+"""
+
+# Database files this process has already prepared, by path and file identity.
+_prepared = {}
+_prepare_lock = threading.Lock()
+
+
+def _connect(path):
+    con = sqlite3.connect(path, timeout=BUSY_SECONDS)
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def _prepare(root, path):
+    """Create the private file, switch it to WAL once and apply the schema version."""
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+    finally:
+        os.close(fd)
+    con = _connect(path)
+    try:
+        # WAL is persistent in the file. Readers no longer block the writer that
+        # records a job's progress, and the -wal/-shm files inherit the 0600 mode.
+        if con.execute("PRAGMA journal_mode").fetchone()[0].lower() != "wal":
+            con.execute("PRAGMA journal_mode=WAL")
+        if con.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            con.executescript(_SCHEMA + f"PRAGMA user_version={SCHEMA_VERSION};")
+    finally:
+        con.close()
+    return info.st_dev, info.st_ino
+
+
+def _ready(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(info.st_mode) and _prepared.get(str(path)) == (info.st_dev, info.st_ino)
+
+
+@contextlib.contextmanager
+def database(root=ROOT):
+    database_path = root / "group.sqlite3"
+    if not _ready(database_path):
+        # A replaced or deleted file is prepared again, never followed through a symlink.
+        with _prepare_lock:
+            if not _ready(database_path):
+                _prepared[str(database_path)] = _prepare(root, database_path)
+    con = _connect(database_path)
+    try:
         yield con
         con.commit()
     finally:
@@ -92,6 +145,13 @@ def bind_instance(bot, chat, *, root=ROOT, adopt_legacy=False):
     if type(bot) is not int or bot <= 0 or type(chat) is not int or chat >= 0:
         raise ValueError("Invalid group vault identity")
     with database(root) as con:
+        # Every accepted update confirms the binding. It is written once and never changes,
+        # so only the first binding needs the write lock.
+        bound = con.execute("SELECT bot,chat FROM instance_binding WHERE singleton=1").fetchone()
+        if bound == (bot, chat):
+            return
+        if bound is not None:
+            raise RuntimeError("Group vault identity mismatch")
         con.execute("BEGIN IMMEDIATE")
         bound = con.execute("SELECT bot,chat FROM instance_binding WHERE singleton=1").fetchone()
         if bound == (bot, chat):
