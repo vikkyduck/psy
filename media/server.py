@@ -1,6 +1,7 @@
 """Authenticated streaming uploads. No polling consumer and no public file directory."""
 import asyncio
 import concurrent.futures
+import contextlib
 import functools
 import hashlib
 import json
@@ -31,6 +32,9 @@ TRANSCRIPT_PIECE = 64 * 1024
 # psy-member.socket accepts 24 connections (each one is a process). Further lookups wait
 # here for a free slot instead of being refused by systemd.
 BROKER_SLOTS = 16
+# /healthz is public: it connects to the broker socket (which starts a process) at most this often.
+HEALTH_TTL = 30
+_broker_answered = [float('-inf')]
 SECURITY_HEADERS = {
     'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
     'Content-Security-Policy': "default-src 'self'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'self' https://web.telegram.org https://*.telegram.org",
@@ -105,6 +109,7 @@ async def broker_exchange(payload):
             raise ValueError('invalid response')
     except (KeyError,OSError,ValueError,asyncio.TimeoutError):
         raise web.HTTPServiceUnavailable() from None
+    _broker_answered[0] = time.monotonic()
     if reply.get('status')==401:raise web.HTTPUnauthorized()
     if reply.get('status')==403:raise web.HTTPForbidden()
     if reply.get('status')!=200:raise web.HTTPServiceUnavailable()
@@ -587,12 +592,50 @@ async def asset(request):
     name=request.match_info['name']
     if name not in ('app.js','style.css'):raise web.HTTPNotFound()
     return web.FileResponse(ASSETS/name)
-async def health(request):return web.json_response({'ok':True})
+def state_database_opens():
+    """A new connection to the existing file (never creating one) that can read the job table."""
+    uri = (C.ROOT / 'state.sqlite3').resolve().as_uri() + '?mode=rw'
+    with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=3)) as conn:
+        conn.execute('SELECT 1 FROM jobs LIMIT 1').fetchall()
+    return True
+
+
+async def broker_reachable(app):
+    probe = app['broker_probe']
+    now = time.monotonic()
+    if now - _broker_answered[0] < HEALTH_TTL:
+        return True
+    if probe['until'] > now:
+        return probe['ok']
+    async with probe['lock']:
+        if probe['until'] > time.monotonic():
+            return probe['ok']
+        try:
+            async with asyncio.timeout(3):
+                _, writer = await asyncio.open_unix_connection(os.environ['PSY_ACCESS_SOCKET'])
+                writer.close()
+                await writer.wait_closed()
+            ok = True
+        except (OSError, KeyError, TimeoutError):
+            ok = False
+        probe.update(ok=ok, until=time.monotonic() + HEALTH_TTL)
+        return ok
+
+
+async def health(request):
+    """Unauthenticated and without details: the state database opens and the broker answers."""
+    try:
+        database = await asyncio.wait_for(blocking(state_database_opens), 5)
+    except Exception:
+        database = False
+    ok = database and await broker_reachable(request.app)
+    return web.json_response({'ok': ok}, status=200 if ok else 503)
 
 
 async def lifecycle(app):
     await blocking(C.initialize)
     app['members']={}
+    app['broker_probe']={'ok':False,'until':float('-inf'),'lock':asyncio.Lock()}
     yield
 
 

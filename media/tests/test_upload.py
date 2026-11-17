@@ -324,6 +324,39 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(C.plausible_init(raw,now-20),extra)
 
 
+    async def test_health_checks_database_and_broker_without_details(self):
+        connections=[]
+        async def count(reader,writer):
+            connections.append(1)
+            writer.close()
+        path=str(C.ROOT/'probe.sock')
+        sock=await asyncio.start_unix_server(count,path=path)
+        self.addAsyncCleanup(sock.wait_closed)
+        self.addCleanup(sock.close)
+        server._broker_answered[0]=float('-inf')
+        self.client.server.app['broker_probe']['until']=float('-inf')
+        with patch.dict(os.environ,{'PSY_ACCESS_SOCKET':path}):
+            for _ in range(5):
+                response=await self.client.get('/healthz')
+                self.assertEqual((response.status,await response.json()),(200,{'ok':True}))
+            # The public endpoint starts at most one broker process per interval.
+            self.assertEqual(len(connections),1)
+        self.client.server.app['broker_probe']['until']=float('-inf')
+        with patch.dict(os.environ,{'PSY_ACCESS_SOCKET':str(C.ROOT/'missing.sock')}):
+            response=await self.client.get('/healthz')
+            self.assertEqual((response.status,await response.json()),(503,{'ok':False}))
+            # A recent real broker answer counts as reachable without another probe.
+            server._broker_answered[0]=__import__('time').monotonic()
+            self.assertEqual((await self.client.get('/healthz')).status,200)
+        moved=C.ROOT/'state.moved'
+        (C.ROOT/'state.sqlite3').rename(moved)
+        try:
+            response=await self.client.get('/healthz')
+            self.assertEqual((response.status,await response.json()),(503,{'ok':False}))
+            self.assertFalse((C.ROOT/'state.sqlite3').exists())
+        finally:
+            moved.rename(C.ROOT/'state.sqlite3')
+
     async def test_transcript_streams_in_bounded_pieces(self):
         ident=(await (await self.new_job(1,b'x')).json())['id']
         with C.db() as c:
