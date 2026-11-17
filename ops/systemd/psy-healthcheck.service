@@ -4,15 +4,30 @@ After=network-online.target hermes-gateway.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/local/libexec/psy-healthcheck.py
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/psy-healthcheck.py
 TimeoutStartSec=150
 StateDirectory=psy-healthcheck
 StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/psy-healthcheck
+# Root to read the bot's log and credential and to reach its control socket below /home/hermes,
+# and to restart the gateway (systemd checks the caller for CAP_SYS_ADMIN). Nothing else.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_ADMIN
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-

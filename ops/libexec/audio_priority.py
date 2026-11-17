@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import subprocess
 import time
 
@@ -11,12 +12,30 @@ HOME=Path('/home/hermes/.hermes')
 STATE=Path('/var/lib/psy-audio-priority/state.json')
 BUILD='psy-telegram-build.service'
 
+def open_readonly(db):
+    """Root reads the uploads queue without ever creating files next to it. A WAL database that no
+    process holds open has no -wal/-shm, and a read-only open would try to create them (root-owned,
+    breaking the service accounts); it is fully checkpointed then, so read the file itself."""
+    fd=os.open(db,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC)
+    with os.fdopen(fd,'rb') as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):raise OSError('not a regular file')
+        header=f.read(100)
+    wal=len(header)>=20 and header[18]==2
+    if wal and not all(os.path.exists(str(db)+side) for side in ('-wal','-shm')):
+        return sqlite3.connect(db.as_uri()+'?mode=ro&immutable=1',uri=True,timeout=3)
+    return sqlite3.connect(db.as_uri()+'?mode=ro',uri=True,timeout=3)
+
 def audio_busy():
+    """True or False; None when the queue cannot be read (the caller then changes nothing)."""
     db=HOME/'vault/uploads/state.sqlite3'
     busy=False
     if db.exists():
-        with sqlite3.connect(db.as_uri()+'?mode=ro',uri=True,timeout=3) as c:
-            busy=bool(c.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('queued','processing','sending') OR (state='uploading' AND updated>?))",(int(time.time())-120,)).fetchone()[0])
+        try:
+            c=open_readonly(db)
+            try:busy=bool(c.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('queued','processing','sending') OR (state='uploading' AND updated>?))",(int(time.time())-120,)).fetchone()[0])
+            finally:c.close()
+        except (OSError,sqlite3.Error):
+            return None
     lock=HOME/'cache/scratch/audio-transcription.lock'
     if lock.exists():
         with lock.open('rb') as f:
@@ -49,7 +68,12 @@ def main():
     state=json.loads(STATE.read_text()) if STATE.exists() else {'managed_freeze':False,'idle_since':None}
     raw=subprocess.check_output(['systemctl','show',BUILD,'-p','ActiveState','-p','FreezerState'],text=True,timeout=5)
     props=dict(line.split('=',1) for line in raw.splitlines() if '=' in line)
-    state,action=decision(state,audio_busy(),props.get('ActiveState'),props.get('FreezerState'),int(time.time()))
+    busy=audio_busy()
+    if busy is None:
+        # Neither freeze nor thaw on a guess; the previous state and any pause stay as they are.
+        print('Audio priority check skipped: recording queue unreadable')
+        return
+    state,action=decision(state,busy,props.get('ActiveState'),props.get('FreezerState'),int(time.time()))
     if action:
         subprocess.run(['systemctl',action,BUILD],check=True,timeout=10)
         print('Optional Telegram build paused for audio processing' if action=='freeze' else 'Optional Telegram build resumed after audio processing')

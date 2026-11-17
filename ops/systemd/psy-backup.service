@@ -11,7 +11,23 @@ Nice=19
 IOSchedulingClass=idle
 CPUWeight=20
 MemoryMax=400M
-TimeoutStartSec=2h
+# Sunday runs offer every recording again, one at a time.
+TimeoutStartSec=6h
 UMask=0077
 PrivateTmp=true
 ProtectSystem=full
+# Reads everything as root and switches to the database owners with runuser (not setuid).
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

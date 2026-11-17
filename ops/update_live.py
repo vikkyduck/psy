@@ -49,17 +49,20 @@ UPLOAD_PYTHON = "/opt/psy-upload-venv/bin/python"
 DATABASES = (GROUP_DB, "/home/hermes/.hermes/vault/uploads/state.sqlite3",
              "/var/lib/psy-recording-receipts/results.sqlite3")
 
-# Kept in step with install-runtime.
+# Kept in step with install-runtime and install-backup; units come from ops/inventory.json.
 MEDIA = ("access_broker", "asr_client", "asr_sandbox", "asr_service", "psy_upload_common", "queue_health",
          "recording_grant", "recording_receipts", "server", "storage_capacity", "transcribe", "worker")
 HELPERS = {"psy_codex_auth.py": "psy-codex-auth.py", "psy_healthcheck.py": "psy-healthcheck.py",
            "psy_alerts.py": "psy-alerts.py", "psy_vault_archive.py": "psy-vault-archive.py",
-           "upload_healthcheck.py": "psy-upload-healthcheck.py", "deploy-cert": "psy-upload-deploy-cert"}
-ALERTED = ("hermes-gateway", "psy-healthcheck", "psy-upload-health", "psy-codex-auth", "psy-upload-cert-renew",
-           "psy-upload", "psy-upload-worker", "psy-asr")
+           "upload_healthcheck.py": "psy-upload-healthcheck.py", "psy_restart_outdated.py": "psy-restart-outdated.py",
+           "deploy-cert": "psy-upload-deploy-cert"}
+INVENTORY = json.loads((REPO / "ops/inventory.json").read_text())
+INSTALLED = {name: unit for name, unit in INVENTORY["units"].items() if unit["installer"] in ("runtime", "backup")}
 # Long-running services in restart order: the gateway last, once the upload side it calls is back.
-SERVICES = ("psy-asr", "psy-upload-worker", "psy-upload", "hermes-gateway")
+SERVICES = tuple(name.removesuffix(".service") for name in INVENTORY["restart_order"])
 GATEWAY_IMPORTS = {"psy_upload_common.py", "storage_capacity.py", "recording_grant.py"}  # via psy_upload_handoff
+NEEDRESTART = Path("/etc/needrestart/conf.d/50-psy.conf")
+BACKUP_LIB = Path("/usr/local/lib/psy-backup")
 
 
 @dataclass
@@ -108,18 +111,30 @@ def system_entries(hermes_uid):
                 Entry(GROUP_LIB / "manifest.json", (REPO / "gateway/group-manifest.json").read_bytes(), "gateway/group-manifest.json")]
     entries += [Entry(LIBEXEC / dst, (REPO / "ops/libexec" / src).read_bytes(), f"ops/libexec/{src}",
                       mode=0o755 if src == "deploy-cert" else 0o644) for src, dst in HELPERS.items()]
-    for unit in sorted((REPO / "ops/systemd").iterdir()):
-        # Like install-runtime: the optional audio-priority build and the backup, which ops/install-backup owns.
-        if unit.is_file() and not unit.name.startswith(("psy-audio-priority.", "psy-backup.")):
-            entries.append(Entry(SYSTEMD / unit.name, unit.read_bytes(), f"ops/systemd/{unit.name}"))
+    entries.append(Entry(NEEDRESTART, (REPO / "ops/needrestart/50-psy.conf").read_bytes(), "ops/needrestart/50-psy.conf"))
+    # Backup code, as ops/install-backup stages it; its keys, destination and timer state stay as they are.
+    entries += [Entry(Path("/usr/local/sbin/psy-backup"), (REPO / "ops/backup/psy-backup").read_bytes(),
+                      "ops/backup/psy-backup", mode=0o755),
+                Entry(BACKUP_LIB / "sqlite_snapshot.py", (REPO / "ops/backup/sqlite_snapshot.py").read_bytes(),
+                      "ops/backup/sqlite_snapshot.py"),
+                Entry(BACKUP_LIB / "verify_backup.py", (REPO / "tools/verify_backup.py").read_bytes(), "tools/verify_backup.py")]
+    names = list(INSTALLED) + [unit["timer"] for unit in INSTALLED.values() if unit.get("timer")]
+    entries += [Entry(SYSTEMD / name, (REPO / "ops/systemd" / name).read_bytes(), f"ops/systemd/{name}") for name in names]
     for conf in sorted((REPO / "ops/systemd/hermes-gateway.service.d").glob("*.conf")):
         entries.append(Entry(SYSTEMD / "hermes-gateway.service.d" / conf.name, conf.read_bytes(),
                              f"ops/systemd/hermes-gateway.service.d/{conf.name}"))
     entries.append(Entry(SYSTEMD / "hermes-gateway.service.d/user-session.conf",
                          f"[Unit]\nAfter=user@{hermes_uid}.service\nWants=user@{hermes_uid}.service\n".encode(), "generated"))
-    entries += [Entry(SYSTEMD / f"{unit}.service.d/owner-alert.conf", b"[Unit]\nOnFailure=psy-alerts.service\n", "generated")
-                for unit in ALERTED]
+    alert = f"[Unit]\nOnFailure={INVENTORY['on_failure']}\n".encode()
+    entries += [Entry(SYSTEMD / f"{name}.d/owner-alert.conf", alert, "generated")
+                for name, unit in INSTALLED.items() if unit.get("alert")]
     return entries
+
+
+def new_timers(targets):
+    """Timers this update installs for the first time; the release expects them running."""
+    return [t.name for t in targets if t.parent == SYSTEMD and t.suffix == ".timer"
+            and any(u.get("timer") == t.name and u["installer"] == "runtime" for u in INSTALLED.values())]
 
 
 def release_sums():
@@ -411,17 +426,14 @@ def units_for(target):
     if text.startswith(str(SYSTEMD) + "/"):
         name = Path(text).relative_to(SYSTEMD).parts[0].removesuffix(".d")
         unit = name.removesuffix(".service")
-        return {unit} if unit in SERVICES else ({name} if name.endswith(".socket") else set())
+        return {unit} if unit in SERVICES else ({name} if name.endswith((".socket", ".timer")) else set())
     return set()
 
 
 def check_instance():
     """Import the release's settings readers with this host's instance.env before anything changes."""
-    env = {"PATH": "/usr/bin:/bin"}
-    for line in INSTANCE.read_text().splitlines():
-        key, sep, value = line.partition("=")
-        if sep and not key.lstrip().startswith("#"):
-            env[key.strip()] = value.strip()
+    parser = load(REPO / "ops/instance_env.py", "psy_instance_env")
+    env = {"PATH": "/usr/bin:/bin", **parser.parse(INSTANCE.read_text(), complete=True)}
     probes = [("/usr/bin/python3", REPO / "gateway" / RELEASE.TELEGRAM, "import psy_instance"),
               ("/usr/bin/python3", REPO / "gateway", "import upload_broker"),
               (UPLOAD_PYTHON, REPO / "media", "import psy_upload_common")]
@@ -433,11 +445,22 @@ def check_instance():
                              + (result.stderr.strip().splitlines() or ["no output"])[-1])
 
 
+# Opened read-write as its owner: a read-only open of a WAL database fails while no other process
+# holds it, and only the owner may create its -shm file.
+def check_backup_config():
+    """psy-backup reads its destination from a file that ops/install-backup creates; a host whose
+    backup predates that file would fail its next nightly run after this update."""
+    enabled = not run("systemctl", "is-enabled", "--quiet", "psy-backup.timer", check=False).returncode
+    if enabled and read_plain("/etc/psy-backup/destination.env") is None:
+        raise ValueError("psy-backup.timer is enabled but /etc/psy-backup/destination.env is missing; "
+                         "set PSY_BACKUP_DEST there (see ops/backup/destination.env.example) first")
+
+
 GROUP_PROBE = """
 import sqlite3, sys
-db = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=5)
+db = sqlite3.connect(sys.argv[1], timeout=30)
 count = lambda where: db.execute("select count(*) from requests where " + where).fetchone()[0]
-print(count("state in ('queued', 'running')"), count("state = 'uncertain'"))
+print(count("state in ('queued', 'running', 'sending')"), count("state in ('uncertain', 'failed')"))
 """
 
 
@@ -448,7 +471,7 @@ def busy():
     if active:
         reasons.append(f"group queue has {active} request(s) in progress")
     if stuck:
-        print(f"note: {stuck} group request(s) are stuck in 'uncertain' (not blocking)")
+        print(f"note: {stuck} group request(s) wait for the operator in 'uncertain' or 'failed' (not blocking)")
     queue = (json.loads(UPLOAD_HEALTH.read_text()).get("queue") or {}) if UPLOAD_HEALTH.exists() else {}
     if queue.get("queued") or queue.get("processing"):
         reasons.append(f"recordings: {queue.get('queued')} queued, {queue.get('processing')} processing")
@@ -523,18 +546,14 @@ class Backup:
                 Path(target).unlink(missing_ok=True)  # unlink never follows a link
 
 
-SNAPSHOT = """
-import sqlite3, sys
-source = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=30)
-target = sqlite3.connect(sys.argv[2])
-source.backup(target, pages=256, sleep=0.05)
-target.close(); source.close()
-"""
-
-
 def snapshot_databases(backup):
-    """Copy each database as the account that owns it into a folder only that account can write."""
+    """Copy each database as the account that owns it into a folder only that account can write.
+
+    The release's own ops/backup/sqlite_snapshot.py does the copy (paced, WAL-aware), passed as code
+    because the database owners cannot read root's copy of the repository.
+    """
     import pwd
+    code = (REPO / "ops/backup/sqlite_snapshot.py").read_text()
     copies = []
     for number, path in enumerate(DATABASES):
         try:
@@ -548,11 +567,13 @@ def snapshot_databases(backup):
         folder = backup.root / f"db-{number}"
         folder.mkdir(mode=0o700)
         os.chown(folder, info.st_uid, info.st_gid)
-        result = run("/usr/bin/python3", "-I", "-c", SNAPSHOT, path, str(folder / Path(path).name), user=user, check=False)
+        source = Path(path)
+        result = run("/usr/bin/python3", "-I", "-c", code, str(source.parent), str(folder), str(source),
+                     user=user, check=False)
         if result.returncode:
             raise ValueError(f"could not copy {path} before the update: "
                              + (result.stderr.strip().splitlines() or ["no output"])[-1])
-        copies.append(str(folder / Path(path).name))
+        copies.append(str(folder / source.name))
     return copies
 
 
@@ -616,6 +637,8 @@ def commit_label():
 
 def roll_back_to(backup):
     """Put a backup's files back and restart what it touched; the names still not running."""
+    for timer in backup.index.get("enabled") or ():
+        run("systemctl", "disable", "--now", timer, check=False)
     backup.restore()
     if backup.index.get("reload"):
         run("systemctl", "daemon-reload", check=False)
@@ -643,6 +666,7 @@ def main():
         check_group_manifest(sums)
         entries = system_entries(pwd.getpwnam("hermes").pw_uid) + gateway_entries(sums)
         check_instance()
+        check_backup_config()
         todo = plan(entries)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
         sys.exit(f"refused: {exc}")
@@ -706,6 +730,15 @@ def main():
         check = run("/usr/bin/python3", "-I", str(GROUP_LIB / "preflight.py"), user="hermes", check=False)
         if check.returncode:
             roll_back("preflight: " + (check.stderr or check.stdout).strip())
+        # Enable new timers before the restarts: the per-minute alert check already runs the new
+        # code and would report a timer the release expects as disabled.
+        fresh = [t for t in new_timers([e.target for kind, e in todo if kind == "new"])
+                 if run("systemctl", "is-enabled", "--quiet", t, check=False).returncode]
+        backup.index["enabled"] = fresh
+        backup.note(units, reload_units)
+        for timer in fresh:
+            run("systemctl", "enable", "--now", timer)
+            print(f"  enabled {timer}")
         failed = restart(units)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         roll_back(str(exc))

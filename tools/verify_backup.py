@@ -9,14 +9,19 @@ import subprocess
 import tarfile
 import tempfile
 
+# Also the nightly "must be in the archive" list: ops/backup/psy-backup runs this verifier on every copy.
 REQUIRED = (
     'home/hermes/.hermes/config.yaml', 'home/hermes/.hermes/SOUL.md',
     'home/hermes/.hermes/.env', 'home/hermes/.hermes/auth.json',
-    'etc/psy-upload/recording-signing', 'db/state.db',
+    'etc/psy/instance.env', 'etc/psy-upload/recording-signing', 'db/state.db',
     'sysdb/var/lib/psy-recording-receipts/results.sqlite3', 'meta/media-manifest.tsv',
 )
 MAX_BYTES = 10 * 1024**3
 MAX_FILES = 100000
+
+
+class MissingState(ValueError):
+    """Names only the fixed public paths from REQUIRED, never archive content."""
 
 
 def relative_name(name):
@@ -46,20 +51,28 @@ def read_regular_members(stream, destination, *, max_bytes=MAX_BYTES):
     return count
 
 
-def inspect_tree(root):
-    if not all((root / name).is_file() for name in REQUIRED):
-        raise ValueError('Required recovery state is missing')
-    count = 0
+def inspect_tree(root, *, tolerate_sqlite_errors=False):
+    """Return (good SQLite snapshots, failed ones). Failures raise unless tolerated."""
+    missing = [name for name in REQUIRED if not (root / name).is_file()]
+    if missing:
+        raise MissingState('Required recovery state is missing: ' + ', '.join(missing))
+    count = failed = 0
     for base in ('db', 'sysdb'):
         for path in (root / base).rglob('*'):
             if path.is_file() and path.suffix in ('.db', '.sqlite', '.sqlite3'):
-                with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as database:
-                    if database.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
-                        raise ValueError('Invalid SQLite snapshot')
+                try:
+                    with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True) as database:
+                        if database.execute('PRAGMA integrity_check').fetchall() != [('ok',)]:
+                            raise ValueError('Invalid SQLite snapshot')
+                except (ValueError, sqlite3.Error):
+                    if not tolerate_sqlite_errors:
+                        raise
+                    failed += 1
+                    continue
                 count += 1
     if (root / 'etc/psy-upload/recording-signing').stat().st_size != 32:
         raise ValueError('Invalid recording signing state')
-    return count
+    return count, failed
 
 
 def retain_verified_tree(source, destination):
@@ -76,7 +89,7 @@ def retain_verified_tree(source, destination):
             shutil.rmtree(temporary)
 
 
-def verify(archive, passphrase, *, scratch_parent=None, stage=None):
+def verify(archive, passphrase, *, scratch_parent=None, stage=None, tolerate_sqlite_errors=False):
     os.umask(0o077)
     with tempfile.TemporaryDirectory(prefix='psy-backup-check-', dir=scratch_parent) as directory:
         root = Path(directory)
@@ -96,7 +109,7 @@ def verify(archive, passphrase, *, scratch_parent=None, stage=None):
                     pass
                 if zstd.wait(timeout=60) or gpg.wait(timeout=60):
                     raise ValueError('Decryption or decompression failed')
-                databases = inspect_tree(restored)
+                databases, failed = inspect_tree(restored, tolerate_sqlite_errors=tolerate_sqlite_errors)
                 if stage is not None:
                     retain_verified_tree(restored, stage)
             finally:
@@ -108,7 +121,8 @@ def verify(archive, passphrase, *, scratch_parent=None, stage=None):
                 subprocess.run(['gpgconf', '--homedir', str(private_home), '--kill', 'gpg-agent'],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
     return {'encrypted_archive_verified': True, 'regular_files': files,
-            'sqlite_snapshots_ok': databases, 'staged_regular_files': stage is not None,
+            'sqlite_snapshots_ok': databases, 'sqlite_snapshots_failed': failed,
+            'staged_regular_files': stage is not None,
             'services_started': 0, 'messages_sent': 0}
 
 
@@ -118,10 +132,15 @@ def main():
     parser.add_argument('--passphrase-file', type=Path, required=True)
     parser.add_argument('--scratch-parent', type=Path)
     parser.add_argument('--stage', type=Path, help='Keep verified regular files in a new private directory')
+    parser.add_argument('--tolerate-sqlite-errors', action='store_true',
+                        help='Count damaged SQLite snapshots instead of failing (the nightly run reports them itself)')
     args = parser.parse_args()
     try:
         result = verify(args.archive.resolve(strict=True), args.passphrase_file.resolve(strict=True),
-                        scratch_parent=args.scratch_parent, stage=args.stage)
+                        scratch_parent=args.scratch_parent, stage=args.stage,
+                        tolerate_sqlite_errors=args.tolerate_sqlite_errors)
+    except MissingState as error:
+        raise SystemExit('Backup verification failed: ' + str(error))
     except Exception as error:
         raise SystemExit('Backup verification failed: ' + type(error).__name__)
     print(json.dumps(result))

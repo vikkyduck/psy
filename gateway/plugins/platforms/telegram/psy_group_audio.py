@@ -21,8 +21,12 @@ def metadata(msg):
         media = getattr(msg,attr,None)
         if media:
             name = getattr(media,"file_name",None) or default
-            name = re.sub(r"[^\w .()-]","_",name.rsplit("/",1)[-1]).strip(". ")[:140]
+            name = re.sub(r"[^\w .()-]","_",name.rsplit("/",1)[-1]).strip(". ")
             if name and name.casefold().rsplit(".",1)[-1] in AUDIO_EXT:
+                if len(name) > 140:
+                    # Shorten the stem. The extension decides the route and the decoder.
+                    stem, ext = name.rsplit(".",1)
+                    name = stem[:139-len(ext)] + "." + ext
                 return media,name
     return None
 

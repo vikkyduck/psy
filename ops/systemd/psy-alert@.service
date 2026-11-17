@@ -1,0 +1,38 @@
+# OnFailure=psy-alert@%n.service on every watched unit: one instance per failing unit, so systemd
+# can pass that unit's result on (MONITOR_*) instead of logging an ambiguous trigger every run.
+[Unit]
+Description=PSY owner alert check after %i failed
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/psy/instance.env
+# The bot token from the root-only credential when it is staged; the placeholder means "use .env".
+LoadCredential=telegram:/etc/psy-upload/telegram
+SetCredential=telegram:absent
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/psy-alerts.py --triggered-by %i
+TimeoutStartSec=150
+StateDirectory=psy-alerts
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/psy-alerts
+# Root only to read the bot's state below /home/hermes; systemctl needs no capability.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

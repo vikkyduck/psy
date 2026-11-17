@@ -5,9 +5,8 @@ set -euo pipefail
 case "${1:-}" in ''|--new-profile) ;; *) exit 2 ;; esac
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)
 ops=$repo/ops
-for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
-    psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer psy-backup.timer; do
+units=$(python3 -I "$ops/inventory.py" idle)
+for unit in $units; do
     if systemctl is-active --quiet "$unit"; then
         echo "$unit active. Stage this restore on an idle host." >&2; exit 1
     fi
@@ -30,20 +29,29 @@ install -m 0644 "$ops/libexec/psy_healthcheck.py" /usr/local/libexec/psy-healthc
 install -m 0644 "$ops/libexec/psy_alerts.py" /usr/local/libexec/psy-alerts.py
 install -m 0644 "$ops/libexec/psy_vault_archive.py" /usr/local/libexec/psy-vault-archive.py
 install -m 0644 "$ops/libexec/upload_healthcheck.py" /usr/local/libexec/psy-upload-healthcheck.py
+install -m 0644 "$ops/libexec/psy_restart_outdated.py" /usr/local/libexec/psy-restart-outdated.py
+# needrestart leaves the bot alone; psy-restart-outdated.timer restarts it at night when idle.
+install -d -m 0755 /etc/needrestart/conf.d
+install -m 0644 "$ops/needrestart/50-psy.conf" /etc/needrestart/conf.d/50-psy.conf
 install -m 0755 "$ops/libexec/deploy-cert" /usr/local/libexec/psy-upload-deploy-cert
-# Audio priority only controlled an optional build. Its timer is disabled on the reference host.
-for file in "$ops/systemd/"*.service "$ops/systemd/"*.socket "$ops/systemd/"*.timer; do
-    case "$file" in */psy-audio-priority.*|*/psy-backup.*) continue ;; esac
-    install -m 0644 "$file" /etc/systemd/system/
+# Units from ops/inventory.json. Audio priority only controlled an optional build and is not
+# installed; the backup units come from install-backup below.
+files=$(python3 -I "$ops/inventory.py" unit-files runtime)
+for file in $files; do
+    install -m 0644 "$ops/systemd/$file" /etc/systemd/system/
 done
 install -d -m 0755 /etc/systemd/system/hermes-gateway.service.d
 install -m 0644 "$ops/systemd/hermes-gateway.service.d/"*.conf /etc/systemd/system/hermes-gateway.service.d/
 # Resolve the user@ unit from the new Linux UID. Reference host UID allocation is not portable.
 printf '[Unit]\nAfter=user@%s.service\nWants=user@%s.service\n' "$(id -u hermes)" "$(id -u hermes)" \
     > /etc/systemd/system/hermes-gateway.service.d/user-session.conf
-for unit in hermes-gateway psy-healthcheck psy-upload-health psy-codex-auth psy-upload-cert-renew psy-upload psy-upload-worker psy-asr; do
-    install -d -m 0755 "/etc/systemd/system/$unit.service.d"
-    printf '[Unit]\nOnFailure=psy-alerts.service\n' > "/etc/systemd/system/$unit.service.d/owner-alert.conf"
+# One alert instance per failing unit (psy-alert@<unit>.service): many units sharing one OnFailure=
+# target made systemd log an ambiguous trigger on every run of that target.
+on_failure=$(python3 -I "$ops/inventory.py" on-failure)
+alerted=$(python3 -I "$ops/inventory.py" alerted)
+for unit in $alerted; do
+    install -d -m 0755 "/etc/systemd/system/$unit.d"
+    printf '[Unit]\nOnFailure=%s\n' "$on_failure" > "/etc/systemd/system/$unit.d/owner-alert.conf"
 done
 h=/home/hermes/.hermes
 skill=$h/skills/media/audio-transcription
@@ -58,5 +66,7 @@ fi
 if ! runuser -u hermes -- test -e "$h/SOUL.md"; then
     runuser -u hermes -- sh -ec 'umask 077; set -C; cat > "$1"' sh "$h/SOUL.md" < "$repo/profile/SOUL.md"
 fi
+# Stage the backup code and units too (never enabled here), so every unit in the inventory exists.
+bash "$ops/install-backup"
 systemctl daemon-reload
 echo "Runtime staged. Units have not been started or enabled."

@@ -812,31 +812,10 @@ index 257b4314..2ace588a 100644
      """OpenAI Codex login: device code by default, browser PKCE when opted in (``--browser`` /
      ``auth.codex_login_flow``). Tokens stored in ~/.hermes/auth.json."""
 diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
-index 54b6eb8f..1e92cae3 100644
+index 54b6eb8f..179069c3 100644
 --- a/plugins/platforms/telegram/adapter.py
 +++ b/plugins/platforms/telegram/adapter.py
-@@ -6229,11 +6229,15 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
-         if not (0 < self._int_or_zero(file_size) <= getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)):
-             return "oversized", file_size
-         try:
--            file_obj = await source.get_file()
--            data = bytes(await file_obj.download_as_bytearray())
--            if not filename:
--                filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
--            cached = await cache_media_bytes_async(data, filename=filename, mime_type=mime, default_kind=kind)
-+            if self.config.extra.get("local_mode"):
-+                from plugins.platforms.telegram.psy_local_media import download_local_media
-+                cached = await download_local_media(source, filename=filename, mime_type=mime, default_kind=kind)
-+            else:
-+                file_obj = await source.get_file()
-+                data = bytes(await file_obj.download_as_bytearray())
-+                if not filename:
-+                    filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
-+                cached = await cache_media_bytes_async(data, filename=filename, mime_type=mime, default_kind=kind)
-         except Exception as exc:
-             logger.warning("[Telegram] Failed to cache %s: %s", what, _redact_telegram_error_text(exc), exc_info=True)
-             return "failed", None
-@@ -6482,6 +6486,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+@@ -6482,6 +6482,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
          msg = self._effective_update_message(update)
          if not msg or not msg.text:
              return
@@ -847,7 +826,7 @@ index 54b6eb8f..1e92cae3 100644
          if not self._should_process_message(msg, is_command=True):
              return
          if not self._is_user_authorized_from_message(msg):
-@@ -6660,18 +6668,28 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+@@ -6660,6 +6664,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
          try:
              allowed, note = self._telegram_media_size_allowed(source, label)
              if not allowed:
@@ -858,32 +837,7 @@ index 54b6eb8f..1e92cae3 100644
                  event.text = self._append_observed_note(event.text, note or "")
                  logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
                  await self.handle_message(event)
-                 return True
--            file_obj = await source.get_file()
--            data = await file_obj.download_as_bytearray()
--            if kind == "video":
--                ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
--                cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
--                mime = SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")
-+            if self.config.extra.get("local_mode"):
-+                from plugins.platforms.telegram.psy_local_media import download_local_media
-+                cached = await download_local_media(
-+                    source, filename=getattr(source, "file_name", None) or (kind + ext), mime_type=mime, default_kind=kind)
-+                cached_path, mime = cached.path, cached.media_type
-             else:
--                cached_path = await cache_audio_from_bytes_async(bytes(data), ext=ext)
-+                file_obj = await source.get_file()
-+                data = await file_obj.download_as_bytearray()
-+                if kind == "video":
-+                    ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
-+                    cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
-+                    mime = SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")
-+                else:
-+                    cached_path = await cache_audio_from_bytes_async(bytes(data), ext=ext)
-             event.media_urls = [cached_path]
-             event.media_types = [mime]
-             logger.info("[Telegram] Cached user %s at %s", kind, cached_path)
-@@ -6708,9 +6726,38 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
+@@ -6708,6 +6716,11 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
              display = original_filename or doc_mime or ext or 'unknown'
              # Size check before the image branch so image documents can't bypass the limit.
              if not doc.file_size or doc.file_size > self._max_doc_bytes:
@@ -895,33 +849,6 @@ index 54b6eb8f..1e92cae3 100644
                  logger.info("[Telegram] Document too large: %s bytes", doc.file_size)
                  return await self._dispatch_with_text(
                      event, f"The document is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
-+            if self.config.extra.get("local_mode"):
-+                from plugins.platforms.telegram.psy_local_media import download_local_media
-+                cached = await download_local_media(doc, filename=original_filename, mime_type=doc_mime)
-+                if cached is None:
-+                    return await self._dispatch_with_text(event, f"Document '{display}' could not be cached.")
-+                event.media_urls = [cached.path]
-+                event.media_types = [cached.media_type]
-+                event.media_text_inlined = [False]
-+                if cached.kind in self._CACHED_KIND_TO_MESSAGE_TYPE:
-+                    event.message_type = self._CACHED_KIND_TO_MESSAGE_TYPE[cached.kind]
-+                logger.info("[Telegram] Cached user %s on disk at %s", cached.kind, cached.path)
-+                if cached.kind == "image":
-+                    await self._route_photo_event(msg, event)
-+                    return True
-+                if (ext in _TEXT_INJECT_EXTENSIONS or doc_mime.startswith("text/")) and doc.file_size <= 100 * 1024:
-+                    try:
-+                        from pathlib import Path
-+                        text_content = await asyncio.to_thread(Path(cached.path).read_text, encoding="utf-8")
-+                        injection = f"[Content of {cached.display_name}]:\n{text_content}"
-+                        event.text = f"{injection}\n\n{event.text}" if event.text else injection
-+                        event.media_text_inlined = [True]
-+                    except UnicodeDecodeError:
-+                        pass
-+                return False
-             # Screenshots/photos sent as documents take the image cache + batching path.
-             if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                 file_obj = await doc.get_file()
 diff --git a/plugins/platforms/telegram/update_admission.py b/plugins/platforms/telegram/update_admission.py
 index 7b3a161c..9e61753c 100644
 --- a/plugins/platforms/telegram/update_admission.py

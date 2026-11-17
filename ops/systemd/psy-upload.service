@@ -27,9 +27,26 @@ BindPaths=/home/hermes/.hermes/vault/uploads:/srv/psy-queue /home/hermes/.hermes
 BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress
 ReadWritePaths=/srv/psy-queue /srv/psy-media
 PrivateTmp=true
+PrivateDevices=true
 CapabilityBoundingSet=
 RestrictSUIDSGID=true
 LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+# TLS listener and the broker socket only. aiohttp, OpenSSL and CPython need no executable
+# writable memory, no privileged or resource-control system calls.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryDenyWriteExecute=true
 MemoryMax=180M
 TasksMax=64
 [Install]

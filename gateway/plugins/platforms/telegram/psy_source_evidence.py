@@ -182,38 +182,60 @@ def norm(value):
 
 
 class EvidenceReader:
-    """One lookup budget and one short-lived cache per research job."""
+    """One short-lived cache per research job, bounded by the memory it retains.
+
+    Parallel stages share it. The lock guards only the cache: each page is fetched once,
+    without the lock, so one slow site never holds up checks against other pages."""
     def __init__(self):
         self.pages = {}
+        self.fetching = set()
         self.cache_bytes = 0
         self.lock = threading.Lock()
+        self.ready = threading.Condition(self.lock)
+
+    def _page(self, base):
+        with self.ready:
+            while base in self.fetching:
+                self.ready.wait()
+            if base in self.pages:
+                return self.pages[base]
+            self.fetching.add(base)
+            budget = CACHE_LIMIT - self.cache_bytes
+        page, size, done = None, 0, False
+        try:
+            try:
+                kind, blocks = passages(base)
+                if len(blocks) > MAX_BLOCKS:
+                    raise ValueError("source paragraph budget")
+                normalized = []
+                for block in blocks:
+                    value = norm(block)
+                    size += sys.getsizeof(value) + 16
+                    if size > budget:
+                        raise ValueError("source cache budget")
+                    normalized.append(value)
+                page = kind, normalized
+            except (OSError, ValueError, LookupError, http.client.HTTPException, subprocess.SubprocessError):
+                page, size = None, 0
+            done = True
+        finally:
+            with self.ready:
+                self.fetching.discard(base)
+                if done:
+                    # Another page may have been cached meanwhile. Keep the aggregate bound.
+                    if page is not None and self.cache_bytes + size > CACHE_LIMIT:
+                        page, size = None, 0
+                    self.pages[base] = page
+                    self.cache_bytes += size
+                self.ready.notify_all()
+        return page
 
     def locate(self, url, support, location, author, work):
         quote = norm(support)
         if not 12 <= len(quote) <= 600 or len(quote.split()) < 3:
             return None
         base = url.partition("#")[0]
-        with self.lock:
-            if base not in self.pages:
-                if len(self.pages) >= 16:
-                    return None
-                try:
-                    kind, blocks = passages(base)
-                    if len(blocks) > MAX_BLOCKS:
-                        raise ValueError("source paragraph budget")
-                    normalized = []
-                    size = 0
-                    for block in blocks:
-                        value = norm(block)
-                        size += sys.getsizeof(value) + 16
-                        if self.cache_bytes + size > CACHE_LIMIT:
-                            raise ValueError("source cache budget")
-                        normalized.append(value)
-                    self.pages[base] = kind, normalized
-                    self.cache_bytes += size
-                except (OSError, ValueError, LookupError, http.client.HTTPException, subprocess.SubprocessError):
-                    self.pages[base] = None
-            source = self.pages[base]
+        source = self._page(base)
         if not source:
             return None
         kind, blocks = source

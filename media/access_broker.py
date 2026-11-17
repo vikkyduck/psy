@@ -86,6 +86,9 @@ def dispatch(request,token,member_lookup=telegram_member):
         uid=request['uid']
         if type(uid) is not int or not 0<uid<2**52:
             return {'status':400}
+        if uid==C.OWNER:
+            # The owner keeps the group destination without being a group member.
+            return {'status':200,'member':True}
         try:
             return {'status':200,'member':bool(member_lookup(uid,token))}
         except Exception:

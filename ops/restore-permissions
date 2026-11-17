@@ -2,9 +2,9 @@
 # Rebuild named ownership and ACLs after regular-file recovery, only on an idle host.
 set -euo pipefail
 [[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
-for unit in hermes-gateway psy-upload psy-upload-worker psy-asr psy-member.socket psy-group-upload.socket \
-    psy-healthcheck.timer psy-upload-health.timer psy-codex-auth.timer psy-alerts.timer \
-    psy-vault-archive.timer psy-backup.timer psy-upload-cert-renew.timer; do
+ops=$(cd -- "$(dirname -- "$0")" && pwd)
+units=$(python3 -I "$ops/inventory.py" idle)
+for unit in $units; do
     state=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)
     case "$state" in active|activating|deactivating|reloading)
         echo "Recovery requires idle services and disabled timers" >&2; exit 1 ;;
@@ -35,13 +35,16 @@ for name in .env auth.json config.yaml SOUL.md state.db psy-codex-received.json;
     [[ ! -L $p ]]
     if [[ -f $p ]]; then chown hermes:hermes "$p"; chmod 0600 "$p"; fi
 done
+# Shared directories: the same policy prepare-host applies (ops/acl-policy.sh), plus the
+# recovered entries inside them.
+. "$ops/acl-policy.sh"
 q=$h/vault/uploads
 m=$h/media-vault/uploads
 [[ -d $q && -d $m ]]
-setfacl -R -m u:psy-upload:rwX,u:psy-deliver:rwX "$q"
-setfacl -m d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rwx,d:g::---,d:o::--- "$q"
-setfacl -R -m u:psy-upload:rwX,u:psy-deliver:rX,u:psy-asr:rX "$m"
-setfacl -m d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rx,d:u:psy-asr:rx,d:g::---,d:o::--- "$m"
+for shared in "$q:QUEUE" "$m:MEDIA"; do
+    psy_shared_acl_entries "${shared%:*}" "${shared##*:}"
+    psy_shared_acl "${shared%:*}" "${shared##*:}"
+done
 receipt=/var/lib/psy-recording-receipts
 [[ -d $receipt && ! -L $receipt ]]
 chown psy-deliver:psy-upload "$receipt"
@@ -57,8 +60,8 @@ if [[ -d /var/lib/psy-asr ]]; then
     find /var/lib/psy-asr -type f -exec chmod 0600 {} +
     progress=/var/lib/psy-asr/progress
     install -d -m 0750 -o psy-asr -g psy-deliver "$progress"
-    setfacl -R -m u:psy-upload:rX "$progress"
-    setfacl -m d:u:psy-upload:rx,d:g::rx,d:o::--- "$progress"
+    psy_shared_acl_entries "$progress" PROGRESS
+    psy_shared_acl "$progress" PROGRESS
 fi
 if [[ -f /etc/psy-upload/recording-signing ]]; then
     [[ ! -L /etc/psy-upload/recording-signing ]]

@@ -17,7 +17,8 @@ UPLOAD_START = re.compile(r"/start(?:@" + re.escape(BOT_USERNAME) + r")? upload_
 HELLO = ("В этой группе я отвечаю на сообщения, исследую публичные источники и разбираю записи. "
          "Ответьте на файл расшифровки, чтобы обсудить его. /audio открывает загрузку до 1 ГБ. "
          "/files показывает Ваши сохраненные в этой группе материалы. /get НОМЕР возвращает выбранный файл. "
-         "/read НОМЕР ВОПРОС открывает его для разбора. /research ВОПРОС запускает поиск по источникам. "
+         "/read НОМЕР ВОПРОС открывает его для разбора. /delete НОМЕР удаляет его из Ваших материалов. "
+         "/research ВОПРОС запускает поиск по источникам. "
          "/image ОПИСАНИЕ создает изображение через Codex.")
 MAX_TEXT = 8 * 1024**2
 MAX_IMAGE = 5 * 1024**2
@@ -217,6 +218,18 @@ async def group_message(msg):
         rows = await asyncio.to_thread(store.listing, uid, topic)
         await msg.reply_text("\n".join(f"{ident}. {name}" for ident,name in rows)[:4000] or "У Вас пока нет сохраненных материалов в этой теме.")
         return
+    if command == "/delete":
+        numeral = param.partition(" ")[0]
+        if not re.fullmatch("[1-9][0-9]{0,9}", numeral):
+            await msg.reply_text("Укажите номер из /files.")
+            return
+        # A replayed job finds its own receipt instead of reporting the file as missing.
+        receipt = getattr(msg, "ident", None)
+        deleted = await asyncio.to_thread(store.forget, uid, topic, int(numeral),
+                                          request_key=(receipt, "delete") if type(receipt) is int else None)
+        await msg.reply_text(f"Материал {numeral} удален из Ваших материалов." if deleted else
+                             "Материал с этим номером в Вашем кабинете не найден.")
+        return
     doc_id = None
     source = None
     if command in ("/get", "/read"):
@@ -248,11 +261,8 @@ async def group_message(msg):
         if source:
             doc_id = await archive_source(uid, topic, msg, source)
     if msg.document and not source:
-        ext = (msg.document.file_name or "").lower().rsplit(".",1)[-1]
-        if ext in ("m4a","mp3","wav","mp4","flac","ogg","mov","mkv","opus","aac","webm"):
-            await upload_button(msg)
-        else:
-            await msg.reply_text("Для разбора пришлите текст в TXT, Markdown, CSV или фотографию в JPEG, PNG, WebP.")
+        # Recordings never get here: audio.metadata routed every audio or video document above.
+        await msg.reply_text("Для разбора пришлите текст в TXT, Markdown, CSV или фотографию в JPEG, PNG, WebP.")
         return
     if quoted and not source:
         doc_id, source, quote, quoted_turn = await quoted_material(uid, topic, quoted)
@@ -262,7 +272,8 @@ async def group_message(msg):
         return
     question = param if command else text
     from hermes_cli.config import load_config
-    model = load_config()["model"]
+    # Hermes re-reads config.yaml when it changes. Keep that file I/O and YAML parsing off the loop.
+    model = (await asyncio.to_thread(load_config))["model"]
     if model["provider"] != "openai-codex":
         raise RuntimeError("wrong provider")
     if not source and not quoted:
@@ -341,8 +352,8 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             await asyncio.to_thread(store.archive, uid, topic, name, kind, data, **receipt(key))
         except store.ArchiveFull:
             # The durable answer and per-part receipts still carry the exact payload.
-            # The archive quota must not discard work that already finished.
-            log.info("group answer archive quota reached")
+            # A nearly full disk must not discard work that already finished.
+            log.info("group answer not archived: disk reserve reached")
 
     if text:
         if len(text) <= 4000:
@@ -392,7 +403,8 @@ async def process_group(msg):
     try:
         await group_message(msg)
         log.info("group action finished elapsed=%.1fs", time.monotonic() - start)
-    except store.GroupJobParked:
+    except (store.GroupJobParked, store.DeliveryUncertain):
+        # A timed-out Telegram send may already have reached the group.
         raise
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
@@ -402,9 +414,6 @@ async def process_group(msg):
             raise store.GroupJobParked()
         await error_reply(msg, exc.public())
     except Exception as exc:
-        # A timed-out Telegram send may already have reached the group.
-        if type(exc).__name__ == "DeliveryUncertain":
-            raise
         tb = exc.__traceback__
         while tb and tb.tb_next:
             tb = tb.tb_next
@@ -412,8 +421,17 @@ async def process_group(msg):
         fn = tb.tb_frame.f_code.co_name if tb else "unknown"
         log.warning("group request failed class=%s function=%s line=%d elapsed=%.1fs",
                     type(exc).__name__, fn, tb.tb_lineno if tb else 0, time.monotonic() - start)
+        queued = getattr(msg, "defer_failure", None)
+        if queued is not None and store.transient(exc):
+            # A locked or full database, a disk error or a dropped Telegram download says
+            # nothing about the request. Keep its checkpoints and run it again later.
+            await queued()
+            raise store.GroupJobParked() from None
         safe = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else None
         await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
+        if queued is not None and safe is None:
+            # The member was told. The operator can still requeue it from its checkpoints.
+            raise store.GroupJobFailed() from None
 
 
 UNLINKED_REPLY = ("В этой теме у Вас нет привязки этого сообщения к исходному материалу. "

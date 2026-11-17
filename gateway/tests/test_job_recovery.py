@@ -92,7 +92,12 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
               patch.object(model.codex_policy, "record_model_refusal") as refused,
               patch.object(model,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
             await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
-            self.assertEqual(counts, Counter({1:1,2:1,3:1}))
+            # Chapter 4 starts only after a sibling finished. Its sign-in failure halts the job:
+            # siblings already streaming finish and keep their checkpoints, siblings that have not
+            # reached the model yet wait for the resume. Which ones made it depends on thread timing.
+            self.assertNotIn(4, counts)
+            self.assertTrue(counts)
+            self.assertTrue(all(n == 1 for n in counts.values()))
             self.assertEqual(accepted, [])
             self.assertEqual(store.state(self.ident),"queued")
             refused.assert_called_once_with("fixture-generation")
@@ -289,7 +294,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.message.reply_text.assert_not_awaited()
         self.assertEqual(store.state(self.ident), "uncertain")
 
-    async def test_generated_manuscript_delivered_when_archive_is_full(self):
+    async def test_generated_manuscript_delivered_when_disk_reserve_is_reached(self):
         manuscript = "текст главы. " * 700
         sent = []
         async def document(*, document, **kwargs):
@@ -300,7 +305,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         cp = store.Checkpoints(self.ident)
         cp.put("route:input:v1", job)
         cp.put("route:answer:v1", {"text":manuscript, "images":[]})
-        with patch.object(store, "MEMBER_LIMIT", 10), patch.object(route, "respond") as provider:
+        with patch.object(store, "DISK_RESERVE", 1 << 62), patch.object(route, "respond") as provider:
             await queue.run_job(self.app, asyncio.Event(), *store.claim_next())
         provider.assert_not_called()
         self.assertEqual(sent, [manuscript.encode()])
