@@ -1,10 +1,10 @@
 [Unit]
-Description=Save PSY generated results and conversation text locally every minute
+Description=Save PSY generated results and conversation text locally every 10 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitInactiveSec=60s
-AccuracySec=5s
+OnUnitInactiveSec=10min
+AccuracySec=30s
 
 [Install]
 WantedBy=timers.target
