@@ -89,7 +89,7 @@ class ParallelHalt(unittest.TestCase):
 
     def test_rate_limited_search_stops_the_independent_central_reader(self):
         reads = 0
-        refused = threading.Event()
+        refused, reading = threading.Event(), threading.Event()
 
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
             nonlocal reads
@@ -97,10 +97,12 @@ class ParallelHalt(unittest.TestCase):
                 return model.Result('PSY_TASK {"minutes":60,"public_topic":"Freud"}', [], 0)
             if instructions == model.CENTRAL_READING:
                 reads += 1
+                reading.set()
                 self.assertTrue(refused.wait(3))
                 # An unfinished first pass would normally ask the reader for a second one.
                 return model.Result('{"scope":"partial","items":[],"gaps":["second pass needed"]}', [], 1)
             if instructions == model.WEB_SYSTEM:
+                self.assertTrue(reading.wait(3))
                 refused.set()
                 raise model.ModelIssue("busy", "http")
             self.fail("unexpected stage")
