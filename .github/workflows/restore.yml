@@ -47,6 +47,10 @@ jobs:
           sudo bash ops/install-runtime
           sudo bash ops/test-host
           sudo bash ops/tests/test_recovered_access.sh
+      - name: Rebuild permissions as after a restore and accept the host again
+        run: |
+          sudo bash ops/restore-permissions
+          sudo bash ops/test-host
       - name: Verify encrypted synthetic recovery and observer configuration
         run: python3 -m unittest discover -s tools -p "test_*.py" -v
   recognition:
