@@ -1,3 +1,5 @@
+# Started by psy-alerts.timer. Failing units start psy-alert@<unit>.service instead (OnFailure=),
+# so no unit is the failure target of many units at once.
 [Unit]
 Description=PSY independent owner alerts
 After=network-online.target
@@ -5,14 +7,32 @@ After=network-online.target
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/psy/instance.env
+# The bot token from the root-only credential when it is staged; the placeholder means "use .env".
+LoadCredential=telegram:/etc/psy-upload/telegram
+SetCredential=telegram:absent
 ExecStart=/usr/bin/python3 -I /usr/local/libexec/psy-alerts.py
-TimeoutStartSec=120
+TimeoutStartSec=150
 StateDirectory=psy-alerts
 StateDirectoryMode=0700
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=read-only
 ReadWritePaths=/var/lib/psy-alerts
+# Root only to read the bot's state below /home/hermes; systemctl needs no capability.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

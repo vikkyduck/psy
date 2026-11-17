@@ -41,9 +41,11 @@ install -m 0644 "$ops/systemd/hermes-gateway.service.d/"*.conf /etc/systemd/syst
 # Resolve the user@ unit from the new Linux UID. Reference host UID allocation is not portable.
 printf '[Unit]\nAfter=user@%s.service\nWants=user@%s.service\n' "$(id -u hermes)" "$(id -u hermes)" \
     > /etc/systemd/system/hermes-gateway.service.d/user-session.conf
-for unit in hermes-gateway psy-healthcheck psy-upload-health psy-codex-auth psy-upload-cert-renew psy-upload psy-upload-worker psy-asr; do
+# One alert instance per failing unit (psy-alert@<unit>.service): many units sharing one OnFailure=
+# target made systemd log an ambiguous trigger on every run of that target.
+for unit in hermes-gateway psy-healthcheck psy-upload-health psy-codex-auth psy-upload-cert-renew psy-upload psy-upload-worker psy-asr psy-vault-archive; do
     install -d -m 0755 "/etc/systemd/system/$unit.service.d"
-    printf '[Unit]\nOnFailure=psy-alerts.service\n' > "/etc/systemd/system/$unit.service.d/owner-alert.conf"
+    printf '[Unit]\nOnFailure=psy-alert@%%n.service\n' > "/etc/systemd/system/$unit.service.d/owner-alert.conf"
 done
 h=/home/hermes/.hermes
 skill=$h/skills/media/audio-transcription

@@ -11,8 +11,10 @@ import urllib.request
 
 HOME = pathlib.Path('/home/hermes/.hermes')
 STATE = pathlib.Path('/var/lib/psy-healthcheck/state.json')
+ALERTS = pathlib.Path('/var/lib/psy-alerts/state.json')
 STALL = 300
 COOLDOWN = 900
+ALERTS_STALE = 600   # psy-alerts runs every minute
 
 
 def control_status():
@@ -90,6 +92,30 @@ def assess(previous, now, pid, control_ok, connected, pending, ingress):
     return state, reason
 
 
+def alerts_watch(now, booted_for):
+    """The owner alerts must keep running. A stale state fails this check, and its OnFailure= starts
+    an immediate alert run that reports what stopped the regular one (for example a disabled timer)."""
+    try:
+        state = json.loads(ALERTS.read_text())
+    except (OSError, ValueError):
+        state = {}
+    age = now - float(state.get('checked_at', 0) or 0)
+    failures = state.get('delivery', {}).get('failures', 0)
+    if failures:
+        print(f'alerts: {failures} owner notice deliveries failed in a row ({state["delivery"].get("reason", "unknown")})')
+    if booted_for > ALERTS_STALE and age > ALERTS_STALE:
+        print(f'alerts: owner alert checks have not completed for {int(min(age, 10**9))} s')
+        return False
+    return True
+
+
+def uptime():
+    try:
+        return float(pathlib.Path('/proc/uptime').read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
 def self_test():
     state = {}
     for tick in (1000, 1060, 1120):
@@ -118,6 +144,13 @@ def main():
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    alerts_ok = alerts_watch(time.time(), uptime())
+    gateway(args)
+    if not alerts_ok:
+        raise SystemExit(1)
+
+
+def gateway(args):
     props = subprocess.check_output(['systemctl', 'show', 'hermes-gateway',
         '-p', 'MainPID', '-p', 'ActiveState', '-p', 'ActiveEnterTimestampMonotonic'], text=True)
     props = dict(line.split('=', 1) for line in props.splitlines() if '=' in line)

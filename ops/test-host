@@ -45,6 +45,13 @@ for account in psy-upload psy-deliver; do
         'test -w "$1"; test ! -r /home/hermes/.hermes' sh "$db"
 done
 as_user psy-upload psy-upload 'BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress' /usr/bin/test -r /srv/psy-progress
+# The owner alerts keep working inside their sandbox (few capabilities, read-only home): run the
+# installed check read-only with the unit's own [Service] settings. No message is sent.
+mapfile -t sandbox < <(sed -n '/^\[Service\]/,$p' /etc/systemd/system/psy-alerts.service | grep -E '^[A-Za-z]+=' \
+    | grep -v -E '^(Type|ExecStart|TimeoutStartSec)=')
+probe=$(systemd-run --quiet --wait --pipe --collect "${sandbox[@]/#/-p}" -- \
+    /usr/bin/python3 -I /usr/local/libexec/psy-alerts.py --check-only)
+[[ $probe == *alerts_check* && $probe != *probe:* ]] || { echo "Owner alerts cannot inspect units in their sandbox" >&2; exit 1; }
 if [[ -x /home/hermes/.hermes/hermes-agent/.hermes/bin/hermes && -x /opt/psy-upload-venv/bin/certbot && -x /opt/psy-asr-venv/bin/python ]] || [[ ${1:-} == --units ]]; then
     units=(/etc/systemd/system/{hermes-gateway.service,psy-*.timer,psy-*.service,psy-*.socket})
     systemd-analyze verify "${units[@]}"
