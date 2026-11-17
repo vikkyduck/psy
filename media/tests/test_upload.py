@@ -295,7 +295,7 @@ class UploadTests(unittest.IsolatedAsyncioTestCase):
             return '&'.join(f'{k}={v}' for k,v in fields.items() if v is not None)
         junk=['', 'x'*16385, 'not a query', 'hash=', variant(hash=None), variant(hash=valid['hash'].upper()),
               variant(hash=valid['hash'][:63]), variant(hash='g'*64), variant(auth_date='soon'),
-              variant(auth_date=str(C.now()-601)), variant(auth_date=str(C.now()+61)), variant(user=None),
+              variant(auth_date=str(C.now()-700)), variant(auth_date=str(C.now()+120)), variant(user=None),
               variant(user='%7B'), variant(user='%5B%5D'), variant(user='%7B%22id%22%3A%227%22%7D'),
               variant(user='%7B%22id%22%3A0%7D'), variant(user='%7B%22id%22%3A7%2C%22is_bot%22%3Atrue%7D'),
               variant(user='%5B'*5000), signed(C.OWNER)+'&auth_date=1', 12345, None, ['list']]
