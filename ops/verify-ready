@@ -7,6 +7,7 @@ repo=$(cd "$ops/.." && pwd)
 h=/home/hermes/.hermes
 checkout=$h/hermes-agent
 cd /
+python3 -I "$ops/instance_env.py" check --complete /etc/psy/instance.env
 bash "$ops/test-host" --units
 runuser -u hermes -- python3 -I /usr/local/lib/psy-group/preflight.py
 runuser -u hermes -- test -x "$checkout/.hermes/bin/hermes"
@@ -14,7 +15,8 @@ for path in "$h/.env" "$h/config.yaml" "$h/auth.json"; do
     [[ $(runuser -u hermes -- stat -Lc '%a %U' "$path") == '600 hermes' ]]
 done
 [[ $(stat -c '%a %U' /etc/psy-upload/telegram) == '600 root' ]]
-runuser -u hermes -- bash -ec 'set -a; . /etc/psy/instance.env; set +a; cd "$1"
+# The same values systemd passes, read by the one strict parser instead of bash.
+runuser -u hermes -- python3 -I "$ops/instance_env.py" exec /etc/psy/instance.env -- bash -ec 'cd "$1"
     /usr/bin/python3 -c "import hermes_bootstrap; import faster_whisper, telegram; import plugins.platforms.telegram.psy_instance"
     /usr/bin/python3 -c "import sys; sys.path.insert(0, \"/opt/psy-upload\"); import psy_upload_common"' bash "$checkout"
 runuser -u psy-asr -- /opt/psy-asr-venv/bin/python -I -c 'from faster_whisper import WhisperModel'
