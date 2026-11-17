@@ -16,8 +16,11 @@ install -m 0755 "$ops/backup/psy-backup" /usr/local/sbin/psy-backup
 # Read by the database owners (snapshots) and by root (the same verifier a restore uses).
 install -d -m 0755 /usr/local/lib/psy-backup
 install -m 0644 "$ops/backup/sqlite_snapshot.py" "$ops/../tools/verify_backup.py" /usr/local/lib/psy-backup/
-install -m 0644 "$ops/systemd/psy-backup.service" "$ops/systemd/psy-backup.timer" /etc/systemd/system/
+files=$(python3 -I "$ops/inventory.py" unit-files backup)
+for file in $files; do
+    install -m 0644 "$ops/systemd/$file" /etc/systemd/system/
+done
 install -d -m 0755 /etc/systemd/system/psy-backup.service.d
-printf '[Unit]\nOnFailure=psy-alert@%%n.service\n' > /etc/systemd/system/psy-backup.service.d/owner-alert.conf
+printf '[Unit]\nOnFailure=%s\n' "$(python3 -I "$ops/inventory.py" on-failure)" > /etc/systemd/system/psy-backup.service.d/owner-alert.conf
 systemctl daemon-reload
 echo "Backup staged, not started. Configure private credentials and verify one copy before enabling the timer."

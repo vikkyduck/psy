@@ -3,6 +3,7 @@
 set -euo pipefail
 [[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
 case "${1:-}" in ""|--units) ;; *) exit 2 ;; esac
+ops=$(cd -- "$(dirname -- "$0")" && pwd)
 cd /
 h=/home/hermes/.hermes
 p=$h/media-vault/uploads
@@ -22,9 +23,8 @@ cleanup() {
     as_user psy-deliver psy-deliver "BindPaths=$p:/srv/psy-media" /usr/bin/rm -f -- "$media.txt" || true
 }
 trap cleanup EXIT
-for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
-    psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer; do
+idle=$(python3 -I "$ops/inventory.py" idle)
+for unit in $idle; do
     [[ $(systemctl show "$unit" -p LoadState --value) == loaded ]]
     [[ $(systemctl show "$unit" -p ActiveState --value) == inactive ]]
     ! systemctl is-enabled --quiet "$unit" || { echo "$unit unexpectedly enabled" >&2; exit 1; }

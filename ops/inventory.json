@@ -1,0 +1,24 @@
+{
+  "comment": "The one list of PSY systemd units. Read by prepare-host, install-runtime, install-backup, test-host and restore-permissions through ops/inventory.py; psy_alerts.py and the tests in ops/tests/test_inventory.py are checked against it. kind: daemon (long-running, must be active), socket, socket-instance, check (oneshot started by its timer), alert-instance, optional (kept for history, not installed). installer: runtime (install-runtime), backup (install-backup), none. alert: gets the owner-alert OnFailure= drop-in. max_gap: longest normal time in seconds between two runs of the timer, checked by psy-alerts.",
+  "on_failure": "psy-alert@%n.service",
+  "restart_order": ["psy-asr.service", "psy-upload-worker.service", "psy-upload.service", "hermes-gateway.service"],
+  "units": {
+    "hermes-gateway.service": {"kind": "daemon", "installer": "runtime", "alert": true},
+    "psy-asr.service": {"kind": "daemon", "installer": "runtime", "alert": true},
+    "psy-upload-worker.service": {"kind": "daemon", "installer": "runtime", "alert": true},
+    "psy-upload.service": {"kind": "daemon", "installer": "runtime", "alert": true},
+    "psy-member.socket": {"kind": "socket", "installer": "runtime"},
+    "psy-group-upload.socket": {"kind": "socket", "installer": "runtime"},
+    "psy-member@.service": {"kind": "socket-instance", "installer": "runtime"},
+    "psy-group-upload@.service": {"kind": "socket-instance", "installer": "runtime"},
+    "psy-alerts.service": {"kind": "check", "installer": "runtime", "timer": "psy-alerts.timer", "max_gap": 600},
+    "psy-alert@.service": {"kind": "alert-instance", "installer": "runtime"},
+    "psy-healthcheck.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-healthcheck.timer", "max_gap": 600},
+    "psy-upload-health.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-upload-health.timer", "max_gap": 600},
+    "psy-vault-archive.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-vault-archive.timer", "max_gap": 3600},
+    "psy-codex-auth.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-codex-auth.timer", "max_gap": 10800},
+    "psy-upload-cert-renew.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-upload-cert-renew.timer", "max_gap": 50400},
+    "psy-backup.service": {"kind": "check", "installer": "backup", "alert": true, "timer": "psy-backup.timer", "max_gap": 97200},
+    "psy-audio-priority.service": {"kind": "optional", "installer": "none", "timer": "psy-audio-priority.timer"}
+  }
+}

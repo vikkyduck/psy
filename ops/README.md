@@ -6,7 +6,7 @@
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y acl ca-certificates curl ffmpeg git openssl python3-venv util-linux
+sudo apt-get install -y acl ca-certificates curl ffmpeg git gnupg openssh-client openssl python3-venv rsync util-linux zstd
 sudo bash ops/prepare-host
 ```
 
@@ -126,6 +126,7 @@ systemctl list-timers 'psy-*'
 - psy-vault-archive каждые 10 минут сохраняет сообщения и сгенерированные файлы в локальном vault. Файл с прежними размером и временем изменения повторно не читается. Сбой этой службы вызывает уведомление владельцу. Для переживания потери сервера нужна отдельная приватная копия данных.
 - psy-upload-cert-renew раз в 12 часов проверяет необходимость продления. На узле с общей службой ACME согласуйте выбранный способ продления для этого адреса.
 - Исходники psy-audio-priority сохранены для воспроизводимости истории конфигурации. Таймер контролировал факультативную сборку Telegram Bot API. На исходном узле он выключен, сборка отсутствует. install-runtime пропускает эти unit. Штатная очередь распознавания работает через psy-asr и psy-upload-worker.
+- Список unit, таймеров и подключений к уведомлениям владельцу хранится в одном файле ops/inventory.json. prepare-host, install-runtime, install-backup, test-host и restore-permissions читают его через ops/inventory.py, а тест ops/tests/test_inventory.py сверяет с ним проверки psy-alerts и файлы ops/systemd. Новую службу добавляют сначала в inventory.json. install-runtime также вызывает install-backup: код и unit-файлы копирования ставятся вместе с остальными, но таймер не включается.
 
 Проверки, которые требуют Telegram, перечислены в [инструкции восстановления](../docs/RESTORE.md). Они включают настройку кнопки, пробную загрузку и подтверждение результата в целевом чате.
 
