@@ -403,7 +403,8 @@ async def process_group(msg):
     try:
         await group_message(msg)
         log.info("group action finished elapsed=%.1fs", time.monotonic() - start)
-    except store.GroupJobParked:
+    except (store.GroupJobParked, store.DeliveryUncertain):
+        # A timed-out Telegram send may already have reached the group.
         raise
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
@@ -413,9 +414,6 @@ async def process_group(msg):
             raise store.GroupJobParked()
         await error_reply(msg, exc.public())
     except Exception as exc:
-        # A timed-out Telegram send may already have reached the group.
-        if type(exc).__name__ == "DeliveryUncertain":
-            raise
         tb = exc.__traceback__
         while tb and tb.tb_next:
             tb = tb.tb_next

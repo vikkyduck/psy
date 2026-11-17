@@ -10,7 +10,8 @@ import time
 from types import SimpleNamespace
 
 from telegram import Update
-from . import psy_group_store as store
+from . import psy_group_route as route, psy_group_store as store
+from .psy_instance import BOT, GROUP
 
 log = logging.getLogger("psy.group")
 MAX_ACTIVE_JOBS = 3
@@ -19,8 +20,7 @@ RETRY_START = 1
 RESTART_START = 1
 
 
-class DeliveryUncertain(Exception):
-    pass
+DeliveryUncertain = store.DeliveryUncertain
 
 
 async def committed_call(func, *args, **kwargs):
@@ -228,14 +228,12 @@ async def drain(app, wake):
 
 
 def group_sender(msg):
-    from .psy_group_route import GROUP
     return (msg is not None and msg.chat.id == GROUP and msg.chat.type in ("group", "supergroup")
             and msg.from_user is not None and not msg.from_user.is_bot
             and msg.sender_chat is None and msg.business_connection_id is None)
 
 
 async def ensure_vault(bot):
-    from .psy_group_route import BOT, GROUP
     if bot.id != BOT:
         raise RuntimeError("Connected bot identity mismatch")
     await committed_call(store.bind_instance, BOT, GROUP)
@@ -257,10 +255,8 @@ async def durable(app, func, *args, **kwargs):
 
 
 async def run_job(app, wake, ident, body):
-    from .psy_group_route import process_group
     try:
         update = Update.de_json(json.loads(body), app.bot)
-        from .psy_group_route import BOT
         if app.bot.id != BOT or not group_sender(update.message) or update.update_id != ident:
             raise ValueError("Stored group update is outside the configured scope")
         if not await asyncio.to_thread(store.owns_running_job, ident, update.message.from_user.id):
@@ -270,7 +266,7 @@ async def run_job(app, wake, ident, body):
         try:
             outbound = Outbound(update.message, ident, wake)
             if not await outbound.resume_saved_text():
-                await process_group(outbound)
+                await route.process_group(outbound)
         finally:
             finished.set()
             hint.cancel()

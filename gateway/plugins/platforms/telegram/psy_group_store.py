@@ -387,6 +387,12 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         return turn_id
 
 
+# Job outcomes shared by the route, the queue and the model pipelines. They live here because
+# every group module already imports the store, and the store imports none of them.
+class DeliveryUncertain(Exception):
+    """A Telegram send may have reached the group without a receipt. It is never repeated."""
+
+
 class GroupJobParked(Exception):
     """Durably queued to resume when a long-work slot becomes available."""
 
