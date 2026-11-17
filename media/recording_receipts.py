@@ -137,6 +137,18 @@ def start(ident, now, retry=None):
         return True
 
 
+def interrupted():
+    """Receipts left at the ambiguous send boundary."""
+    with db() as conn:
+        return [row[0] for row in conn.execute("SELECT id FROM results WHERE delivery='sending'")]
+
+
+def settle(ident):
+    """Telegram may or may not have received it: only an explicit confirmation sends again."""
+    with db(True) as conn:
+        conn.execute("UPDATE results SET delivery='unknown' WHERE id=? AND delivery='sending'", (ident,))
+
+
 def status(ident, state, msg=None, *, next_try=0, attempt=0):
     with db(True) as conn:
         conn.execute('UPDATE results SET delivery=?,message_id=?,next_try=?,attempts=? WHERE id=?',

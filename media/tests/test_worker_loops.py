@@ -146,5 +146,36 @@ class WorkerLoops(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(receipts.get(ident, body=True)['body'], text)
 
 
+    async def test_interrupted_send_is_settled_inside_the_loop_and_can_be_confirmed_again(self):
+        unknown = self.add('delivery_pending', queued=1)
+        claimed = self.add('delivery_pending', queued=2)
+        failed = self.add('delivery_pending', queued=3)
+        for ident in (unknown, claimed, failed):
+            receipts.save(self.row(ident), dict(duration=1, speech_detected=True), b'text ' + ident.encode())
+        with C.db() as db:
+            for ident in (unknown, claimed):
+                self.assertTrue(C.transition(db, ident, 'delivery_pending', 'sending'))
+            self.assertTrue(C.transition(db, failed, 'delivery_pending', 'done', delivery='failed'))
+        # A crash or exception after marking the receipt, without restarting the worker.
+        self.assertTrue(receipts.start(unknown, C.now()))
+        self.assertTrue(receipts.start(failed, C.now()))
+        with patch.object(worker, 'bot_call', self.sink):
+            self.assertTrue(await worker.delivery_step(None))
+        self.assertEqual((self.row(unknown)['state'], self.row(unknown)['delivery']), ('done', 'unknown'))
+        self.assertEqual(receipts.get(unknown)['delivery'], 'unknown')
+        self.assertEqual(receipts.get(failed)['delivery'], 'unknown')
+        # Nothing reached Telegram for the claimed one, so it was delivered normally.
+        self.assertEqual((self.row(claimed)['state'], self.row(claimed)['delivery']), ('done', 'sent'))
+        self.assertEqual([send['document'] for send in self.sends], [b'text ' + claimed.encode()])
+        # "Повторить отправку" with the duplicate confirmation works without a worker restart.
+        proof = grants.redelivery(self.session, self.row(unknown), True)
+        with C.db() as db:
+            db.execute("UPDATE jobs SET state='delivery_pending',delivery=NULL,retry_proof=? WHERE id=?",
+                       (json.dumps(proof), unknown))
+        with patch.object(worker, 'bot_call', self.sink):
+            self.assertTrue(await worker.delivery_step(None))
+        self.assertEqual((self.row(unknown)['state'], self.row(unknown)['delivery']), ('done', 'sent'))
+        self.assertEqual(len(self.sends), 2)
+
 if __name__ == '__main__':
     unittest.main()

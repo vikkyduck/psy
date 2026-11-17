@@ -271,7 +271,26 @@ async def transcription_loop(http):
         await supervise(http, job)
 
 
+def reconcile_sending():
+    """Settle sends interrupted without a final status. Called only between deliveries, when
+    nothing is in flight, because the receipt and the job are updated in two databases."""
+    with C.db() as c:
+        stuck = [dict(row) for row in c.execute("SELECT * FROM jobs WHERE state='sending'")]
+    for job in stuck:
+        record = receipts.get(job['id'])
+        if record is not None and record['delivery'] == 'ready':
+            # Claimed, but the receipt never reached the send boundary.
+            move(job, 'sending', 'delivery_pending', next_try=0)
+            continue
+        receipts.settle(job['id'])
+        final = 'unknown' if record is None or record['delivery'] == 'sending' else record['delivery']
+        finish(job, final, record['message_id'] if record else None)
+    for ident in receipts.interrupted():
+        receipts.settle(ident)
+
+
 async def delivery_step(http):
+    reconcile_sending()
     with C.db() as c:
         row = next_delivery(c)
     if row is None:
@@ -299,12 +318,10 @@ async def delivery_loop(http):
 async def main():
     C.initialize()
     receipts.initialize()
-    with receipts.db(True) as db:
-        db.execute("UPDATE results SET delivery='unknown' WHERE delivery='sending'")
     with C.db() as c:
         # This process is the only decoder client; its previous connection is gone.
         c.execute("UPDATE jobs SET state='queued' WHERE state='processing'")
-        c.execute("UPDATE jobs SET state='delivery_pending',next_try=0 WHERE state='sending'")
+    reconcile_sending()
     async with ClientSession(timeout=ClientTimeout(total=120)) as http:
         await asyncio.gather(transcription_loop(http), delivery_loop(http))
 
