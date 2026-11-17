@@ -29,6 +29,16 @@ class Tests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(abs(time.time()+300-data[5]),2)
             for invalid in ({**req,"chat":1},{**req,"uid":True},{**req,"thread":-7},{**req,"reply":"path"}):
                 with self.assertRaises(ValueError): broker.issue(invalid,path)
+    def test_broker_issues_every_session_a_member_asks_for(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=str(Path(tmp)/"s.sqlite")
+            with sqlite3.connect(path) as c:
+                c.execute("CREATE TABLE sessions(hash PRIMARY KEY, uid,chat,thread,reply,expires,proof)")
+            with patch.object(broker.recording_grant,"key",return_value=b"x"*32):
+                tokens={broker.issue({"uid":11,"thread":None,"reply":n},path) for n in range(1,41)}
+            self.assertEqual(len(tokens),40)
+            with sqlite3.connect(path) as c:
+                self.assertEqual(c.execute("SELECT count(*) FROM sessions WHERE uid=11").fetchone()[0],40)
     async def test_upload_resume_content_checked_and_final(self):
         data=b"abc"*590000
         accepted=[]
