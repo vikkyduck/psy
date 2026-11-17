@@ -53,13 +53,20 @@ class ResultBoundary(unittest.IsolatedAsyncioTestCase):
             await worker.run_job(None,self.job)
         self.assertEqual(self.sends,[])
 
+    def replay(self):
+        with C.db() as db:
+            db.execute("UPDATE jobs SET state='delivery_pending' WHERE id=?",(self.job['id'],))
+
     async def test_only_asr_result_to_verified_route_once_even_if_db_replayed(self):
         receipts.save(self.job,dict(duration=1,speech_detected=True),b'actual ASR')
         with patch.object(worker,'bot_call',self.sink):
             for forged in ({'chat':C.GROUP},{'uid':762},{'thread':4},{'reply':5}):
+                self.replay()
                 await worker.run_job(None,{**self.job,**forged})
             self.assertEqual(self.sends,[])
+            self.replay()
             await worker.run_job(None,{**self.job,'filename':'forged field'})
+            self.replay()
             await worker.run_job(None,self.job)
         self.assertEqual(len(self.sends),1)
         self.assertEqual(self.sends[0]['document'],b'actual ASR')

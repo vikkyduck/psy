@@ -73,10 +73,13 @@ class ReprocessTests(unittest.IsolatedAsyncioTestCase):
                                 reply.get("message_id"), payload["document"].file.read()))
         return web.json_response({"ok": True, "result": {"message_id": 100 + len(self.deliveries)}})
 
-    async def recognize(self, job, destination):
+    async def recognize(self, job, destination, saved=None):
         self.recognized.append(job["id"])
         destination.write_bytes(("fixture transcript " + job["id"]).encode())
-        return {"complete": True, "duration": 1.25, "speech_detected": True, "sha256":hashlib.sha256(self.audio).hexdigest()}
+        header = {"complete": True, "duration": 1.25, "speech_detected": True, "sha256":hashlib.sha256(self.audio).hexdigest()}
+        if saved is not None:
+            await saved(header)
+        return header
 
     async def login(self, uid, chat, thread=None, reply=None):
         body = {"initData": signed(uid)}
