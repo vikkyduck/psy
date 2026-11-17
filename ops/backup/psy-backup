@@ -99,6 +99,7 @@ fi
 SENT=$STATE/media-sent.txt
 touch "$SENT"
 RESEND=0; [ "$(date -u +%u)" = 7 ] && RESEND=1
+if [[ -n ${PSY_BACKUP_TEST_DEST:-} && ${PSY_BACKUP_TEST_RESEND:-} == 1 ]]; then RESEND=1; fi   # CI: the Sunday path
 printf 'sha256\tbytes\tpath\n' > "$WORK/snap/meta/media-manifest.tsv"
 : > "$WORK/media-todo"
 while IFS= read -r -d '' f; do
