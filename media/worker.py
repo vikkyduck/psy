@@ -362,7 +362,8 @@ async def main():
     receipts.initialize()
     with C.db() as c:
         # This process is the only decoder client; its previous connection is gone.
-        c.execute("UPDATE jobs SET state='queued' WHERE state='processing'")
+        for row in c.execute("SELECT id FROM jobs WHERE state='processing'").fetchall():
+            C.transition(c, row['id'], 'processing', 'queued')
     reconcile_sending()
     async with ClientSession(timeout=ClientTimeout(total=120)) as http:
         await asyncio.gather(transcription_loop(http), delivery_loop(http), purge_loop())

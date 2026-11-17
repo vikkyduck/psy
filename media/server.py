@@ -226,7 +226,7 @@ def expire_drafts(conn, busy):
     for draft in stale:
         if draft['id'] in busy:continue
         C.file_path(draft).unlink(missing_ok=True)
-        conn.execute("UPDATE jobs SET state='cancelled',updated=? WHERE id=?",(C.now(),draft['id']))
+        C.transition(conn, draft['id'], 'uploading', 'cancelled')
 
 
 def storage_status(conn):
@@ -324,7 +324,7 @@ def seal_chunk(f, j, offset, received):
         if actual!=j['fingerprint']:
             raise ValueError('Wrong recording')
     with C.db() as c:
-        c.execute('UPDATE jobs SET offset=?,updated=? WHERE id=?',(offset+received,C.now(),j['id']))
+        c.execute("UPDATE jobs SET offset=?,updated=? WHERE id=? AND state='uploading'",(offset+received,C.now(),j['id']))
 
 
 def rewind(path, offset):
@@ -373,9 +373,9 @@ async def append(request):
         return web.json_response({'offset':offset+received})
 
 
-def set_state(ident, sql, *args):
+def move(ident, before, after, **fields):
     with C.db() as c:
-        c.execute(sql, (*args, ident))
+        return C.transition(c, ident, before, after, **fields)
 
 
 async def complete(request):
@@ -393,11 +393,10 @@ async def complete(request):
             return failure(426,'Откройте обновленную мини-апку и выберите исходный файл заново.')
         sha, actual = await asyncio.to_thread(C.file_hashes, C.file_path(j))
         if actual != j['content_id']:
-            await blocking(set_state, ident, "UPDATE jobs SET state='cancelled',updated=? WHERE id=?", C.now())
+            await blocking(move, ident, 'uploading', 'cancelled')
             await blocking(C.file_path(j).unlink, missing_ok=True)
             return failure(422,'Контрольная сумма файла не совпала. Выберите исходную запись заново.')
-        await blocking(set_state, ident, "UPDATE jobs SET state='queued',sha256=?,updated=?,queued_at_ns=? WHERE id=?",
-                       sha, C.now(), time.time_ns())
+        await blocking(move, ident, 'uploading', 'queued', sha256=sha, queued_at_ns=time.time_ns())
     return web.json_response({'state':'queued'})
 
 
@@ -445,9 +444,8 @@ def retry_job(ident, s, generation, busy):
             ('uploading','queued','processing','delivery_pending','sending') LIMIT 1""",
             tuple(j[k] for k in ('uid','chat','thread','reply','filename','size','language','content_id'))).fetchone()
         if duplicate:return failure(409,'Эта запись уже поставлена в очередь.')
-        c.execute("""UPDATE jobs SET state='queued',error=NULL,attempts=0,next_try=0,
-                  retry_generation=retry_generation+1,updated=?,queued_at_ns=? WHERE id=?""",
-                  (C.now(),time.time_ns(),ident))
+        C.transition(c, ident, 'failed', 'queued', error=None, attempts=0, next_try=0,
+                     retry_generation=j['retry_generation']+1, queued_at_ns=time.time_ns())
     return web.json_response({'state':'queued'})
 
 
@@ -544,8 +542,8 @@ async def redeliver(request):
             return failure(409,'Сначала проверьте, был ли файл доставлен.')
         origin,_ = await blocking(authorized_result,job,s)
         retry = (await bound_request(request,s,'redeliver',job=origin,confirmed=confirmed))['retry']
-        await blocking(set_state, ident, """UPDATE jobs SET state='delivery_pending',delivery=NULL,attempts=0,
-                    next_try=0,updated=?,retry_proof=? WHERE id=? AND state='done'""", C.now(), json.dumps(retry))
+        await blocking(move, ident, 'done', 'delivery_pending', delivery=None, attempts=0, next_try=0,
+                       retry_proof=json.dumps(retry))
     return web.json_response({'state':'delivery_pending'})
 
 
@@ -555,7 +553,7 @@ async def cancel(request):
     async with locks.setdefault(ident,asyncio.Lock()):
         j=await blocking(owned_job,ident,s)
         if j['state']!='uploading':raise web.HTTPConflict()
-        await blocking(set_state, ident, "UPDATE jobs SET state='cancelled',updated=? WHERE id=?", C.now())
+        await blocking(move, ident, 'uploading', 'cancelled')
         await blocking(C.file_path(j).unlink, missing_ok=True)
     return web.json_response({'state':'cancelled'})
 
