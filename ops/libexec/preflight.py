@@ -5,16 +5,16 @@ import sys
 from pathlib import Path
 
 DEPLOY = Path("/usr/local/lib/psy-group")
-PLATFORM = Path("/home/hermes/.hermes/hermes-agent/plugins/platforms/telegram")
-NATIVE = {
-    "agent/auxiliary_client.py", "agent/credential_pool.py",
-    "hermes_cli/auth.py", "hermes_cli/auth_codex.py", "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_codex_incident.py",
-}
-EXPECTED = NATIVE | {
-    "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py",
-    "psy_source_evidence.py", "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py",
-    "psy_group_queue.py", "psy_owner_recovery.py", "psy_local_media.py", "psy_upload_handoff.py",
-    "psy_group_admin.py",
+CHECKOUT = Path("/home/hermes/.hermes/hermes-agent")
+PLATFORM = "plugins/platforms/telegram/"
+# The release inventory of gateway/apply.py (TRACKED + ADDED). A gateway test keeps them equal.
+EXPECTED = {
+    "agent/auxiliary_client.py", "agent/credential_pool.py", "hermes_cli/auth.py", "hermes_cli/auth_codex.py",
+    "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_codex_policy.py", "tools/transcription_tools.py",
+    *(PLATFORM + name for name in (
+        "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py", "psy_source_evidence.py",
+        "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py", "psy_group_queue.py",
+        "psy_owner_recovery.py", "psy_local_media.py", "psy_upload_handoff.py", "psy_group_admin.py")),
 }
 
 def verify():
@@ -22,10 +22,9 @@ def verify():
     if set(manifest) != EXPECTED:
         raise ValueError()
     for name in EXPECTED:
-        path = PLATFORM.parents[2]/name if name in NATIVE else PLATFORM/name
-        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest[name]:
+        if hashlib.sha256((CHECKOUT/name).read_bytes()).hexdigest() != manifest[name]:
             raise ValueError()
-    source = (PLATFORM/"adapter.py").read_text()
+    source = (CHECKOUT/PLATFORM/"adapter.py").read_text()
     flow = ('builder.application_class(TelegramApplication, {"adapter": self})',
             'from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor')
     if not all(item in source for item in flow):

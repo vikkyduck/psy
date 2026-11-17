@@ -1,4 +1,7 @@
-"""Apply or verify the reviewed PSY gateway release at the pinned Hermes commit."""
+"""Apply or verify the reviewed PSY gateway release at the pinned Hermes commit.
+
+TRACKED and ADDED are the single release inventory. `release` regenerates manifest.json and
+group-manifest.json (checked before every gateway start by ops/libexec/preflight.py) from it."""
 import argparse
 import hashlib
 import json
@@ -33,6 +36,40 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def source(relative):
+    return HERE.parent/"media/telegram_handoff.py" if relative == HANDOFF else HERE/relative
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def inventory(repo):
+    """Hash the patched tracked files and the added sources without touching the checkout."""
+    repo = repo.resolve(strict=True)
+    patch = HERE/"hermes.patch"
+    sums = {}
+    with tempfile.TemporaryDirectory() as folder:
+        tree = Path(folder)
+        git(tree, "init", "-q")
+        for relative in TRACKED:
+            (tree/relative).parent.mkdir(parents=True, exist_ok=True)
+            (tree/relative).write_bytes(git(repo, "show", BASE + ":" + relative))
+        git(tree, "apply", str(patch))
+        for relative in TRACKED:
+            sums[relative] = digest((tree/relative).read_bytes())
+    for relative in ADDED:
+        sums[relative] = digest(source(relative).read_bytes())
+    return {"base": BASE, "patch_sha256": digest(patch.read_bytes()), "sha256": sums}
+
+
+def release(repo):
+    manifest = inventory(repo)
+    write_json(HERE/"manifest.json", manifest)
+    # The boundary check before service start covers the same files, by checkout-relative path.
+    write_json(HERE/"group-manifest.json", manifest["sha256"])
+
+
 def run(repo, apply):
     repo = repo.resolve(strict=True)
     if (Path(git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve() != repo
@@ -57,8 +94,7 @@ def run(repo, apply):
         expected = sums[relative]
         current = digest(path.read_bytes()) if path.exists() else None
         if relative in ADDED:
-            source = HERE.parent/"media/telegram_handoff.py" if relative == HANDOFF else HERE/relative
-            content = source.read_bytes()
+            content = source(relative).read_bytes()
             if digest(content) != expected:
                 raise ValueError(f"Release source integrity mismatch: {relative}")
             if current is None:
@@ -92,11 +128,14 @@ def run(repo, apply):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["apply", "verify"])
+    parser.add_argument("action", choices=["apply", "verify", "release"])
     parser.add_argument("checkout", type=Path)
     opts = parser.parse_args()
     try:
-        run(opts.checkout, opts.action == "apply")
+        if opts.action == "release":
+            release(opts.checkout)
+        else:
+            run(opts.checkout, opts.action == "apply")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         parser.exit(1, str(exc) + "\n")
     print(f"PSY gateway {opts.action} OK")
