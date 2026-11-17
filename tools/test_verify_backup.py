@@ -10,7 +10,7 @@ import tarfile
 from tempfile import TemporaryDirectory
 import unittest
 
-from verify_backup import REQUIRED, read_regular_members, inspect_tree, verify
+from verify_backup import REQUIRED, MissingState, read_regular_members, inspect_tree, verify
 
 
 class BackupTests(unittest.TestCase):
@@ -63,13 +63,19 @@ class BackupTests(unittest.TestCase):
             root = Path(tmp)
             with self.assertRaises(ValueError):
                 read_regular_members(self.archive([('large',tarfile.REGTYPE,b'12345')]),root,max_bytes=4)
-            with self.assertRaises(ValueError):
+            with self.assertRaises(MissingState) as missing:
                 inspect_tree(root)
+            self.assertIn('etc/psy/instance.env', str(missing.exception))
             self.make_tree(root)
-            self.assertEqual(inspect_tree(root),2)
+            self.assertEqual(inspect_tree(root),(2,0))
             (root/'db/state.db').write_bytes(b'not a database')
             with self.assertRaises(sqlite3.DatabaseError):
                 inspect_tree(root)
+            # The nightly run counts a damaged snapshot (and fails later) instead of blocking the upload.
+            self.assertEqual(inspect_tree(root, tolerate_sqlite_errors=True),(1,1))
+            (root/'home/hermes/.hermes/auth.json').unlink()
+            with self.assertRaises(MissingState):
+                inspect_tree(root, tolerate_sqlite_errors=True)
 
     @unittest.skipUnless(shutil.which('gpg') and shutil.which('zstd'), 'gpg and zstd are required')
     def test_real_encrypted_roundtrip_and_wrong_passphrase(self):

@@ -4,14 +4,13 @@ set -euo pipefail
 [[ $EUID == 0 && $(uname -s) == Linux ]] || { echo "Use root on Linux" >&2; exit 1; }
 command -v setfacl >/dev/null
 command -v systemctl >/dev/null
-for unit in hermes-gateway.service psy-upload.service psy-upload-worker.service psy-asr.service \
-    psy-member.socket psy-group-upload.socket psy-healthcheck.timer psy-codex-auth.timer \
-    psy-upload-cert-renew.timer psy-upload-health.timer psy-vault-archive.timer psy-alerts.timer psy-backup.timer; do
+base=$(cd -- "$(dirname -- "$0")" && pwd)
+units=$(python3 -I "$base/inventory.py" idle)
+for unit in $units; do
     if systemctl is-active --quiet "$unit"; then
         echo "$unit active. Use an idle recovery host." >&2; exit 1
     fi
 done
-base=$(cd -- "$(dirname -- "$0")" && pwd)
 umask 077
 cd /
 if ! id -u hermes >/dev/null 2>&1; then
@@ -30,11 +29,13 @@ done
 h=/home/hermes/.hermes
 runuser -u hermes -- mkdir -p -m 0700 "$h" "$h/tools" "$h/vault" "$h/media-vault" "$h/media-vault/uploads" \
     "$h/vault/uploads" "$h/vault/materials" "$h/vault/projects" "$h/vault/generated" "$h/vault/conversations"
-runuser -u hermes -- setfacl -m u:psy-upload:rwx,u:psy-deliver:rwx,d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rwx,d:g::---,d:o::--- "$h/vault/uploads"
+# Shared directories: the same policy restore-permissions applies (ops/acl-policy.sh).
+. "$base/acl-policy.sh"
+psy_shared_acl "$h/vault/uploads" QUEUE runuser -u hermes --
+psy_shared_acl "$h/media-vault/uploads" MEDIA runuser -u hermes --
 # Precreate the shared SQLite inode before the app opens it. Existing content is preserved.
 runuser -u hermes -- sh -ec 'test -e "$1" || (set -C; : > "$1")' sh "$h/vault/uploads/state.sqlite3"
-runuser -u hermes -- setfacl -m u:psy-upload:rw,u:psy-deliver:rw "$h/vault/uploads/state.sqlite3"
-runuser -u hermes -- setfacl -m u:psy-upload:rwx,u:psy-deliver:rwx,u:psy-asr:--x,d:u:hermes:rwx,d:u:psy-upload:rwx,d:u:psy-deliver:rx,d:u:psy-asr:rx,d:g::---,d:o::--- "$h/media-vault/uploads"
+runuser -u hermes -- setfacl -m "${PSY_ACL_QUEUE[1]}" "$h/vault/uploads/state.sqlite3"
 install -d -m 0755 /etc/psy /etc/psy-upload /srv/psy-media /srv/psy-queue /srv/psy-progress
 install -d -m 0750 -o psy-deliver -g psy-upload /var/lib/psy-recording-receipts
 if [[ ! -e /etc/psy-upload/recording-signing ]]; then
@@ -49,5 +50,5 @@ if [[ ! -e /etc/psy/instance.env ]]; then
 fi
 install -d -m 0700 -o psy-asr -g psy-deliver /var/lib/psy-asr
 install -d -m 0750 -o psy-asr -g psy-deliver /var/lib/psy-asr/progress
-setfacl -m u:psy-upload:rx,d:u:psy-upload:rx,d:g::rx,d:o::--- /var/lib/psy-asr/progress
+psy_shared_acl /var/lib/psy-asr/progress PROGRESS
 echo "Accounts, ACLs and instance template staged"

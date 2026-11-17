@@ -1,26 +1,40 @@
 #!/bin/bash
 # Nightly encrypted state and content-addressed media, sent to a configured backup host.
-# Installed 2026-11-13. How to restore: README.txt next to the copies on the Timeweb server
-# (also /etc/psy-backup/README.txt here).
+# How to restore: README.txt next to the copies on the backup host (also /etc/psy-backup/README.txt
+# here) and docs/RECOVERY.md in the source repository.
 #
 # Copies everything the bot cannot get back by reinstalling: settings, databases, persona
 # and memory, materials, PSY's own code and service files. Programs and libraries (Hermes
 # itself, Python, node, ffmpeg, chromium, the speech model) are left out on purpose.
 # Recordings are big and rarely change, so each one is sent once, named by its content hash.
-# No remote deletion is requested. Configure retention separately on the backup host.
+# No remote deletion is requested and the remote cannot be listed: the backup account is
+# write-only. Configure retention separately on the backup host.
 set -euo pipefail
 umask 077
 shopt -s nullglob
 
 CONF=/etc/psy-backup
+LIB=/usr/local/lib/psy-backup
 [[ $EUID == 0 ]] || exit 1
-. "$CONF/destination.env"
 STATE=/var/lib/psy-backup
 H=/home/hermes/.hermes
 A=$H/hermes-agent
-: "${PSY_BACKUP_DEST:?Set PSY_BACKUP_DEST in /etc/psy-backup/destination.env}"
-DEST=$PSY_BACKUP_DEST
-[[ $DEST =~ ^[a-z_][a-z0-9_-]*@[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || exit 2
+# Free space that must stay on this disk after a recording is staged: the bot shares the disk.
+RESERVE=$((1024 * 1024 * 1024))
+# A test run (CI) may write to an existing local directory instead; the service never sets this.
+if [[ -n ${PSY_BACKUP_TEST_DEST:-} ]]; then
+  [[ $PSY_BACKUP_TEST_DEST == /* && -d $PSY_BACKUP_TEST_DEST ]] || exit 2
+  DEST=${PSY_BACKUP_TEST_DEST%/}/
+  RSYNC=(rsync -t --timeout=600)
+  PAUSE=1
+else
+  . "$CONF/destination.env"
+  : "${PSY_BACKUP_DEST:?Set PSY_BACKUP_DEST in /etc/psy-backup/destination.env}"
+  [[ $PSY_BACKUP_DEST =~ ^[a-z_][a-z0-9_-]*@[A-Za-z0-9][A-Za-z0-9.-]*$ ]] || exit 2
+  DEST=$PSY_BACKUP_DEST:
+  RSYNC=(rsync -t --timeout=600 -e "ssh -i $CONF/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$CONF/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30")
+  PAUSE=120
+fi
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
 NAME=psy-bot-$STAMP.tar.zst.gpg
 
@@ -29,8 +43,8 @@ install -d -m 700 "$STATE" "$GNUPGHOME"
 
 WORK=$(mktemp -d /var/tmp/psy-backup.XXXXXX)
 trap 'gpgconf --kill gpg-agent 2>/dev/null; rm -rf "$WORK"' EXIT   # only this run's own scratch folder
-chmod 711 "$WORK"                    # lets the hermes user reach its own db/ folder below
-mkdir -p "$WORK/out/daily" "$WORK/out/media" "$WORK/snap/meta" "$WORK/agent"
+chmod 711 "$WORK"                    # lets the database owners reach their own folders below
+mkdir -p "$WORK/out/daily" "$WORK/snap/meta" "$WORK/agent"
 install -d -o hermes -g hermes -m 700 "$WORK/db"
 install -d -o psy-deliver -g psy-deliver -m 700 "$WORK/sysdb"
 
@@ -41,31 +55,22 @@ encrypt() {  # stdin -> encrypted file "$1"
 decrypt() {  # encrypted file "$1" -> stdout
   gpg --batch --quiet --pinentry-mode loopback --passphrase-file "$CONF/passphrase" --decrypt "$1"
 }
+free_bytes() { df --output=avail -B1 -- "$WORK" | tail -n 1 | tr -d ' '; }
+send() {  # upload the tree below "$1" into the destination root; existing remote files are kept
+  local try
+  for try in 1 2 3; do
+    "${RSYNC[@]}" -r --ignore-existing "$1/" "$DEST" < /dev/null && return 0
+    [[ $try == 3 ]] || sleep "$PAUSE"
+  done
+  return 1
+}
 
-# 1. Databases: consistent copies made by each database's own user, so a live database is
-#    never opened (or its -wal/-shm files created) as root.
+# 1. Databases: paced, consistent copies made by each database's own user, so a live database is
+#    never opened (or its -wal/-shm files created) as root. WAL databases are copied from one snapshot.
 mapfile -d '' -t DBS < <(find "$H" \( -path "$H/tools" -o -path "$H/installs" -o -path "$H/cache" -o -path "$A" \) -prune \
   -o -type f \( -name '*.db' -o -name '*.sqlite' -o -name '*.sqlite3' \) -print0)
 snapshot_dbs() {  # user, root the copies are named relative to, output folder, databases...
-runuser -u "$1" -- /usr/bin/python3 - "${@:2}" <<'PY'
-import pathlib, shutil, sqlite3, sys
-home, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
-notes = []
-for src in map(pathlib.Path, sys.argv[3:]):
-    dst = out / src.relative_to(home)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        s = sqlite3.connect(src.as_uri() + "?mode=ro", uri=True, timeout=30)
-        d = sqlite3.connect(dst)
-        s.backup(d)
-        check = d.execute("pragma quick_check").fetchone()[0]
-        d.close(); s.close()
-        notes.append(f"{src}: {check}")
-    except Exception as exc:  # not SQLite, or busy: keep a plain copy so nothing is lost
-        shutil.copy2(src, dst)
-        notes.append(f"{src}: plain copy ({type(exc).__name__}: {exc})")
-(out / "db-notes.txt").write_text("\n".join(notes) + "\n")
-PY
+  runuser -u "$1" -- /usr/bin/python3 -I "$LIB/sqlite_snapshot.py" "${@:2}"
 }
 snapshot_dbs hermes "$H" "$WORK/db" "${DBS[@]}"
 # Recording receipts live outside the hermes home and belong to psy-deliver.
@@ -79,26 +84,29 @@ fi
 BAD_DBS=$(cat "$WORK/db/db-notes.txt" "$WORK/sysdb/db-notes.txt" | grep -v ': ok$' | grep -c . || true)
 
 # 2. Hermes itself is reinstallable; keep only what PSY changed or added on top of it.
-agent_git() { runuser -u hermes -- env GIT_OPTIONAL_LOCKS=0 git -C "$A" "$@"; }
-agent_git describe --tags --always > "$WORK/snap/meta/hermes-agent.version"
-agent_git diff HEAD --binary > "$WORK/snap/meta/hermes-agent.patch"
-{ agent_git diff HEAD --name-only -z; agent_git ls-files -o --exclude-standard -z; } |
-  while IFS= read -r -d '' f; do if [ -e "$A/$f" ]; then printf '%s\0' "$f"; fi; done > "$WORK/agent.lst"
-( cd "$A" && xargs -0 -r cp -a --parents -t "$WORK/agent" ) < "$WORK/agent.lst"
+if [ -d "$A/.git" ]; then
+  agent_git() { runuser -u hermes -- env GIT_OPTIONAL_LOCKS=0 git -C "$A" "$@"; }
+  agent_git describe --tags --always > "$WORK/snap/meta/hermes-agent.version"
+  agent_git diff HEAD --binary > "$WORK/snap/meta/hermes-agent.patch"
+  { agent_git diff HEAD --name-only -z; agent_git ls-files -o --exclude-standard -z; } |
+    while IFS= read -r -d '' f; do if [ -e "$A/$f" ]; then printf '%s\0' "$f"; fi; done > "$WORK/agent.lst"
+  ( cd "$A" && xargs -0 -r cp -a --parents -t "$WORK/agent" ) < "$WORK/agent.lst"
+fi
 
-# 3. Recordings: manifest always; the file itself only if the Timeweb side has not had it yet.
-#    On Sundays every recording is offered again; the Timeweb side keeps the ones it already has.
+# 3. Recordings: the manifest always; the files themselves go out one at a time after the daily
+#    archive (step 6). New ones every night; on Sundays every recording is offered again and the
+#    backup host keeps the copies it already has.
 SENT=$STATE/media-sent.txt
 touch "$SENT"
 RESEND=0; [ "$(date -u +%u)" = 7 ] && RESEND=1
-NEW=()
+if [[ -n ${PSY_BACKUP_TEST_DEST:-} && ${PSY_BACKUP_TEST_RESEND:-} == 1 ]]; then RESEND=1; fi   # CI: the Sunday path
 printf 'sha256\tbytes\tpath\n' > "$WORK/snap/meta/media-manifest.tsv"
+: > "$WORK/media-todo"
 while IFS= read -r -d '' f; do
-  sum=$(sha256sum "$f" | cut -d' ' -f1)
-  printf '%s\t%s\t%s\n' "$sum" "$(stat -c %s "$f")" "$f" >> "$WORK/snap/meta/media-manifest.tsv"
+  sum=$(sha256sum < "$f" | cut -d' ' -f1)
+  printf '%s\t%s\t%s\n' "$sum" "$(stat -c %s -- "$f")" "$f" >> "$WORK/snap/meta/media-manifest.tsv"
   if [ "$RESEND" = 1 ] || ! grep -qx "$sum" "$SENT"; then
-    [ -e "$WORK/out/media/$sum.gpg" ] || encrypt "$WORK/out/media/$sum.gpg" < "$f"
-    NEW+=("$sum")
+    grep -q "^$sum"$'\t' "$WORK/media-todo" || printf '%s\t%s\n' "$sum" "$f" >> "$WORK/media-todo"
   fi
 done < <(find "$H/media-vault/uploads" -type f -print0)
 
@@ -131,32 +139,59 @@ make_tar() {
 OUT=$WORK/out/daily/$NAME
 make_tar | zstd -q -3 -T1 | encrypt "$OUT"
 
-# 5. Check that the copy opens before sending it anywhere.
-decrypt "$OUT" | zstd -dcq | tar -tf - > "$WORK/members.txt"
-for must in home/hermes/.hermes/config.yaml home/hermes/.hermes/SOUL.md db/state.db meta/media-manifest.tsv \
-            etc/psy/instance.env sysdb/var/lib/psy-recording-receipts/results.sqlite3; do
-  grep -qx "$must" "$WORK/members.txt" || { echo "check failed: $must missing from the copy" >&2; exit 1; }
-done
-for m in "${NEW[@]}"; do
-  [ "$(decrypt "$WORK/out/media/$m.gpg" | sha256sum | cut -d' ' -f1)" = "$m" ] || { echo "check failed: recording $m" >&2; exit 1; }
-done
-cp "$CONF/README.txt" "$WORK/out/README.txt"
+# 5. Check the copy with the same verifier a restore uses (decrypt, safe extraction, required
+#    recovery files, SQLite integrity) before sending it anywhere. A database that already failed its
+#    snapshot is counted in BAD_DBS and fails the run after the upload instead of blocking it.
+/usr/bin/python3 -I "$LIB/verify_backup.py" "$OUT" --passphrase-file "$CONF/passphrase" --scratch-parent "$WORK" --tolerate-sqlite-errors
+SIZE=$(stat -c %s "$OUT")
+SUM=$(sha256sum < "$OUT" | cut -d' ' -f1)
+cp "$CONF/README.txt" "$WORK/README.txt"
 
-# 6. Send. The Timeweb account only accepts uploads into its own folder and never deletes.
-SSH="ssh -i $CONF/id_ed25519 -o IdentitiesOnly=yes -o UserKnownHostsFile=$CONF/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=30 -o ServerAliveInterval=30"
+# 6. Send. The backup account only accepts uploads into its own folder and never deletes.
+send "$WORK/out" || { echo "upload failed 3 times" >&2; exit 1; }
 for try in 1 2 3; do
-  rsync -rt --ignore-existing --exclude=README.txt --timeout=600 -e "$SSH" "$WORK/out/" "$DEST:" \
-    && rsync -t --timeout=120 -e "$SSH" "$WORK/out/README.txt" "$DEST:README.txt" && break
-  [ "$try" = 3 ] && { echo "upload failed 3 times" >&2; exit 1; }
-  sleep 120
+  "${RSYNC[@]}" "$WORK/README.txt" "${DEST}README.txt" < /dev/null && break
+  [[ $try == 3 ]] && { echo "upload of README.txt failed 3 times" >&2; exit 1; }
+  sleep "$PAUSE"
 done
+rm -f -- "$OUT"
 
-[ "${#NEW[@]}" -gt 0 ] && printf '%s\n' "${NEW[@]}" >> "$SENT" && sort -u -o "$SENT" "$SENT"
-if [ "$BAD_DBS" -gt 0 ]; then   # the copy is sent anyway, but the run fails so psy-alerts tells the owner
+# Recordings, one at a time: check free space, encrypt, check, upload, delete, remember.
+# Never more than one recording is staged, so a Sunday resend needs space for the largest one only.
+SENT_NOW=0; MEDIA_FAILED=0; CHANGED=0
+ONE=$WORK/one
+while IFS=$'\t' read -r -u 3 sum f; do
+  rm -rf -- "$ONE"
+  if ! size=$(stat -c %s -- "$f" 2>/dev/null); then CHANGED=$((CHANGED + 1)); continue; fi
+  if (( $(free_bytes) < size + size / 50 + RESERVE )); then
+    echo "check failed: not enough free space to stage recording $sum ($((size / 1024 / 1024)) MB)" >&2
+    MEDIA_FAILED=$((MEDIA_FAILED + 1)); continue
+  fi
+  mkdir -p "$ONE/media"
+  encrypt "$ONE/media/$sum.gpg" < "$f"
+  if [ "$(decrypt "$ONE/media/$sum.gpg" < /dev/null | sha256sum | cut -d' ' -f1)" != "$sum" ]; then
+    if [ "$(sha256sum < "$f" | cut -d' ' -f1)" != "$sum" ]; then
+      CHANGED=$((CHANGED + 1))   # still being written; offered again next night
+    else
+      echo "check failed: recording $sum" >&2; MEDIA_FAILED=$((MEDIA_FAILED + 1))
+    fi
+    continue
+  fi
+  if ! send "$ONE"; then
+    echo "upload of recording $sum failed 3 times; the rest wait for the next run" >&2
+    MEDIA_FAILED=$((MEDIA_FAILED + 1)); break
+  fi
+  printf '%s\n' "$sum" >> "$SENT"
+  SENT_NOW=$((SENT_NOW + 1))
+done 3< "$WORK/media-todo"
+rm -rf -- "$ONE"
+sort -u -o "$SENT" "$SENT"
+
+if [ "$BAD_DBS" -gt 0 ] || [ "$MEDIA_FAILED" -gt 0 ]; then   # the copy is sent anyway; psy-alerts tells the owner
   grep -hv ': ok$' "$WORK/db/db-notes.txt" "$WORK/sysdb/db-notes.txt" | grep . >&2 || true
-  echo "check failed: $BAD_DBS database(s) without a clean snapshot in daily/$NAME" >&2
+  echo "check failed: $BAD_DBS database(s) without a clean snapshot, $MEDIA_FAILED recording(s) not sent; daily/$NAME was sent" >&2
   exit 1
 fi
-SIZE=$(stat -c %s "$OUT")
-printf '%s %s %s\n' "$STAMP" "$SIZE" "$(sha256sum "$OUT" | cut -d' ' -f1)" > "$STATE/last-success"
-echo "ok: daily/$NAME ($((SIZE / 1024 / 1024)) MB, sha256 $(cut -d' ' -f3 "$STATE/last-success")), recordings sent: ${#NEW[@]}, $BAD_DBS db notes"
+printf '%s %s %s\n' "$STAMP" "$SIZE" "$SUM" > "$STATE/last-success.tmp"
+mv -f "$STATE/last-success.tmp" "$STATE/last-success"   # psy-alerts reads its age
+echo "ok: daily/$NAME ($((SIZE / 1024 / 1024)) MB, sha256 $SUM), recordings sent: $SENT_NOW, changed during the run: $CHANGED, 0 db notes"

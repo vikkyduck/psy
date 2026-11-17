@@ -1,0 +1,9 @@
+[Unit]
+Description=Restart outdated PSY services at night while the bot is idle (01:00-04:40 Moscow time)
+
+[Timer]
+OnCalendar=*-*-* 22,23,00,01:00/20:00 UTC
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

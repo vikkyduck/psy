@@ -6,7 +6,7 @@
 
 ```sh
 sudo apt-get update
-sudo apt-get install -y acl ca-certificates curl ffmpeg git openssl python3-venv util-linux
+sudo apt-get install -y acl ca-certificates curl ffmpeg git gnupg openssh-client openssl python3-venv rsync util-linux zstd
 sudo bash ops/prepare-host
 ```
 
@@ -36,7 +36,7 @@ test-host запускает только краткоживущие тесто�
 | PSY_LISTEN_HOST | Адрес привязки веб-сервера, по умолчанию 0.0.0.0 |
 | PSY_LISTEN_PORT | Порт сервера загрузок, по умолчанию 9443 |
 
-Шлюз, сервер, worker и сокетные брокеры получают значения через systemd EnvironmentFile. Доступ в группу проверяется перед запуском Mini App и повторно перед отправкой результата.
+Шлюз, сервер, worker и сокетные брокеры получают значения через systemd EnvironmentFile. systemd, bash и python-dotenv по-разному читают кавычки, пробелы, $ и комментарии в конце строки, поэтому значения записываются без них, а комментарии ставятся отдельной строкой. Скрипты ops читают файл одним строгим парсером ops/instance_env.py, verify-ready отклоняет неоднозначные строки и пустые обязательные ID: `sudo python3 -I ops/instance_env.py check --complete /etc/psy/instance.env`. Доступ в группу проверяется перед запуском Mini App и повторно перед отправкой результата.
 
 ## Hermes и распознавание
 
@@ -116,16 +116,19 @@ sudo systemctl enable --now psy-member.socket psy-group-upload.socket psy-asr.se
 sudo systemctl enable --now hermes-gateway.service
 systemctl is-active hermes-gateway psy-upload psy-upload-worker psy-asr
 sudo systemctl start psy-codex-auth.service
-sudo systemctl enable --now psy-codex-auth.timer psy-healthcheck.timer psy-upload-health.timer psy-vault-archive.timer psy-upload-cert-renew.timer psy-alerts.timer
+sudo systemctl enable --now psy-codex-auth.timer psy-healthcheck.timer psy-upload-health.timer psy-vault-archive.timer psy-upload-cert-renew.timer psy-alerts.timer psy-restart-outdated.timer
 systemctl list-timers 'psy-*'
 ```
 
 - psy-codex-auth раз в час проверяет подписку. Группа, монитор и Hermes передают продление выбранного входа модулю `hermes_cli/psy_codex_policy.py`. Он обновляет совместимые записи одного входа за одну операцию и сохраняет паузу после сбоя соединения для всех трех путей. Если сервер мог уже принять одноразовый ключ, повторный обмен этим ключом блокируется. После получения новых учетных данных ПСИ сохраняет их в закрытом локальном файле до завершения записи. При перезапуске он завершает запись и удаляет временную копию. Если владелец должен подтвердить новый вход, ПСИ присылает кнопку в личный чат. В этом чате также доступна команда `/codex_login`. После входа ПСИ проверяет модель коротким запросом и сразу возобновляет задания, ожидавшие авторизации.
-- psy-healthcheck опрашивает управляющий Unix-сокет шлюза и Telegram getWebhookInfo. По серии сбоев восстанавливает прием с ограничением частоты перезапусков.
-- psy-upload-health раз в минуту проверяет HTTPS /healthz, worker, ASR и состояние очереди. После 3 последовательных сбоев запускает восстановление нужной службы. Метрики ожидания доставки, прогресса и свободного места отдельно сохраняются в локальном состоянии.
-- psy-vault-archive сохраняет сообщения и сгенерированные файлы в локальном vault. Для переживания потери сервера нужна отдельная приватная копия данных.
+- psy-healthcheck опрашивает управляющий Unix-сокет шлюза и Telegram getWebhookInfo. По серии сбоев восстанавливает прием с ограничением частоты перезапусков. Журнал и .env профиля читаются только как обычные файлы: ссылка или FIFO на их месте не блокирует проверку от root.
+- hermes-gateway при повторяющемся сбое старта, например в preflight, перезапускается с растущей паузой от 5 секунд до 2 минут. OOMScoreAdjust=-300 заставляет ядро при нехватке памяти выбирать распознаватель и вспомогательные службы раньше бота, а OOMPolicy=continue не останавливает бота, если ядро завершило один из дочерних процессов агента. Ограничений памяти, запросов или системных вызовов для шлюза нет.
+- psy-upload-health раз в минуту проверяет /healthz загрузчика через loopback на его собственном порту, worker, ASR и состояние очереди. После 3 последовательных локальных сбоев перезапускает нужную службу, не чаще раза в 15 минут. Состояние сохраняется до перезапуска. После неудачного перезапуска пауза удваивается до 2 часов, а служба проверки завершается с ошибкой, чтобы владелец получил уведомление. Публичный HTTPS-адрес проверяется отдельно и только вызывает уведомление после 3 сбоев подряд: перезапуск не исправляет DNS, маршрут или сертификат. Метрики ожидания доставки, прогресса и свободного места отдельно сохраняются в локальном состоянии.
+- psy-vault-archive каждые 10 минут сохраняет сообщения и сгенерированные файлы в локальном vault. Файл с прежними размером и временем изменения повторно не читается. Сбой этой службы вызывает уведомление владельцу. Для переживания потери сервера нужна отдельная приватная копия данных.
+- Автоматические обновления Ubuntu (unattended-upgrades) вызывают needrestart. Файл /etc/needrestart/conf.d/50-psy.conf запрещает ему перезапускать hermes-gateway и службы psy-*, поэтому днем бот и распознавание не прерываются. psy-restart-outdated.timer ночью, с 01:00 до 04:40 по Москве каждые 20 минут, спрашивает needrestart, какие из этих служб работают на устаревших библиотеках. Перезапуск выполняется только при простое: в очереди группы нет заданий queued, running или sending, в очереди записей нет ожидающих и обрабатываемых файлов, а последнее входящее сообщение Telegram пришло больше 20 минут назад. Порядок: psy-asr, psy-upload-worker, psy-upload, затем шлюз. Неудачный перезапуск вызывает уведомление владельцу. Проверка без перезапуска: `sudo python3 -I /usr/local/libexec/psy-restart-outdated.py --check-only`.
 - psy-upload-cert-renew раз в 12 часов проверяет необходимость продления. На узле с общей службой ACME согласуйте выбранный способ продления для этого адреса.
 - Исходники psy-audio-priority сохранены для воспроизводимости истории конфигурации. Таймер контролировал факультативную сборку Telegram Bot API. На исходном узле он выключен, сборка отсутствует. install-runtime пропускает эти unit. Штатная очередь распознавания работает через psy-asr и psy-upload-worker.
+- Список unit, таймеров и подключений к уведомлениям владельцу хранится в одном файле ops/inventory.json. prepare-host, install-runtime, install-backup, test-host и restore-permissions читают его через ops/inventory.py, а тест ops/tests/test_inventory.py сверяет с ним проверки psy-alerts и файлы ops/systemd. Новую службу добавляют сначала в inventory.json. install-runtime также вызывает install-backup: код и unit-файлы копирования ставятся вместе с остальными, но таймер не включается.
 
 ## Обновление работающего узла
 

@@ -5,14 +5,29 @@ import json
 import pathlib
 import os
 import socket
+import stat
 import subprocess
 import time
 import urllib.request
 
 HOME = pathlib.Path('/home/hermes/.hermes')
 STATE = pathlib.Path('/var/lib/psy-healthcheck/state.json')
+ALERTS = pathlib.Path('/var/lib/psy-alerts/state.json')
 STALL = 300
 COOLDOWN = 900
+ALERTS_STALE = 600   # psy-alerts runs every minute
+
+
+def read_tail(path, limit):
+    """The last `limit` bytes of a regular file. Files below /home/hermes are writable by the bot
+    (and its owner's terminal agent): never follow a link or block on a FIFO planted there."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    with os.fdopen(fd, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError('not a regular file')
+        stream.seek(0, 2)
+        stream.seek(max(0, stream.tell() - limit))
+        return stream.read(limit)
 
 
 def control_status():
@@ -34,7 +49,7 @@ def control_status():
 
 def telegram_pending():
     token = None
-    for line in (HOME / '.env').read_text().splitlines():
+    for line in read_tail(HOME / '.env', 1 << 20).decode('utf-8', errors='replace').splitlines():
         key, sep, value = line.partition('=')
         if sep and key.strip() == 'TELEGRAM_BOT_TOKEN':
             token = value.strip().strip('\"\'')
@@ -51,10 +66,7 @@ def telegram_pending():
 
 
 def last_ingress():
-    with (HOME / 'logs/gateway.log').open('rb') as log:
-        log.seek(0, 2)
-        log.seek(max(0, log.tell() - 262144))
-        lines = log.read().decode('utf-8', errors='replace').splitlines()
+    lines = read_tail(HOME / 'logs/gateway.log', 262144).decode('utf-8', errors='replace').splitlines()
     for line in reversed(lines):
         if 'inbound message: platform=telegram' in line:
             return line[:23]  # Timestamp only, never message content.
@@ -90,6 +102,30 @@ def assess(previous, now, pid, control_ok, connected, pending, ingress):
     return state, reason
 
 
+def alerts_watch(now, booted_for):
+    """The owner alerts must keep running. A stale state fails this check, and its OnFailure= starts
+    an immediate alert run that reports what stopped the regular one (for example a disabled timer)."""
+    try:
+        state = json.loads(ALERTS.read_text())
+    except (OSError, ValueError):
+        state = {}
+    age = now - float(state.get('checked_at', 0) or 0)
+    failures = state.get('delivery', {}).get('failures', 0)
+    if failures:
+        print(f'alerts: {failures} owner notice deliveries failed in a row ({state["delivery"].get("reason", "unknown")})')
+    if booted_for > ALERTS_STALE and age > ALERTS_STALE:
+        print(f'alerts: owner alert checks have not completed for {int(min(age, 10**9))} s')
+        return False
+    return True
+
+
+def uptime():
+    try:
+        return float(pathlib.Path('/proc/uptime').read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
 def self_test():
     state = {}
     for tick in (1000, 1060, 1120):
@@ -118,6 +154,13 @@ def main():
     args = parser.parse_args()
     if args.self_test:
         return self_test()
+    alerts_ok = alerts_watch(time.time(), uptime())
+    gateway(args)
+    if not alerts_ok:
+        raise SystemExit(1)
+
+
+def gateway(args):
     props = subprocess.check_output(['systemctl', 'show', 'hermes-gateway',
         '-p', 'MainPID', '-p', 'ActiveState', '-p', 'ActiveEnterTimestampMonotonic'], text=True)
     props = dict(line.split('=', 1) for line in props.splitlines() if '=' in line)

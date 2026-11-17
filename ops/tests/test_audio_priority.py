@@ -1,4 +1,11 @@
+import os
+from pathlib import Path
+import sqlite3
+import tempfile
 import unittest
+from unittest.mock import patch
+
+import audio_priority
 from audio_priority import decision
 
 class Tests(unittest.TestCase):
@@ -21,5 +28,22 @@ class Tests(unittest.TestCase):
     def test_completed_or_missing_build_never_restarted(self):
         state,action=decision({'managed_freeze':True},False,'inactive','running',100)
         self.assertIsNone(action);self.assertFalse(state['managed_freeze'])
+    def test_idle_wal_queue_read_from_read_only_folder_without_creating_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home=Path(folder);uploads=home/'vault/uploads';uploads.mkdir(parents=True)
+            db=sqlite3.connect(uploads/'state.sqlite3');db.execute('PRAGMA journal_mode=WAL')
+            db.execute('CREATE TABLE jobs(id TEXT,state TEXT,updated INTEGER)');db.execute("INSERT INTO jobs VALUES('a','queued',0)")
+            db.commit();db.execute('PRAGMA wal_checkpoint(TRUNCATE)');db.close()
+            for side in ('-wal','-shm'):(uploads/('state.sqlite3'+side)).unlink(missing_ok=True)
+            uploads.chmod(0o500)
+            try:
+                with patch.object(audio_priority,'HOME',home):self.assertIs(audio_priority.audio_busy(),True)
+                self.assertEqual([p.name for p in uploads.iterdir()],['state.sqlite3'])
+            finally:uploads.chmod(0o700)
+    def test_unreadable_queue_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home=Path(folder);(home/'vault/uploads').mkdir(parents=True)
+            os.mkfifo(home/'vault/uploads/state.sqlite3')
+            with patch.object(audio_priority,'HOME',home):self.assertIsNone(audio_priority.audio_busy())
 
 if __name__=='__main__':unittest.main()
