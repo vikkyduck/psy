@@ -1,5 +1,6 @@
 #!/bin/bash
 # Stage backup code and units. Never create keys or enable a network timer automatically.
+# Idempotent and safe on a running host: it replaces code and unit files only.
 set -euo pipefail
 [[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
 ops=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -12,6 +13,9 @@ if [[ ! -e /etc/psy-backup/README.txt ]]; then
     install -m 0600 "$ops/backup/README.txt" /etc/psy-backup/README.txt
 fi
 install -m 0755 "$ops/backup/psy-backup" /usr/local/sbin/psy-backup
+# Read by the database owners (snapshots) and by root (the same verifier a restore uses).
+install -d -m 0755 /usr/local/lib/psy-backup
+install -m 0644 "$ops/backup/sqlite_snapshot.py" "$ops/../tools/verify_backup.py" /usr/local/lib/psy-backup/
 install -m 0644 "$ops/systemd/psy-backup.service" "$ops/systemd/psy-backup.timer" /etc/systemd/system/
 install -d -m 0755 /etc/systemd/system/psy-backup.service.d
 printf '[Unit]\nOnFailure=psy-alerts.service\n' > /etc/systemd/system/psy-backup.service.d/owner-alert.conf
