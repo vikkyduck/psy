@@ -184,6 +184,11 @@ def collect(previous, now):
         state = json.loads(path.read_bytes())
         if key == "upload_health" and state.get("healthy") is False:
             problems[key] = "Проверка загрузки или распознавания сообщает о сбое."
+        if key == "upload_health" and state.get("last_restart", 0) > previous.get("upload_restart", 0):
+            if previous.get("upload_restart") is not None:
+                units = ", ".join(u for u in state.get("restart_units", []) if UNIT_NAME.fullmatch(str(u)))
+                problems["restart:upload-health"] = f"Проверка загрузки перезапустила службы: {units or 'неизвестно'}."
+            previous["upload_restart"] = state["last_restart"]
         if key == "gateway_health" and state.get("last_restart", 0) > previous.get("last_restart", 0):
             if previous.get("last_restart") is not None:
                 problems[key] = "Проверка ПСИ выполнила восстановительный перезапуск."
