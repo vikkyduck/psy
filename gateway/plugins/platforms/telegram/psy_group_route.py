@@ -272,7 +272,8 @@ async def group_message(msg):
         return
     question = param if command else text
     from hermes_cli.config import load_config
-    model = load_config()["model"]
+    # Hermes re-reads config.yaml when it changes. Keep that file I/O and YAML parsing off the loop.
+    model = (await asyncio.to_thread(load_config))["model"]
     if model["provider"] != "openai-codex":
         raise RuntimeError("wrong provider")
     if not source and not quoted:

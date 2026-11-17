@@ -13,11 +13,11 @@
     "plugins/platforms/telegram/psy_group_audio.py": "497b2f377c4a9058d36f2702fea7a65e1424cfc741c821c67df6e37bbad65873",
     "plugins/platforms/telegram/psy_group_codex.py": "66c52682604ab36e48f13c97d141ab3159185704b804006a436866032906fc00",
     "plugins/platforms/telegram/psy_group_queue.py": "0bec173534d8184161bdaae8047edd08b335555ca62fcac57d1b5fd9361fa2c7",
-    "plugins/platforms/telegram/psy_group_route.py": "429547cc193f2d10de914e0dd5f1c37b096e80e7d57a69b0091dae6616a305f0",
+    "plugins/platforms/telegram/psy_group_route.py": "2f6e07016906823f3957234bd71751b5aafcce229d09496752ffc85438914e27",
     "plugins/platforms/telegram/psy_group_store.py": "8444fdaa33792aab6c7ad97f085620763510c97dec0ce0d420ccfc8f81a5299b",
     "plugins/platforms/telegram/psy_instance.py": "75bb8b8deaa5571f0f33ac37b57eaacabfe410feacf039c30b9dab75eebe7b01",
     "plugins/platforms/telegram/psy_owner_recovery.py": "44ee334cf17806c6628148d79e28019406c9f801355729ebcb3b3dfa5eb6398d",
-    "plugins/platforms/telegram/psy_source_evidence.py": "5c6c3d3b87c1beb6dc7c3243df47c9daaf08b928d79af37d7d2e1fdfb116ea70",
+    "plugins/platforms/telegram/psy_source_evidence.py": "0aaa0b30a2764bfa9cd09670c4074dadb91a4aaa057a06639e3fcbb9c7495660",
     "plugins/platforms/telegram/psy_upload_handoff.py": "aa871401fbb9b360fa586347f105c8a9c1c16c30b0008023d88b6a5cee163a0f",
     "plugins/platforms/telegram/update_admission.py": "4bfc788deb2a61869c2cff56ec519b51d05fd90e179688f8b7177b10e3cf4ec6",
     "tools/transcription_tools.py": "dcb54798d0b21be57e75e2060e919ac2b9e1f6ade1d63d907f2ef39ac0842139"

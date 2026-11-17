@@ -1,6 +1,9 @@
 """The same trusted-looking search citation must fail for a fabricated excerpt."""
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 import socket
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -85,3 +88,30 @@ class Evidence(unittest.TestCase):
             self.assertIsNotNone(reader.locate(URL,"On test content","p.2","Author","On test content"))
             self.assertIsNone(reader.locate(URL+"/2","On test content","p.2","Author","On test content"))
         self.assertLessEqual(reader.cache_bytes,2200)
+
+    def test_slow_page_does_not_block_other_pages_and_is_fetched_once(self):
+        reader = evidence.EvidenceReader()
+        release, started = threading.Event(), threading.Event()
+        calls = Counter()
+        def passages(base):
+            calls[base] += 1
+            if base.endswith("/slow"):
+                started.set()
+                self.assertTrue(release.wait(5))
+            return ("HTML", ["Sigmund Freud, Repression", "three actual source words"])
+        check = ("three actual source words", "p. 1", "Sigmund Freud", "Repression")
+        with patch.object(evidence, "passages", passages), ThreadPoolExecutor(3) as pool:
+            slow = [pool.submit(reader.locate, URL + "/slow", *check) for _ in range(2)]
+            self.assertTrue(started.wait(5))
+            self.assertIsNotNone(reader.locate(URL + "/fast", *check))
+            self.assertFalse(any(future.done() for future in slow))
+            release.set()
+            self.assertTrue(all(future.result(5) for future in slow))
+        self.assertEqual(calls, Counter({URL + "/slow": 1, URL + "/fast": 1}))
+
+    def test_no_page_count_limit_within_the_memory_bound(self):
+        reader = evidence.EvidenceReader()
+        with patch.object(evidence, "passages", return_value=("HTML", ["Sigmund Freud, Repression", "three actual source words"])):
+            found = [reader.locate(f"{URL}/{i}", "three actual source words", "p. 1", "Sigmund Freud", "Repression")
+                     for i in range(40)]
+        self.assertTrue(all(found))
