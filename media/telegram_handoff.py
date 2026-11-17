@@ -82,7 +82,8 @@ async def command(msg):
     if not t:
         await msg.reply_text('Эта ссылка недоступна или устарела. Отправьте /audio в группе от своего имени.')
         return True
-    if t['chat']==C.GROUP:
+    # The owner may have left the group and keeps its upload destination, as on the upload side.
+    if t['chat']==C.GROUP and msg.from_user.id!=C.OWNER:
         try:
             member=await msg.get_bot().get_chat_member(C.GROUP,msg.from_user.id)
             if not C.member_allowed(member.to_dict()):return True
