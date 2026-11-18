@@ -159,8 +159,8 @@ def telegram_api():
 
 
 def peer_uid(connection):
-    _, uid, _ = struct.unpack("3i", connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
-    return uid
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII"))
+    return struct.unpack("iII", credentials)[1]  # struct ucred: pid, uid, gid
 
 
 def allowed_uids():
@@ -460,7 +460,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             kind = self.serve(route)
         except Refusal as exc:
             kind = exc.kind
-            self.reply(exc.status, exc.document())
+            if not self.replied:
+                self.reply(exc.status, exc.document())
         except ClientGone:
             kind = "client_gone"
         except Exception as exc:
@@ -530,6 +531,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream")
+                # Asked for identity; should Codex compress anyway, the unchanged bytes need their label.
+                encoding = response.getheader("Content-Encoding", "identity")
+                if encoding.lower() != "identity":
+                    self.send_header("Content-Encoding", encoding)
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Connection", "close")
                 self.end_headers()
@@ -564,7 +569,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = f"{upstream()}/{path}"
 
         def attempt(token):
-            headers = {**identity(token), "Content-Type": "application/json",
+            # The plugin's own headers: its httpx client also sends Accept: */*.
+            headers = {**identity(token), "Accept": "*/*", "Content-Type": "application/json",
                        "x-codex-image-turn-id": str(uuid.uuid4())}
             return exchange(url, data, headers, connect=IMAGE_CONNECT_SECONDS, read=IMAGE_READ_SECONDS,
                             limit=MAX_IMAGE_RESPONSE)

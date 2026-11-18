@@ -5,7 +5,7 @@
   "hermes_cli/auth_codex.py": "12341379d489a03199700d41d3a15da0478ff0ce0f8c521f6af942f9a1ee2de2",
   "hermes_cli/psy_codex_incident.py": "ca64f2656d2767210a1ab78a1112c917f58f92f3a194d2d834f1150de8351350",
   "hermes_cli/psy_codex_policy.py": "bd8c030a836c2346a1256e824ecc5496be2e401a0f09ef44142f41f968ba4102",
-  "hermes_cli/psy_platform_bridge.py": "7813d498c585fe754636c599491c8d02053c2bae66502d0358818e6f5cf1812e",
+  "hermes_cli/psy_platform_bridge.py": "77c1a713f81412498c840bd22caf90a4d35452e852f5885dede14800bd963e4d",
   "plugins/platforms/telegram/adapter.py": "134fefbcfc439d389bae0eb09d6d2190f8b339ec5d59e557261683baa33f1ad1",
   "plugins/platforms/telegram/psy_group_admin.py": "b849c4b4174f6ce15190b241b26eae883000d4a9e72d8dfadc4786993e58e3e4",
   "plugins/platforms/telegram/psy_group_audio.py": "497b2f377c4a9058d36f2702fea7a65e1424cfc741c821c67df6e37bbad65873",

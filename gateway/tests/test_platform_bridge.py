@@ -1,5 +1,6 @@
 """The platform bridge over a real Unix socket, against loopback stand-ins for Codex and Telegram."""
 import base64
+import gzip
 import http.client
 import http.server
 import importlib
@@ -208,6 +209,24 @@ class PlatformBridge(unittest.TestCase):
         self.credentials.assert_called_once_with(None)
         self.assertTrue(self.logged("request method=POST path=/responses status=200"))
         self.assertFalse([line for line in self.capture.lines if "bearer" in line or "Привет" in line or "data:" in line])
+
+    def test_a_compressed_stream_keeps_its_bytes_and_their_label(self):
+        packed = gzip.compress(STREAM)
+
+        def compressed(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Content-Encoding", "gzip")
+            handler.send_header("Content-Length", str(len(packed)))
+            handler.end_headers()
+            handler.wfile.write(packed)
+
+        self.codex.replies.append(compressed)
+        conn = UnixConnection(self.path)
+        conn.request("POST", "/responses", body=json.dumps(MINIMAL).encode())
+        response = conn.getresponse()
+        self.assertEqual((response.status, response.getheader("Content-Encoding"), response.read()), (200, "gzip", packed))
+        conn.close()
 
     def test_payload_outside_the_accepted_subset_is_refused(self):
         for wrong in ({"temperature": 0.2}, {"previous_response_id": "resp_1"}, {"tools": [{"type": "web_search", "filters": {}}]},
@@ -436,7 +455,8 @@ class PlatformBridge(unittest.TestCase):
         expected = IMAGES._build_image_request(prompt="Круг на зеленом фоне", size="1536x1024", quality="medium")
         self.assertEqual(("/backend-api/codex/" + expected[0], json.loads(body)), (path, expected[1]))
         self.assertEqual(json.loads(body)["model"], "gpt-image-2")
-        self.assertEqual((headers["Authorization"], headers["originator"]), ("Bearer live-bearer-fixture", "psy-fixture"))
+        self.assertEqual((headers["Authorization"], headers["originator"], headers["Accept"]),
+                         ("Bearer live-bearer-fixture", "psy-fixture", "*/*"))
         self.assertRegex(headers["x-codex-image-turn-id"], r"^[0-9a-f-]{36}$")
         for target, requested, delivered in (("864x1536", "1024x1536", (1024, 1536)), ("512x512", "1024x1024", (1024, 1024)),
                                              ("1536x864", "1536x1024", (1024, 1024))):
