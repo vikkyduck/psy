@@ -47,8 +47,8 @@ class ReleaseInventory(unittest.TestCase):
         text = (apply.HERE/"README.md").read_text()
         counts = {r"Патч изменяет (\d+) отслеживаемых": len(apply.TRACKED),
                   r"Установщик добавляет (\d+) файл": len(apply.ADDED),
-                  r"SHA-256 каждого из (\d+) файлов": len(FILES),
-                  r"содержит те же (\d+) контрольных сумм": len(FILES)}
+                  r"SHA-256 каждого из (\d+) файл": len(FILES),
+                  r"содержит те же (\d+) контрольн": len(FILES)}
         for pattern, expected in counts.items():
             self.assertEqual(int(re.search(pattern, text).group(1)), expected, pattern)
 

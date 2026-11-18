@@ -482,9 +482,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return None
         with self.server.slot():
             if route == "/health":
-                return self.health()
-            body = self.read_json()
-            return getattr(self, route[1:])(body)
+                return self.serve_health()
+            # serve_responses, serve_images, serve_notify (BaseHTTPRequestHandler.responses is its status table)
+            return getattr(self, "serve_" + route[1:])(self.read_json())
 
     def read_json(self):
         length = self.headers.get("Content-Length", "")
@@ -506,7 +506,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise bad_request()
         return body
 
-    def health(self):
+    def serve_health(self):
         try:
             credentials()
         except Refusal as exc:
@@ -515,7 +515,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.reply(200, {"ok": True, "codex": "ready"})
         return None
 
-    def responses(self, body):
+    def serve_responses(self, body):
         data = encode(responses_payload(body))
         url = upstream() + "/responses"
 
@@ -555,7 +555,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except OSError:
                 return "client_gone"
 
-    def images(self, body):
+    def serve_images(self, body):
         prompt, width, height, quality = image_request(body)
         # The Hermes openai-codex image plugin owns the request body of the native endpoint.
         plugin = importlib.import_module("plugins.image_gen.openai-codex")
@@ -576,7 +576,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          "height": height, "upstream_size": received})
         return None
 
-    def notify(self, body):
+    def serve_notify(self, body):
         text = body.get("text")
         if set(body) != {"text"} or not isinstance(text, str) or not 1 <= len(text) <= NOTICE_CHARS or not text.strip():
             raise bad_request()

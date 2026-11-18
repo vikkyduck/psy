@@ -64,7 +64,7 @@ class Recorder(http.server.ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Playback)
         self.seen, self.replies, self.default = [], [], None
         self.release = threading.Event()
-        threading.Thread(target=self.serve_forever, daemon=True).start()
+        threading.Thread(target=self.serve_forever, args=(0.02,), daemon=True).start()
 
     @property
     def base(self):
@@ -153,7 +153,7 @@ class PlatformBridge(unittest.TestCase):
         bridge.log.setLevel(logging.INFO)
         self.path = self.home / "bridge.sock"
         self.server = bridge.make_server(self.path)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        threading.Thread(target=self.server.serve_forever, args=(0.02,), daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
@@ -514,10 +514,10 @@ class PlatformBridge(unittest.TestCase):
             self.assertEqual(self.json_call("POST", "/notify", {"text": "x"}), (502, {"sent": False, "reason": "telegram"}))
         # An undelivered text is not a duplicate.
         self.assertEqual(self.json_call("POST", "/notify", {"text": "x"}), (200, {"sent": True}))
-        with patch.dict(os.environ, {"PSY_PLATFORM_TELEGRAM_API": "http://127.0.0.1:9/never"}):
-            with socket.socket() as probe:
-                probe.bind(("127.0.0.1", 0))
-                os.environ["PSY_PLATFORM_TELEGRAM_API"] = f"http://127.0.0.1:{probe.getsockname()[1]}"
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            closed = probe.getsockname()[1]
+        with patch.dict(os.environ, {"PSY_PLATFORM_TELEGRAM_API": f"http://127.0.0.1:{closed}"}):
             self.assertEqual(self.json_call("POST", "/notify", {"text": "y"}), (502, {"sent": False, "reason": "telegram"}))
         (self.home / ".env").write_text("OTHER=1\n")
         self.assertEqual(self.json_call("POST", "/notify", {"text": "z"}), (503, {"sent": False, "reason": "unconfigured"}))
