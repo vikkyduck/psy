@@ -14,6 +14,12 @@ from .psy_instance import BOT, BOT_USERNAME, GROUP, OWNER
 
 MINI_LINK = f"https://t.me/{BOT_USERNAME}?startapp=psy_group"
 UPLOAD_START = re.compile(r"/start(?:@" + re.escape(BOT_USERNAME) + r")? upload_[0-9a-f]{32}", re.I)
+# Hermes' own /update stashes PSY's edits to the checkout and moves Hermes to another version; the
+# boundary check then keeps the bot down until someone restores it by hand. PSY is updated from its
+# repository with ops/update_live.py instead, so the command never reaches Hermes.
+SELF_UPDATE = re.compile(r"/update(?:@[A-Za-z0-9_]+)?(?:\s.*)?", re.I | re.S)
+SELF_UPDATE_REPLY = ("Команда /update отключена: обновление Hermes этой командой остановило бы бота. "
+                     "ПСИ обновляется из репозитория через выкатку (ops/update_live.py).")
 HELLO = ("В этой группе я отвечаю на сообщения, исследую публичные источники и разбираю записи. "
          "Ответьте на файл расшифровки, чтобы обсудить его. /audio открывает загрузку до 1 ГБ. "
          "/files показывает Ваши сохраненные в этой группе материалы. /get НОМЕР возвращает выбранный файл. "
@@ -376,9 +382,12 @@ async def intercept(app, update):
     if await owner_recovery(app, update):
         return True
     route = scope(update)
-    if route == "owner":
-        return False
     msg = getattr(update, "message", None)
+    if route == "owner":
+        if msg and SELF_UPDATE.fullmatch((getattr(msg, "text", None) or "").strip()):
+            await msg.reply_text(SELF_UPDATE_REPLY)
+            return True
+        return False
     if route == "upload" and msg:
         from plugins.platforms.telegram.psy_upload_handoff import command
         await command(msg)

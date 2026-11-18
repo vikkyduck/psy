@@ -17,7 +17,7 @@
   "plugins/platforms/telegram/psy_group_pipeline.py": "552b85c09fe1d2f9ff0cb631d802af74293ec982e59c6db5ca9d6237fea20e6d",
   "plugins/platforms/telegram/psy_group_prompts.py": "d83466d6d99afb6905416f2a2b1d8feee331c55ed45cf77449b6df5ea406f39b",
   "plugins/platforms/telegram/psy_group_queue.py": "3234ead38aff60b42a084775a6aafd5846164ca39ceb32d091c5b777ea687756",
-  "plugins/platforms/telegram/psy_group_route.py": "2fd2795be164e651efa31e44c64f6e193906f31874f35a6572f3d940aa5cc9da",
+  "plugins/platforms/telegram/psy_group_route.py": "9cd5844d6809136cc948c5ca09a5404d64d06c59b488e10f85f021d2792b1192",
   "plugins/platforms/telegram/psy_group_sources.py": "b394ffbe63e0fcd76488e183f8d0c6c6eda57bf904592c8ce4fee1fa4321f043",
   "plugins/platforms/telegram/psy_group_store.py": "f834b118f13569b76f260a9a52aaac79010fae043e56f17dda345dff02726b3b",
   "plugins/platforms/telegram/psy_instance.py": "0ee509a6d64accffea2192a9d53b157105effea342d50b4d10c3fd1873c44c10",
