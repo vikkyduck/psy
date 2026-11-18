@@ -1,0 +1,25 @@
+#!/bin/bash
+# Stage the platform bridge: the psy-platform group and its two units. Never enables or starts them.
+# Idempotent and safe on a running host: it replaces unit files only. Run it again once the platform
+# account exists, then restart the platform so that its processes carry the new group.
+set -euo pipefail
+[[ $EUID == 0 && $(uname -s) == Linux ]] || exit 1
+ops=$(cd -- "$(dirname -- "$0")" && pwd)
+group=psy-platform
+peer=kotu
+id -u hermes >/dev/null 2>&1 || { echo "No hermes account. Run ops/prepare-host first." >&2; exit 1; }
+if ! getent group "$group" >/dev/null; then
+    groupadd --system "$group"
+fi
+if ! id -u "$peer" >/dev/null 2>&1; then
+    echo "Note: user $peer does not exist yet. Run this script again after the platform account is created."
+elif [[ " $(id -nG "$peer") " != *" $group "* ]]; then
+    usermod -a -G "$group" "$peer"
+    echo "Added $peer to $group. Restart the platform so that its processes get the group."
+fi
+files=$(python3 -I "$ops/inventory.py" unit-files platform)
+for file in $files; do
+    install -m 0644 "$ops/systemd/$file" /etc/systemd/system/
+done
+systemctl daemon-reload
+echo "Platform bridge staged, not started. Enable it with: systemctl enable --now psy-platform-bridge.socket"

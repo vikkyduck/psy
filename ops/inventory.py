@@ -3,7 +3,7 @@
   idle             units that must be inactive before staging or restoring (daemons, sockets, timers)
   alerted          services that get the owner-alert OnFailure= drop-in
   on-failure       the OnFailure= target for those drop-ins
-  unit-files NAME  unit files in ops/systemd that installer NAME (runtime, backup) installs
+  unit-files NAME  unit files in ops/systemd that installer NAME (runtime, backup, platform) installs
   restart-order    long-running services, in the order they are restarted
 """
 import json
@@ -28,7 +28,7 @@ def query(name, *args):
         return [n for n, u in installed().items() if u.get('alert')]
     if name == 'on-failure':
         return [INVENTORY['on_failure']]
-    if name == 'unit-files' and len(args) == 1 and args[0] in ('runtime', 'backup'):
+    if name == 'unit-files' and len(args) == 1 and args[0] in ('runtime', 'backup', 'platform'):
         units = installed(args[0])
         return list(units) + [u['timer'] for u in units.values() if u.get('timer')]
     if name == 'restart-order':

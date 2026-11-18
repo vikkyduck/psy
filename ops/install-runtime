@@ -66,7 +66,8 @@ fi
 if ! runuser -u hermes -- test -e "$h/SOUL.md"; then
     runuser -u hermes -- sh -ec 'umask 077; set -C; cat > "$1"' sh "$h/SOUL.md" < "$repo/profile/SOUL.md"
 fi
-# Stage the backup code and units too (never enabled here), so every unit in the inventory exists.
+# Stage the backup and platform bridge units too (never enabled here), so every unit in the inventory exists.
 bash "$ops/install-backup"
+bash "$ops/install-platform-bridge"
 systemctl daemon-reload
 echo "Runtime staged. Units have not been started or enabled."
