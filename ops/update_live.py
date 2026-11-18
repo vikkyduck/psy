@@ -667,7 +667,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=("plan", "apply", "rollback"))
     parser.add_argument("backup", nargs="?", help="for rollback: the /var/lib/psy-deploy folder to put back")
-    parser.add_argument("--force", action="store_true", help="apply even while group or recording work is in progress")
+    parser.add_argument("--force", action="store_true", help="apply even while group or recording work is in progress; rollback a backup that is not the latest")
     parser.add_argument("--commit", default=None, help="label for the record when the checkout has no .git")
     opts = parser.parse_args()
     if os.geteuid() != 0:
@@ -675,6 +675,13 @@ def main():
     if opts.action == "rollback":
         if not opts.backup or Path(opts.backup).resolve().parent != BACKUPS:
             sys.exit(f"rollback needs a folder directly under {BACKUPS}")
+        # An older backup removes files that later releases added and still need (psy_common, new
+        # modules). Only the backup of the update the host runs now can be put back safely.
+        record = read_plain(RECORD)
+        latest = dict(line.split("=", 1) for line in (record[0].decode() if record else "").splitlines() if "=" in line)
+        if latest.get("backup") != str(Path(opts.backup).resolve()) and not opts.force:
+            sys.exit(f"{opts.backup} is not the backup of the current update ({latest.get('backup', 'none recorded')}); "
+                     "roll back the newer updates first, or pass --force")
         still = roll_back_to(Backup(root=Path(opts.backup).resolve()))
         sys.exit(f"still not running: {', '.join(still)}" if still else f"Restored {opts.backup}.")
     import pwd

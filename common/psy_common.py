@@ -214,13 +214,17 @@ def atomic_write(path, data, mode=0o600, *, durable=True):
 
 
 def env_value(text, key):
-    """The first `key=value` of a profile .env as the bot's own checks read it: surrounding spaces and
-    quotes removed; None when the key is absent."""
+    """`key` from a profile .env the way Hermes ends up with it: python-dotenv keeps the last line for a
+    repeated key; an empty line is skipped, so a stray `KEY=` cannot hide the real value. Surrounding
+    spaces and quotes are removed. '' when only empty lines name the key, None when it is absent."""
+    found = None
     for line in text.splitlines():
         name, separator, value = line.partition('=')
         if separator and name.strip() == key:
-            return value.strip().strip('"\'')
-    return None
+            value = value.strip().strip('"\'')
+            if value or found is None:
+                found = value
+    return found
 
 
 # ---------- SQLite ----------

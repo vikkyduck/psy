@@ -130,8 +130,13 @@ class AtomicFiles(unittest.TestCase):
 
     def test_profile_env_value(self):
         text = 'OTHER=1\n  TELEGRAM_BOT_TOKEN = "value"\nTELEGRAM_BOT_TOKEN=second\n'
-        self.assertEqual(common.env_value(text, 'TELEGRAM_BOT_TOKEN'), 'value')
-        self.assertEqual(common.env_value('TELEGRAM_BOT_TOKEN=\nTELEGRAM_BOT_TOKEN=x\n', 'TELEGRAM_BOT_TOKEN'), '')
+        # Hermes loads the profile with python-dotenv, which keeps the last line for a repeated key.
+        self.assertEqual(common.env_value(text, 'TELEGRAM_BOT_TOKEN'), 'second')
+        self.assertEqual(common.env_value('  TELEGRAM_BOT_TOKEN = "value"\n', 'TELEGRAM_BOT_TOKEN'), 'value')
+        # A stray empty line never hides the real value, before or after it.
+        self.assertEqual(common.env_value('TELEGRAM_BOT_TOKEN=\nTELEGRAM_BOT_TOKEN=x\n', 'TELEGRAM_BOT_TOKEN'), 'x')
+        self.assertEqual(common.env_value('TELEGRAM_BOT_TOKEN=x\nTELEGRAM_BOT_TOKEN=\n', 'TELEGRAM_BOT_TOKEN'), 'x')
+        self.assertEqual(common.env_value('TELEGRAM_BOT_TOKEN=\n', 'TELEGRAM_BOT_TOKEN'), '')
         self.assertIsNone(common.env_value('export TELEGRAM_BOT_TOKEN=x\n', 'TELEGRAM_BOT_TOKEN'))
 
 
