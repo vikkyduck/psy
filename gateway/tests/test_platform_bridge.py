@@ -279,6 +279,13 @@ class PlatformBridge(unittest.TestCase):
                     self.assertEqual(kind, issue.kind)
                     self.assertEqual(reset, issue.reset if type(issue.reset) is int else None)
 
+    def test_quota_wait_in_seconds_becomes_a_moment(self):
+        before = time.time()
+        kind, reset = bridge.classify(429, {"type": "usage_limit_reached", "resets_in_seconds": 120})
+        self.assertEqual(kind, "quota")
+        self.assertTrue(before + 119 <= reset <= time.time() + 121)
+        self.assertEqual(bridge.classify(429, {"type": "usage_limit_reached", "resets_in_seconds": -5}), ("quota", None))
+
     def test_401_is_retried_once_with_a_fresh_login(self):
         self.codex.replies += [answer(401, {"error": {"code": "token_expired"}}), sse(STREAM)]
         self.assertEqual(self.call("POST", "/responses", MINIMAL), (200, "text/event-stream", STREAM))

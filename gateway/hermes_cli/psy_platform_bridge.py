@@ -128,7 +128,13 @@ def classify(status, detail):
     codes = (detail.get("code"), detail.get("type"))
     if any(code in QUOTA for code in codes):
         reset = detail.get("resets_at")
-        return "quota", reset if type(reset) in (int, float) and math.isfinite(reset) else None
+        if type(reset) in (int, float) and math.isfinite(reset):
+            return "quota", reset
+        # Some refusals give only the wait. The platform schedules by a moment in time.
+        wait = detail.get("resets_in_seconds")
+        if type(wait) in (int, float) and math.isfinite(wait) and 0 <= wait <= 30 * 86400:
+            return "quota", int(time.time() + wait)
+        return "quota", None
     if any(code in CONTEXT for code in codes):
         return "context", None
     if status == 429 or "rate_limit_exceeded" in codes:

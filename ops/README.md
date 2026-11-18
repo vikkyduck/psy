@@ -195,6 +195,18 @@ sudo curl --unix-socket /run/psy-platform-bridge.sock 'http://x/health?deep=1'
 
 `ops/update_live.py` обновляет модуль и unit-файлы моста вместе с остальным релизом. Если сокет включен, сценарий перезапускает его, а с ним и работающий мост. needrestart мост не перезапускает, psy-restart-outdated его тоже не обслуживает: после обновления системных библиотек выполните `sudo systemctl restart psy-platform-bridge.socket`. psy-alerts за мостом не следит, его состояние показывает `systemctl status psy-platform-bridge`.
 
+### Общий порт 80 с nginx платформы
+
+Сертификат Mini App продлевается через `certbot --standalone`: на время проверки certbot сам открывает порт 80. Когда на сервере работает nginx платформы, порт 80 занят, и продление не пройдет. Переведите линию psy-upload-ip на общий каталог, который nginx отдает по пути `/.well-known/acme-challenge/`. В UPLOAD_IP укажите IP из PSY_PUBLIC_URL.
+
+```sh
+sudo install -d -m 755 /var/www/acme
+sudo /opt/psy-upload-venv/bin/certbot certonly --webroot -w /var/www/acme --cert-name psy-upload-ip --preferred-profile shortlived --ip-address "$UPLOAD_IP" --deploy-hook /usr/local/libexec/psy-upload-deploy-cert --non-interactive
+sudo /opt/psy-upload-venv/bin/certbot renew --cert-name psy-upload-ip --dry-run
+```
+
+certbot запоминает способ проверки в настройке линии, таймер psy-upload-cert-renew менять не нужно. Сайт nginx для порта 80 с этим каталогом описан в плане переезда платформы (репозиторий Kotu, `ops/ПЕРЕЕЗД-AMS3.md`, шаг 3). Его нужно включить до перевыпуска, иначе проверка не найдет файл.
+
 ### Инструменты платформы для агента владельца
 
 Платформа поднимает свой MCP-сервер на отдельном порту 5011. Он привязан только к 127.0.0.1, nginx его не проксирует. Чтобы агент владельца видел инструменты платформы, добавьте сервер в /home/hermes/.hermes/config.yaml:
