@@ -28,14 +28,14 @@ jobs:
       - name: Test Codex renewal across the gateway, monitor and Hermes
         run: |
           python3 -m venv "$RUNNER_TEMP/oauth-tests"
-          "$RUNNER_TEMP/oauth-tests/bin/pip" install "httpx==0.28.1" "ruamel.yaml==0.18.16" "python-dotenv==1.2.4"
+          "$RUNNER_TEMP/oauth-tests/bin/pip" install --require-hashes -r gateway/integration/requirements.lock.txt
           "$RUNNER_TEMP/oauth-tests/bin/python" -B gateway/integration/codex_renewal.py "$RUNNER_TEMP/hermes"
           "$RUNNER_TEMP/oauth-tests/bin/python" -B gateway/integration/renewal_commit.py "$RUNNER_TEMP/hermes"
           "$RUNNER_TEMP/oauth-tests/bin/python" -B gateway/integration/lecture_recovery.py "$RUNNER_TEMP/hermes"
       - name: Exercise the Mini App with synthetic recordings over loopback
         run: |
           python3 -m venv "$RUNNER_TEMP/psy-venv"
-          "$RUNNER_TEMP/psy-venv/bin/pip" install -r media/requirements.lock.txt
+          "$RUNNER_TEMP/psy-venv/bin/pip" install --require-hashes -r media/requirements.lock.txt
           "$RUNNER_TEMP/psy-venv/bin/python" media/tests/run.py
       - name: Unit tests for credentials and service recovery
         run: PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=ops/libexec python3 -m unittest discover -s ops/tests -v
@@ -66,7 +66,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends ffmpeg python3-venv
           python3 -m venv "$RUNNER_TEMP/asr"
-          "$RUNNER_TEMP/asr/bin/pip" install -r media/asr-requirements.lock.txt
+          "$RUNNER_TEMP/asr/bin/pip" install --require-hashes -r media/asr-requirements.lock.txt
       - name: Verify the public model before running it on generated audio
         run: |
           revision=ebe41f70d5b6dfa9166e2c581c45c9c0cfc57b66
