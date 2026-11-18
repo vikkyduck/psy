@@ -82,8 +82,26 @@ class Inventory(unittest.TestCase):
         with self.assertRaises(SystemExit):
             inventory.query('unknown')
 
+    def test_platform_bridge_is_socket_activated_and_staged_with_the_runtime(self):
+        files = set(inventory.query('unit-files', 'platform'))
+        self.assertEqual(files, {'psy-platform-bridge.socket', 'psy-platform-bridge.service'})
+        self.assertTrue(files.isdisjoint(inventory.query('unit-files', 'runtime')))
+        self.assertIn('psy-platform-bridge.socket', inventory.query('idle'))
+        self.assertIn('bash "$ops/install-platform-bridge"', (OPS / 'install-runtime').read_text())
+        activated = [name for name, unit in UNITS.items() if unit['kind'] == 'socket-service']
+        self.assertEqual(activated, ['psy-platform-bridge.service'])
+        for name in activated:
+            socket = bare(name) + '.socket'
+            self.assertEqual(UNITS[socket]['kind'], 'socket')
+            service = (OPS / 'systemd' / name).read_text()
+            # Started by its socket only, and stopped or restarted with it.
+            self.assertNotIn('[Install]', service, name)
+            self.assertIn(f'\nRequires={socket}\n', service)
+            self.assertRegex((OPS / 'systemd' / socket).read_text(), r'(?m)^Accept=no$')
+
     def test_installers_and_checks_read_the_inventory(self):
-        for script in ('prepare-host', 'install-runtime', 'install-backup', 'test-host', 'restore-permissions'):
+        for script in ('prepare-host', 'install-runtime', 'install-backup', 'install-platform-bridge', 'test-host',
+                       'restore-permissions'):
             text = (OPS / script).read_text()
             self.assertIn('inventory.py', text, script)
             self.assertNotRegex(text, r'psy-(healthcheck|alerts|vault-archive)\.timer', script)

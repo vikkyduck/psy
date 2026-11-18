@@ -1,0 +1,10 @@
+[Unit]
+Description=Socket of the PSY platform bridge (root and the psy-platform group only)
+[Socket]
+ListenStream=/run/psy-platform-bridge.sock
+SocketUser=hermes
+SocketGroup=psy-platform
+SocketMode=0660
+Accept=no
+[Install]
+WantedBy=sockets.target

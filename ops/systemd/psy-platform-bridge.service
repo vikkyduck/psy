@@ -1,0 +1,51 @@
+[Unit]
+Description=PSY bridge lending the owner's Codex login and owner notices to the co-located platform
+# Started only by its socket. Requires= takes a running bridge along when the socket restarts.
+Requires=psy-platform-bridge.socket
+After=psy-platform-bridge.socket network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/home/hermes/.hermes
+Environment=HOME=/home/hermes USER=hermes LOGNAME=hermes
+Environment=HERMES_HOME=/home/hermes/.hermes PSY_PLATFORM_PEERS=kotu
+EnvironmentFile=/etc/psy/instance.env
+# Lend nothing from a checkout that differs from the audited release: the gateway's own start check.
+ExecStartPre=/usr/bin/python3 -I /usr/local/lib/psy-group/preflight.py
+ExecStart=/home/hermes/.hermes/hermes-agent/.hermes/bin/hermes --run-module hermes_cli.psy_platform_bridge
+Restart=on-failure
+RestartSec=5
+RestartSteps=5
+RestartMaxDelaySec=2min
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/hermes
+ReadWritePaths=/home/hermes
+PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+LockPersonality=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+# Codex and Telegram over TCP, the platform over the Unix socket.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# At most 8 requests of up to 32 MiB at a time. The gateway keeps its memory (OOMScoreAdjust=-300 there).
+MemoryMax=1G
+TasksMax=64

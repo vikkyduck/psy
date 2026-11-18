@@ -1,5 +1,5 @@
 {
-  "comment": "The one list of PSY systemd units. Read by prepare-host, install-runtime, install-backup, test-host and restore-permissions through ops/inventory.py; psy_alerts.py and the tests in ops/tests/test_inventory.py are checked against it. kind: daemon (long-running, must be active), socket, socket-instance, check (oneshot started by its timer), alert-instance, optional (kept for history, not installed). installer: runtime (install-runtime), backup (install-backup), none. alert: gets the owner-alert OnFailure= drop-in. max_gap: longest normal time in seconds between two runs of the timer, checked by psy-alerts.",
+  "comment": "The one list of PSY systemd units. Read by prepare-host, install-runtime, install-backup, install-platform-bridge, test-host and restore-permissions through ops/inventory.py; psy_alerts.py and the tests in ops/tests/test_inventory.py are checked against it. kind: daemon (long-running, must be active), socket, socket-instance, socket-service (started by its socket on the first connection, Accept=no, and restarted through it; not watched by psy-alerts), check (oneshot started by its timer), alert-instance, optional (kept for history, not installed). installer: runtime (install-runtime), backup (install-backup), platform (install-platform-bridge), none. install-runtime runs install-backup and install-platform-bridge too, so every installed unit exists on a staged host. alert: gets the owner-alert OnFailure= drop-in. max_gap: longest normal time in seconds between two runs of the timer, checked by psy-alerts.",
   "on_failure": "psy-alert@%n.service",
   "restart_order": ["psy-asr.service", "psy-upload-worker.service", "psy-upload.service", "hermes-gateway.service"],
   "units": {
@@ -11,6 +11,8 @@
     "psy-group-upload.socket": {"kind": "socket", "installer": "runtime"},
     "psy-member@.service": {"kind": "socket-instance", "installer": "runtime"},
     "psy-group-upload@.service": {"kind": "socket-instance", "installer": "runtime"},
+    "psy-platform-bridge.socket": {"kind": "socket", "installer": "platform"},
+    "psy-platform-bridge.service": {"kind": "socket-service", "installer": "platform"},
     "psy-alerts.service": {"kind": "check", "installer": "runtime", "timer": "psy-alerts.timer", "max_gap": 600},
     "psy-alert@.service": {"kind": "alert-instance", "installer": "runtime"},
     "psy-healthcheck.service": {"kind": "check", "installer": "runtime", "alert": true, "timer": "psy-healthcheck.timer", "max_gap": 600},

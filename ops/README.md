@@ -128,7 +128,7 @@ systemctl list-timers 'psy-*'
 - Автоматические обновления Ubuntu (unattended-upgrades) вызывают needrestart. Файл /etc/needrestart/conf.d/50-psy.conf запрещает ему перезапускать hermes-gateway и службы psy-*, поэтому днем бот и распознавание не прерываются. psy-restart-outdated.timer ночью, с 01:00 до 04:40 по Москве каждые 20 минут, спрашивает needrestart, какие из этих служб работают на устаревших библиотеках. Перезапуск выполняется только при простое: в очереди группы нет заданий queued, running или sending, в очереди записей нет ожидающих и обрабатываемых файлов, а последнее входящее сообщение Telegram пришло больше 20 минут назад. Порядок: psy-asr, psy-upload-worker, psy-upload, затем шлюз. Неудачный перезапуск вызывает уведомление владельцу. Проверка без перезапуска: `sudo python3 -I /usr/local/libexec/psy-restart-outdated.py --check-only`.
 - psy-upload-cert-renew раз в 12 часов проверяет необходимость продления. На узле с общей службой ACME согласуйте выбранный способ продления для этого адреса.
 - Исходники psy-audio-priority сохранены для воспроизводимости истории конфигурации. Таймер контролировал факультативную сборку Telegram Bot API. На исходном узле он выключен, сборка отсутствует. install-runtime пропускает эти unit. Штатная очередь распознавания работает через psy-asr и psy-upload-worker.
-- Список unit, таймеров и подключений к уведомлениям владельцу хранится в одном файле ops/inventory.json. prepare-host, install-runtime, install-backup, test-host и restore-permissions читают его через ops/inventory.py, а тест ops/tests/test_inventory.py сверяет с ним проверки psy-alerts и файлы ops/systemd. Новую службу добавляют сначала в inventory.json. install-runtime также вызывает install-backup: код и unit-файлы копирования ставятся вместе с остальными, но таймер не включается.
+- Список unit, таймеров и подключений к уведомлениям владельцу хранится в одном файле ops/inventory.json. prepare-host, install-runtime, install-backup, install-platform-bridge, test-host и restore-permissions читают его через ops/inventory.py, а тест ops/tests/test_inventory.py сверяет с ним проверки psy-alerts и файлы ops/systemd. Новую службу добавляют сначала в inventory.json. install-runtime также вызывает install-backup и install-platform-bridge: код и unit-файлы копирования и моста платформы ставятся вместе с остальными, но таймер и сокет не включаются.
 
 ## Обновление работающего узла
 
@@ -164,6 +164,64 @@ sudo python3 ops/update_live.py rollback /var/lib/psy-deploy/<папка>
 
 Проверки, которые требуют Telegram, перечислены в [инструкции восстановления](../docs/RESTORE.md). Они включают настройку кнопки, пробную загрузку и подтверждение результата в целевом чате.
 
+
+## Мост для соседней платформы
+
+На этом сервере может работать платформа kotu: Node.js-приложение под отдельным пользователем Linux kotu. Ей нужна та же подписка ChatGPT, что и ПСИ. Второй вход в подписку для платформы не заводят: если две программы обновляют один refresh token, текущий вход может быть аннулирован. Платформа обращается к Codex только через мост psy-platform-bridge, локальную службу на Unix-сокете /run/psy-platform-bridge.sock.
+
+Мост работает от hermes и берет учетные данные из профиля через тот же модуль `hermes_cli/psy_codex_policy.py`, что и групповой обработчик. Своей копии входа, своего таймера и своего обновления у моста нет. Если ключ доступа скоро истекает или модель ответила 401, обновление идет по общему пути: под блокировкой хранилища и с журналом одноразового ключа. У входа остается один владелец, профиль hermes. Тот же мост передает владельцу короткие сообщения платформы в личный чат с ботом.
+
+Сокет принадлежит hermes и группе psy-platform, режим 0660. Кроме того, мост проверяет учетную запись каждого соединения через SO_PEERCRED. Разрешены root и пользователи из PSY_PLATFORM_PEERS, в unit-файле это kotu. Остальные, включая процессы hermes и терминал агента, получают 403.
+
+| Запрос | Что делает |
+|---|---|
+| `GET /health` | Отвечает `{"ok": true}` без обращения к учетным данным. С `?deep=1` проверяет вход Codex и отвечает `{"ok": true, "codex": "ready"}` или 503 с видом проблемы, например `{"ok": false, "codex": "signin"}` |
+| `POST /responses` | Принимает запрос Responses API: model, instructions, input и только поля tools (web_search), tool_choice, include, reasoning, text, prompt_cache_key, parallel_tool_calls. Мост сам выставляет `stream: true` и `store: false` и без изменений передает поток SSE от Codex |
+| `POST /images` | Создает изображение gpt-image-2 нужного размера, по умолчанию 1536x864, и возвращает PNG в base64 |
+| `POST /notify` | Отправляет владельцу текст до 3500 символов. Тот же текст в течение 10 минут повторно не отправляется, за час проходит не больше 30 сообщений |
+
+Ошибка приходит в виде `{"error": {"kind": "..."}}`. Если запрос отклонил Codex, мост возвращает его HTTP-статус, а при исчерпанном лимите и время восстановления resets_at. Повтор имеет смысл для busy, timeout, connection, unavailable и access_wait. signin ждет нового входа владельца, quota ждет resets_at, context означает слишком большой запрос. Одновременно выполняется не больше 8 запросов, тело запроса ограничено 32 МиБ. В журнал попадают только метод, путь, статус, длительность и вид ошибки, без токенов, запросов и текстов.
+
+Unit-файлы ставит `ops/install-platform-bridge`. Сценарий создает группу psy-platform, добавляет в нее kotu и ничего не включает. install-runtime вызывает его сам, поэтому на подготовленном узле unit-файлы уже есть, а сокет выключен. Когда на сервере появился пользователь kotu, выполните:
+
+```sh
+sudo bash ops/install-platform-bridge
+sudo systemctl enable --now psy-platform-bridge.socket
+sudo curl --unix-socket /run/psy-platform-bridge.sock http://x/health
+sudo curl --unix-socket /run/psy-platform-bridge.sock 'http://x/health?deep=1'
+```
+
+Если kotu еще нет, сценарий сообщает об этом. Запустите его повторно после создания пользователя, затем перезапустите платформу, чтобы ее процессы получили группу psy-platform. Служба моста стартует при первом подключении к сокету. Перед стартом она выполняет ту же проверку preflight, что и шлюз, поэтому при измененных файлах Hermes мост не запускается. Журнал: `journalctl -u psy-platform-bridge`.
+
+`ops/update_live.py` обновляет модуль и unit-файлы моста вместе с остальным релизом. Если сокет включен, сценарий перезапускает его, а с ним и работающий мост. needrestart мост не перезапускает, psy-restart-outdated его тоже не обслуживает: после обновления системных библиотек выполните `sudo systemctl restart psy-platform-bridge.socket`. psy-alerts за мостом не следит, его состояние показывает `systemctl status psy-platform-bridge`.
+
+### Общий порт 80 с nginx платформы
+
+Сертификат Mini App продлевается через `certbot --standalone`: на время проверки certbot сам открывает порт 80. Когда на сервере работает nginx платформы, порт 80 занят, и продление не пройдет. Переведите линию psy-upload-ip на общий каталог, который nginx отдает по пути `/.well-known/acme-challenge/`. В UPLOAD_IP укажите IP из PSY_PUBLIC_URL.
+
+```sh
+sudo install -d -m 755 /var/www/acme
+sudo /opt/psy-upload-venv/bin/certbot certonly --webroot -w /var/www/acme --cert-name psy-upload-ip --preferred-profile shortlived --ip-address "$UPLOAD_IP" --deploy-hook /usr/local/libexec/psy-upload-deploy-cert --non-interactive
+sudo /opt/psy-upload-venv/bin/certbot renew --cert-name psy-upload-ip --dry-run
+```
+
+certbot запоминает способ проверки в настройке линии, таймер psy-upload-cert-renew менять не нужно. Сайт nginx для порта 80 с этим каталогом описан в плане переезда платформы (репозиторий Kotu, `ops/ПЕРЕЕЗД-AMS3.md`, шаг 3). Его нужно включить до перевыпуска, иначе проверка не найдет файл.
+
+### Инструменты платформы для агента владельца
+
+Платформа поднимает свой MCP-сервер на отдельном порту 5011. Он привязан только к 127.0.0.1, nginx его не проксирует. Чтобы агент владельца видел инструменты платформы, добавьте сервер в /home/hermes/.hermes/config.yaml:
+
+```yaml
+mcp_servers:
+  kotu:
+    url: "http://127.0.0.1:5011/mcp"
+    headers:
+      Authorization: "Bearer ${KOTU_MCP_TOKEN}"
+```
+
+Сам токен храните не в config.yaml, а строкой `KOTU_MCP_TOKEN=...` в закрытом .env профиля: /home/hermes/.hermes/.env, владелец hermes, режим 0600. При загрузке MCP Hermes подставляет `${KOTU_MCP_TOKEN}` из .env профиля. Если переменной нет, Hermes не подключает этот сервер и называет недостающую переменную. После правки выполните `sudo systemctl reload hermes-gateway`: шлюз перезапустится мягко, после текущих ответов.
+
+Инструменты платформы доступны только в личном чате владельца. Сообщения группы останавливает граница `psy_group_route.py` до обработчиков, хуков и плагинов Hermes, данные группы никогда не попадают к агенту владельца. Поэтому участники группы не могут вызвать инструменты платформы, а материалы группы не уходят к ней через агента.
 
 ## Закрытые копии и внешний наблюдатель
 

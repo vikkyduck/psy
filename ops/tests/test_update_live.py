@@ -52,6 +52,16 @@ class ReleaseInventory(unittest.TestCase):
         self.assertEqual(live.units_for(live.COMMON / "psy_common.py"),
                          {"psy-upload", "psy-upload-worker", "hermes-gateway"})
 
+    def test_platform_bridge_restarts_through_its_socket(self):
+        socket = "psy-platform-bridge.socket"
+        self.assertEqual(live.units_for(live.CHECKOUT / "hermes_cli/psy_platform_bridge.py"), {"hermes-gateway", socket})
+        self.assertEqual(live.units_for(live.CHECKOUT / "hermes_cli/auth.py"), {"hermes-gateway", socket})
+        self.assertEqual(live.units_for(live.SYSTEMD / "psy-platform-bridge.service"), {socket})
+        self.assertEqual(live.units_for(live.SYSTEMD / socket), {socket})
+        targets = {str(e.target) for e in live.system_entries(997)}
+        self.assertIn("/etc/systemd/system/psy-platform-bridge.service", targets)
+        self.assertNotIn("/etc/systemd/system/psy-platform-bridge.service.d/owner-alert.conf", targets)
+
     def test_owner_alerts_use_one_instance_per_failing_unit(self):
         entries = {str(e.target): e.data for e in live.system_entries(997)}
         alerted = [n for n, u in live.INSTALLED.items() if u.get("alert")]

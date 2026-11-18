@@ -10,7 +10,8 @@ PLATFORM = "plugins/platforms/telegram/"
 # The release inventory of gateway/apply.py (TRACKED + ADDED). A gateway test keeps them equal.
 EXPECTED = {
     "agent/auxiliary_client.py", "agent/credential_pool.py", "hermes_cli/auth.py", "hermes_cli/auth_codex.py",
-    "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_codex_policy.py", "tools/transcription_tools.py",
+    "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_platform_bridge.py",
+    "tools/transcription_tools.py",
     *(PLATFORM + name for name in (
         "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py", "psy_source_evidence.py",
         "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py", "psy_group_queue.py",
