@@ -49,7 +49,8 @@ UPLOAD_PYTHON = "/opt/psy-upload-venv/bin/python"
 DATABASES = (GROUP_DB, "/home/hermes/.hermes/vault/uploads/state.sqlite3",
              "/var/lib/psy-recording-receipts/results.sqlite3")
 
-# Kept in step with install-runtime and install-backup; units come from ops/inventory.json.
+# Kept in step with install-runtime, install-backup and install-platform-bridge;
+# units come from ops/inventory.json.
 MEDIA = ("access_broker", "asr_client", "asr_sandbox", "asr_service", "psy_upload_common", "queue_health",
          "recording_grant", "recording_receipts", "server", "storage_capacity", "transcribe", "worker")
 HELPERS = {"psy_codex_auth.py": "psy-codex-auth.py", "psy_healthcheck.py": "psy-healthcheck.py",
@@ -57,9 +58,14 @@ HELPERS = {"psy_codex_auth.py": "psy-codex-auth.py", "psy_healthcheck.py": "psy-
            "upload_healthcheck.py": "psy-upload-healthcheck.py", "psy_restart_outdated.py": "psy-restart-outdated.py",
            "deploy-cert": "psy-upload-deploy-cert"}
 INVENTORY = json.loads((REPO / "ops/inventory.json").read_text())
-INSTALLED = {name: unit for name, unit in INVENTORY["units"].items() if unit["installer"] in ("runtime", "backup")}
+INSTALLED = {name: unit for name, unit in INVENTORY["units"].items()
+             if unit["installer"] in ("runtime", "backup", "platform")}
 # Long-running services in restart order: the gateway last, once the upload side it calls is back.
 SERVICES = tuple(name.removesuffix(".service") for name in INVENTORY["restart_order"])
+# Socket-activated services run checkout code too and restart through their socket: Requires= in the
+# service takes a running bridge along, an idle one starts with the new code on the next connection.
+ACTIVATED = {name.removesuffix(".service"): name.removesuffix(".service") + ".socket"
+             for name, unit in INVENTORY["units"].items() if unit["kind"] == "socket-service"}
 GATEWAY_IMPORTS = {"psy_upload_common.py", "storage_capacity.py", "recording_grant.py"}  # via psy_upload_handoff
 NEEDRESTART = Path("/etc/needrestart/conf.d/50-psy.conf")
 BACKUP_LIB = Path("/usr/local/lib/psy-backup")
@@ -420,12 +426,14 @@ def plan(entries, now=None):
 def units_for(target):
     text = str(target)
     if text.startswith(str(CHECKOUT) + "/"):
-        return {"hermes-gateway"}
+        return {"hermes-gateway", *ACTIVATED.values()}
     if text.startswith(str(UPLOAD) + "/"):
         return {"psy-asr", "psy-upload-worker", "psy-upload"} | ({"hermes-gateway"} if target.name in GATEWAY_IMPORTS else set())
     if text.startswith(str(SYSTEMD) + "/"):
         name = Path(text).relative_to(SYSTEMD).parts[0].removesuffix(".d")
         unit = name.removesuffix(".service")
+        if unit in ACTIVATED:
+            return {ACTIVATED[unit]}
         return {unit} if unit in SERVICES else ({name} if name.endswith((".socket", ".timer")) else set())
     return set()
 
