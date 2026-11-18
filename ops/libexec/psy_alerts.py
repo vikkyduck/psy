@@ -11,6 +11,7 @@ run exits non-zero, so the broken alert path shows in `systemctl --failed` and i
 import argparse
 import calendar
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -18,12 +19,28 @@ import re
 import socket
 import sqlite3
 import ssl
-import stat
 import subprocess
+import sys
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 STATE = Path("/var/lib/psy-alerts")
 HOME = Path("/home/hermes/.hermes")
@@ -45,7 +62,6 @@ REMIND = (3600, 3 * 3600, 6 * 3600)   # gaps between reminders of one unresolved
 FAILING_AFTER = 3          # failed deliveries in a row before the run itself fails
 EVENTS = ("restart:", "gateway_health")   # one-off events: reported once, never "resolved"
 MAX_TEXT = 3500
-TOKEN = re.compile(r"[0-9]{5,15}:[A-Za-z0-9_-]{30,}")
 UNIT_NAME = re.compile(r"[A-Za-z0-9@_.:\\-]{1,200}")
 
 
@@ -111,32 +127,12 @@ def backup_problem(now, timer_enabled):
     return None
 
 
-def open_readonly(path):
-    """Read metadata without ever creating files next to the bot's database. A WAL database that no
-    process holds open has no -wal/-shm, and a read-only open would try to create them (as root);
-    it is fully checkpointed then, so read the file itself."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError("not a regular file")
-        header = stream.read(100)
-    if len(header) >= 20 and header[18] == 2 and not all(
-            os.path.exists(str(path) + side) for side in ("-wal", "-shm")):
-        return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
-    db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3)
-    try:
-        db.execute("SELECT count(*) FROM sqlite_master").fetchone()
-        return db
-    except sqlite3.OperationalError:
-        db.close()
-        return sqlite3.connect(path.as_uri() + "?mode=ro&immutable=1", uri=True, timeout=3)
-
-
 def group_status(path, now):
     """Read metadata only. Neither checkpoint text nor participant data leave the host."""
     if not path.exists():
         return ["Хранилище заданий группы недоступно."]
-    db = open_readonly(path)
+    # Root never creates files next to the bot's database (see psy_common.open_readonly).
+    db = common.open_readonly(path)
     try:
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if "job_progress" not in tables:
@@ -242,35 +238,22 @@ def collect(previous, now):
     return problems, counters
 
 
-def read_regular(path, limit=1 << 20):
-    """Read a small regular file without following a link or blocking on a FIFO."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError("not a regular file")
-        return stream.read(limit).decode("utf-8", errors="replace")
-
-
 def token():
     """The root-only systemd credential first, then the environment, then the profile .env."""
     directory = os.environ.get("CREDENTIALS_DIRECTORY")
     if directory:
         try:
-            staged = (Path(directory) / "telegram").read_text().strip()
-        except OSError:
-            staged = ""
-        if TOKEN.fullmatch(staged):   # an unstaged credential arrives as a placeholder
-            return staged
+            return common.bot_token((Path(directory) / "telegram").read_text().strip())
+        except (OSError, ValueError):
+            pass   # an unstaged credential arrives as a placeholder
     supplied = os.environ.get("TELEGRAM_BOT_TOKEN")
     if supplied:
         return supplied
+    # The profile is writable by the bot: never follow a link or block on a FIFO planted there.
     credential = Path(os.environ.get("PSY_TELEGRAM_CREDENTIAL_FILE", str(HOME / ".env")))
-    for line in read_regular(credential).splitlines():
-        key, separator, value = line.partition("=")
-        if separator and key.strip() == "TELEGRAM_BOT_TOKEN":
-            value = value.strip().strip("\"'")
-            if value:
-                return value
+    value = common.env_value(common.read_regular(credential).decode("utf-8", errors="replace"), "TELEGRAM_BOT_TOKEN")
+    if value:
+        return value
     raise ValueError("credential missing")
 
 
@@ -283,28 +266,18 @@ class Later(Exception):
 
 
 def send_owner(text):
-    owner = os.environ.get("PSY_OWNER_ID", "")
-    if not owner.isdecimal() or int(owner) <= 0:
-        raise ValueError("Invalid owner")
-    body = urllib.parse.urlencode(dict(chat_id=owner, text=text, protect_content="true")).encode()
-    request = urllib.request.Request("https://api.telegram.org/bot" + token() + "/sendMessage", data=body)
+    owner = common.telegram_id(os.environ.get("PSY_OWNER_ID", ""), "PSY_OWNER_ID")   # never a group
+    message = dict(chat_id=owner, text=text, protect_content="true")
     # Never print exception strings, URLs, request bodies or credential paths: status codes only.
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
-            answer = json.load(response)
-    except urllib.error.HTTPError as error:
-        retry = 300
-        if error.code == 429:
-            try:
-                retry = json.loads(error.read(8192)).get("parameters", {}).get("retry_after", 60)
-            except ValueError:
-                retry = 60
-        raise Later(retry, f"http={error.code}") from None
-    except (urllib.error.URLError, OSError, ValueError) as error:
-        raise Later(60, "network=" + type(error).__name__) from None
-    if not answer.get("ok"):
-        raise Later(answer.get("parameters", {}).get("retry_after", 300), f"api={answer.get('error_code')}")
-    if str(answer["result"]["chat"]["id"]) != owner:
+        result = common.bot_call(token(), "sendMessage", message, timeout=15, form=True)
+    except common.BotApiError as error:
+        if error.status == 429 or error.kind == "network":
+            retry = 60 if error.retry_after is None else error.retry_after
+        else:
+            retry = 300 if error.retry_after is None else error.retry_after
+        raise Later(retry, error.reason) from None
+    if str(result["chat"]["id"]) != str(owner):
         raise ValueError("Owner delivery mismatch")
 
 
@@ -455,10 +428,7 @@ def main():
         update_alerts(state, problems, now)
         state["counters"] = counters
         state["checked_at"] = now
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(state))
-        temporary.chmod(0o600)
-        temporary.replace(path)
+        common.atomic_write(path, json.dumps(state).encode())
         failures = state.get("delivery", {}).get("failures", 0)
         if failures >= FAILING_AFTER:
             print(f"alerts_delivery_failing failures={failures} {state['delivery'].get('reason', 'unknown')}")

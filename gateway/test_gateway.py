@@ -15,7 +15,9 @@ def main():
     checkout = parser.parse_args().checkout.resolve()
     run(checkout, apply=False)
     os.environ.update(PSY_OWNER_ID="101", PSY_GROUP_ID="-202", PSY_BOT_ID="303",
-                      PSY_BOT_USERNAME="DemoTestBot", PSY_PUBLIC_URL="https://example.invalid")
+                      PSY_BOT_USERNAME="DemoTestBot", PSY_PUBLIC_URL="https://example.invalid",
+                      # Installed code loads /usr/local/lib/psy-common/psy_common.py; tests use this copy.
+                      PSY_COMMON_PATH=str(HERE.parent/"common/psy_common.py"))
     # Load the actual restored modules without starting the real Telegram adapter.
     sys.path.insert(0, str(checkout))
     pkg = types.ModuleType("psy_modules")

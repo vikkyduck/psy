@@ -8,10 +8,12 @@ if systemctl is-active --quiet hermes-gateway.service; then
     exit 1
 fi
 install -d -m 0700 /etc/psy-observer
-install -d -m 0755 /usr/local/libexec
+install -d -m 0755 /usr/local/libexec /usr/local/lib/psy-common
 if [[ ! -e /etc/psy-observer/instance.env ]]; then
     install -m 0600 "$ops/observer/instance.env.example" /etc/psy-observer/instance.env
 fi
+# psy-alerts loads the shared helpers by this path.
+install -m 0644 "$ops/../common/psy_common.py" /usr/local/lib/psy-common/psy_common.py
 install -m 0644 "$ops/libexec/psy_alerts.py" /usr/local/libexec/psy-alerts.py
 install -m 0644 "$ops/observer/psy-alerts.service" /etc/systemd/system/psy-alerts.service
 install -m 0644 "$ops/systemd/psy-alerts.timer" /etc/systemd/system/psy-alerts.timer

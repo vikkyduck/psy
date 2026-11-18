@@ -9,7 +9,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from psy_modules import psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 
 
 BLOCK_SIZE = 1024
@@ -54,7 +55,7 @@ class LectureEndpoint:
     def reply(self, payload):
         instruction = payload["instructions"]
         complete = True
-        if model.DISPATCH in instruction:
+        if prompts.DISPATCH in instruction:
             text = 'PSY_TASK {"minutes":30,"public_topic":"Synthetic"}'
         elif "Сейчас нужен внутренний редакционный" in instruction:
             plan = {"title": PLAN_TITLE, "sections": [{"title": "Теория", "brief": "Тезис",
@@ -69,7 +70,7 @@ class LectureEndpoint:
         elif "Проверь содержание раздела" in instruction:
             self.chapter_reviews.extend(prose_fragments(payload))
             text = '{"missing":""}'
-        elif instruction == model.REVIEW:
+        elif instruction == prompts.REVIEW:
             self.source_reviews.extend(prose_fragments(payload))
             text = '{"edits":[]}'
         else:
@@ -82,10 +83,10 @@ class LectureEndpoint:
         fake_http.TimeoutException = type("TimeoutException", (fake_http.RequestError,), {})
         source_cards = encode({"claims": [{"support": SOURCE}], "gaps": []})
         with patch.dict(sys.modules, {"httpx": fake_http}), patch.object(
-                model, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(
-                model, "_primary_sources", return_value=model.Result(source_cards, [], 1)):
-            return model._compose(self, [model._user(QUESTION)], False, "fixture", QUESTION,
-                                  checkpoints=checkpoints)
+                codex, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(
+                pipeline, "_primary_sources", return_value=model.Result(source_cards, [], 1)):
+            return pipeline._compose(self, [codex._user(QUESTION)], False, "fixture", QUESTION,
+                                     checkpoints=checkpoints)
 
 
 class SupplementEndpoint(LectureEndpoint):
@@ -181,7 +182,7 @@ class ContinuationCost(unittest.TestCase):
             self.assertEqual(store.pending(7, 12, "{}", root=root), "queued")
             self.assertEqual(store.claim_next(root=root)[0], 12)
             with patch.object(interrupted, "reply", side_effect=interrupt):
-                with self.assertRaises(model._ResumeModelJob):
+                with self.assertRaises(codex._ResumeModelJob):
                     interrupted.compose(store.Checkpoints(12, root=root))
 
             self.assertEqual(store.recover(root=root), 1)

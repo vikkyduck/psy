@@ -9,6 +9,8 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+# Installed scripts load /usr/local/lib/psy-common/psy_common.py; tests use the repository copy.
+os.environ.setdefault('PSY_COMMON_PATH', str(Path(__file__).resolve().parents[2] / 'common/psy_common.py'))
 import psy_alerts as alerts
 
 

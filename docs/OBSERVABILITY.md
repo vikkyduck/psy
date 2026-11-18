@@ -20,7 +20,7 @@
 sudo bash ops/install-observer
 ```
 
-Установщик копирует psy_alerts.py и unit-файлы, создает закрытый шаблон. Он не включает таймер и не отправляет сообщения. В /etc/psy-observer/instance.env заполните положительный ID владельца и актуальный PSY_PUBLIC_URL. Затем сохраните прежний токен бота через скрытый ввод:
+Установщик копирует psy_alerts.py, общий модуль /usr/local/lib/psy-common/psy_common.py, без которого psy_alerts.py не запускается, и unit-файлы, создает закрытый шаблон. При обновлении узла снова запустите install-observer, а не копируйте один psy_alerts.py. Он не включает таймер и не отправляет сообщения. В /etc/psy-observer/instance.env заполните положительный ID владельца и актуальный PSY_PUBLIC_URL. Затем сохраните прежний токен бота через скрытый ввод:
 
 ```sh
 sudo python3 ops/stage-observer.py

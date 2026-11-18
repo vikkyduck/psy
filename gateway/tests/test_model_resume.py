@@ -20,7 +20,9 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(sys.argv[1]).parents[2]))
     sys.modules[pkg.__name__] = pkg
 
-from psy_modules import psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_continuation as continuation, psy_group_pipeline as pipeline
+from psy_modules import psy_group_prompts as prompts, psy_group_sources as sources
 
 
 class FakeHttp(types.ModuleType):
@@ -59,7 +61,7 @@ def run_child(root, kind, interrupt):
 
     def stream(client, headers, messages, web, selected_model, *, instructions, **kwargs):
         step = None
-        if model.DISPATCH in instructions:
+        if prompts.DISPATCH in instructions:
             step = "dispatch"
             task = {"minutes": 60} if kind == "lecture" else {"public_topic": "Synthetic public topic"}
             text = "PSY_TASK " + json.dumps(task)
@@ -76,13 +78,13 @@ def run_child(root, kind, interrupt):
         elif match := re.search(r'Проверь содержание раздела "Chapter (\d+)"', instructions):
             index = int(match.group(1))
             step, text = f"check-{index}", json.dumps({"missing": "", "checked_chapter": index})
-        elif instructions == model.WEB_SYSTEM:
+        elif instructions == prompts.WEB_SYSTEM:
             step, text = "sources", "Public notes"
-        elif instructions == model.SOURCE_CHECK:
+        elif instructions == prompts.SOURCE_CHECK:
             card = dict(author="A", work="W", date="2001", location="p.1", support="quotation",
                         claim="Original assertion", access="full_text", url=source)
             step, text = "source-check", json.dumps({"claims": [card], "gaps": []})
-        elif instructions == model.REVIEW:
+        elif instructions == prompts.REVIEW:
             step = "review"
             text = json.dumps({"edits": [{"before": "draft assertion", "after": "verified assertion"}]})
         else:
@@ -94,11 +96,11 @@ def run_child(root, kind, interrupt):
             os._exit(83)
         return model.Result(text, [], int(web), source_urls=(source,) if web else ())
 
-    with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(
-        model, "_connection", return_value=("", {}, "fixture-generation")
-    ), patch.object(model, "_stream", stream):
-        result = model._compose(None, [model._user(question)], kind == "analysis", "fixture", question,
-                                checkpoints=Checkpoints(ident, root=root))
+    with patch.object(sources.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(
+        codex, "_connection", return_value=("", {}, "fixture-generation")
+    ), patch.object(codex, "_stream", stream):
+        result = pipeline._compose(None, [codex._user(question)], kind == "analysis", "fixture", question,
+                                   checkpoints=Checkpoints(ident, root=root))
     assert result.complete
     (root/"answer").write_text(result.text)
     store.settle(ident, True, root=root)
@@ -142,7 +144,7 @@ class ModelRestart(unittest.TestCase):
 
         checkpoints = Memory()
         question = "A question"
-        turns = [model._user(question)]
+        turns = [codex._user(question)]
         kept = "Original paragraph. " * 500
         hidden = "Private commentary. " * 500
         def events():
@@ -154,25 +156,25 @@ class ModelRestart(unittest.TestCase):
             raise Interrupted()
         def restored(*args, instructions, **kwargs):
             inputs = args[2]
-            expected_tail = kept.strip()[-model.CONTINUATION_TAIL_CHARS:]
+            expected_tail = kept.strip()[-continuation.CONTINUATION_TAIL_CHARS:]
             self.assertEqual(inputs[-2], {"role": "assistant", "content": expected_tail})
             self.assertNotIn(hidden.strip(), str(inputs))
             return model.Result("Restored ending.", [], 0)
         client = Mock()
         client.stream.return_value = nullcontext(Mock(status_code=200, iter_lines=events))
-        with patch.object(model.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(model, "_connection", return_value=("", {}, "fixture-generation")):
+        with patch.object(sources.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(codex, "_connection", return_value=("", {}, "fixture-generation")):
             with self.assertRaises(Interrupted):
-                model._compose(client, turns, False, "fixture", question, checkpoints=checkpoints)
+                pipeline._compose(client, turns, False, "fixture", question, checkpoints=checkpoints)
             self.assertNotIn(hidden[:100], json.dumps(checkpoints))
-            with patch.object(model, "_stream", side_effect=restored) as provider:
-                result = model._compose(None, turns, False, "fixture", question, checkpoints=checkpoints)
+            with patch.object(codex, "_stream", side_effect=restored) as provider:
+                result = pipeline._compose(None, turns, False, "fixture", question, checkpoints=checkpoints)
                 self.assertEqual(provider.call_count, 1)
             self.assertTrue(result.complete)
             self.assertEqual(result.text, kept.strip()+"\nRestored ending.")
 
-            with patch.object(model, "_stream", return_value=model.Result("different answer", [], 0)) as provider:
-                fresh = model._compose(None, [model._user("Different question")], False, "fixture",
-                                       "Different question", checkpoints=checkpoints)
+            with patch.object(codex, "_stream", return_value=model.Result("different answer", [], 0)) as provider:
+                fresh = pipeline._compose(None, [codex._user("Different question")], False, "fixture",
+                                          "Different question", checkpoints=checkpoints)
                 self.assertEqual((provider.call_count, fresh.text), (1, "different answer"))
 
 

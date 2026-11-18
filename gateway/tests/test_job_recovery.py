@@ -12,7 +12,8 @@ from types import SimpleNamespace as NS
 import unittest
 import test_delivery_resume as harness
 from test_delivery_resume import RetryAfter, queue, route, store
-from psy_modules import psy_group_codex as model
+from psy_modules import psy_group_client as codex, psy_group_codex as model
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 
 
 class Recovery(unittest.IsolatedAsyncioTestCase):
@@ -63,7 +64,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         accepted = []
         authenticated = False
         def stream(client, headers, messages, web, selected_model, *, instructions, **kwargs):
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 text = 'PSY_TASK {"minutes":60}'
             elif "Сейчас нужен внутренний редакционный" in instructions:
                 text = json.dumps(plan)
@@ -79,8 +80,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 self.fail("unexpected manuscript stage")
             return model.Result(text, [], 0)
         def run_model(turns, **opts):
-            return model._compose(None, turns, opts["research"], opts["model"], opts["question"],
-                                  checkpoints=opts["checkpoints"])
+            return pipeline._compose(None, turns, opts["research"], opts["model"], opts["question"],
+                                     checkpoints=opts["checkpoints"])
         async def send(*, document, **kwargs):
             accepted.append(document.read().decode())
             return NS(message_id=111)
@@ -88,9 +89,9 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         self.message.reply_text.return_value = NS(message_id=110)
         store.Checkpoints(self.ident).put("route:input:v1", dict(destination=[-202,7,0,100], doc_id=None,
                           question="write lecture",quote="",history=[],research=False,draw=False,model="fixture"))
-        with (patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture", {}, "fixture-generation")),
-              patch.object(model.codex_policy, "record_model_refusal") as refused,
-              patch.object(model,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
+        with (patch.object(codex,"_stream",stream), patch.object(codex,"_connection",return_value=("fixture", {}, "fixture-generation")),
+              patch.object(codex.codex_policy, "record_model_refusal") as refused,
+              patch.object(codex,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
             await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
             # Chapter 4 starts only after a sibling finished. Its sign-in failure halts the job:
             # siblings already streaming finish and keep their checkpoints, siblings that have not
@@ -147,7 +148,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             interrupted=True
             def stream(*args, instructions, **kwargs):
                 nonlocal first_calls
-                if model.DISPATCH in instructions:
+                if prompts.DISPATCH in instructions:
                     first_calls += 1
                     return model.Result("Первая глава.",[],0,False)
                 self.assertEqual(args[2][-2]["content"],"Первая глава.")
@@ -161,10 +162,10 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             store.Checkpoints(ident).put("route:input:v1",dict(destination=[-202,7,0,100],doc_id=None,
                         question="write lecture", quote="",history=[],research=False,draw=False,model="test"))
             def run_model(turns, **opts):
-                return model._compose(None,turns,False,"test",opts["question"],checkpoints=opts["checkpoints"])
+                return pipeline._compose(None,turns,False,"test",opts["question"],checkpoints=opts["checkpoints"])
             with (patch.object(queue.Update,"de_json",return_value=NS(message=self.message,update_id=ident)),
-                  patch.object(model,"_stream",stream), patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),
-                  patch.object(model,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
+                  patch.object(codex,"_stream",stream), patch.object(codex,"_connection",return_value=("fixture",{}, "fixture-generation")),
+                  patch.object(codex,"_transport",nullcontext), patch.object(model,"_respond",side_effect=run_model)):
                 await queue.run_job(self.app,asyncio.Event(),*store.claim_next())
                 self.assertEqual(store.state(ident),"queued")
                 self.assertEqual(len(received),1)
@@ -201,8 +202,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             client=Mock()
             client.stream.return_value=nullcontext(response)
             try:
-                model._compose(client, [model._user("synthetic")], False, "fixture", "synthetic", checkpoints=checkpoints)
-            except model._ResumeModelJob as interrupted:
+                pipeline._compose(client, [codex._user("synthetic")], False, "fixture", "synthetic", checkpoints=checkpoints)
+            except codex._ResumeModelJob as interrupted:
                 raise interrupted.issue
         async def group(msg):
             if msg.ident == 34:
@@ -211,8 +212,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.to_thread(classify, msg.checkpoints)
         with (patch.object(queue.Update, "de_json", side_effect=restore), patch.object(route, "group_message",group),
-              patch.object(model, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(model, "_transport", nullcontext),
-              patch.object(model, "time", NS(monotonic=lambda: getattr(clocks,"now",0)))):
+              patch.object(codex, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(codex, "_transport", nullcontext),
+              patch.object(codex, "time", NS(monotonic=lambda: getattr(clocks,"now",0)))):
             worker=asyncio.create_task(queue.work(self.app, wake))
             try:
                 await asyncio.wait_for(answered.wait(),5)

@@ -2,13 +2,30 @@
 import argparse
 import fcntl
 import getpass
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sys
-import urllib.error
-import urllib.request
 
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+# This tool runs from a release checkout: it uses the shared module shipped with it, and so does
+# the uploader settings module below, which finds it already loaded.
+psy_common = _common(Path(__file__).resolve().parents[1] / "common/psy_common.py")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "media"))
 import psy_upload_common as cfg
 
@@ -16,17 +33,7 @@ import psy_upload_common as cfg
 def save(state_path, value):
     # The parent is a private operator-owned directory. Keep the intent if
     # Telegram accepts a send but its reply cannot be received.
-    temporary = state_path.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle)
-        handle.flush()
-        os.fsync(handle.fileno())
-    temporary.replace(state_path)
-    directory = os.open(state_path.parent, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    psy_common.atomic_write(state_path, json.dumps(value).encode())
 
 
 def entries(call, install, folder):
@@ -94,22 +101,17 @@ def main():
     parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/psy-menu"))
     args = parser.parse_args()
     os.umask(0o077)
-    token, base = cfg.bot_settings() if "CREDENTIALS_DIRECTORY" in os.environ else (
-        getpass.getpass("Telegram bot token: "), "https://api.telegram.org/bot")
-    if token.partition(":")[0] != str(cfg.BOT_ID) or base != "https://api.telegram.org/bot":
-        raise ValueError("Invalid credential for this instance")
+    token = cfg.bot_settings()[0] if "CREDENTIALS_DIRECTORY" in os.environ else getpass.getpass("Telegram bot token: ")
+    try:
+        psy_common.bot_token(token, cfg.BOT_ID)
+    except ValueError:
+        raise ValueError("Invalid credential for this instance") from None
 
     def call(method, data):
-        req = urllib.request.Request(base + token + "/" + method, data=json.dumps(data).encode(),
-                                     headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=15) as response:
-                result = json.load(response)
-        except (OSError, ValueError):
-            raise ValueError(f"Telegram call failed: {method}") from None
-        if not result.get("ok"):
-            raise ValueError(f"Telegram declined: {method}")
-        return result["result"]
+            return psy_common.bot_call(token, method, data, timeout=15)
+        except psy_common.BotApiError as error:
+            raise ValueError(("Telegram declined: " if error.kind == "api" else "Telegram call failed: ") + method) from None
 
     return 0 if entries(call, args.action == "install", args.state_dir) else 1
 

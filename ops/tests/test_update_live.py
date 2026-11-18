@@ -41,6 +41,16 @@ class ReleaseInventory(unittest.TestCase):
             self.assertIn(path.rsplit("/", 1)[0], script + backup_script)
         self.assertIn("/etc/systemd/system/psy-restart-outdated.timer", targets)
         self.assertNotIn("/etc/psy-backup/destination.env", targets)
+        # The shared module goes first, where install-runtime puts it, and its digest is in the release.
+        entries = live.system_entries(997)
+        self.assertEqual((str(entries[0].target), entries[0].source),
+                         ("/usr/local/lib/psy-common/psy_common.py", "common/psy_common.py"))
+        self.assertIn('"$repo/common/psy_common.py" /usr/local/lib/psy-common/psy_common.py', script)
+        self.assertEqual(live.release_sums()[str(entries[0].target)], live.sha256(entries[0].data))
+
+    def test_shared_module_restarts_the_services_that_load_it(self):
+        self.assertEqual(live.units_for(live.COMMON / "psy_common.py"),
+                         {"psy-upload", "psy-upload-worker", "hermes-gateway"})
 
     def test_owner_alerts_use_one_instance_per_failing_unit(self):
         entries = {str(e.target): e.data for e in live.system_entries(997)}
@@ -198,6 +208,18 @@ class BackupAndRestore(unittest.TestCase):
             self.assertEqual(mine.read_text(), "checkout before")
             self.assertEqual(mine.stat().st_mode & 0o777, 0o600)
             self.assertFalse(added.exists())
+
+    def test_new_code_folder_is_readable_by_the_services_under_any_umask(self):
+        import pwd
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "lib/psy-common/psy_common.py"
+            target.parent.parent.mkdir()
+            previous = os.umask(0o077)
+            try:
+                live.write(target, b"code", pwd.getpwuid(os.geteuid()).pw_name, 0o644)
+            finally:
+                os.umask(previous)
+            self.assertEqual((target.parent.stat().st_mode & 0o777, target.stat().st_mode & 0o777), (0o755, 0o644))
 
     def test_plan_lists_only_differences(self):
         with tempfile.TemporaryDirectory() as tmp:

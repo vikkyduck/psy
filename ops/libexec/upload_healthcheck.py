@@ -8,13 +8,32 @@ restart, and a failed restart backs off instead of being retried every minute.
 """
 import argparse
 import http.client
+import importlib.util
 import json
 import os
 import ssl
 import subprocess
+import sys
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 ROOT = Path('/var/lib/psy-upload-health')
 FAILS_BEFORE_RESTART = 3
@@ -52,9 +71,7 @@ def local_ok():
 
 def public_ok():
     try:
-        public = urlsplit(os.environ['PSY_PUBLIC_URL'])
-        if public.scheme != 'https' or not public.hostname or public.username or public.password:
-            raise ValueError('Invalid public HTTPS origin')
+        public = urlsplit(common.https_origin(os.environ.get('PSY_PUBLIC_URL', '')))
         return healthz(public.hostname, public.port or 443, ssl.create_default_context())
     except Exception:
         return False
@@ -99,10 +116,7 @@ def decide(state, now, api_ok, worker_ok, asr_ok, public):
 
 
 def save(path, state):
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(state))
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    common.atomic_write(path, json.dumps(state).encode())
 
 
 def main():

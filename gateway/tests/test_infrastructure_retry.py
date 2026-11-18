@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock, patch
 
 import test_delivery_resume as harness
 from test_delivery_resume import queue, route, store
-from psy_modules import psy_group_codex as model
+from psy_modules import psy_group_client as codex, psy_group_codex as model
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 
 LOCKED = sqlite3.OperationalError("database is locked")
 
@@ -79,21 +80,21 @@ class InfrastructureRetry(unittest.IsolatedAsyncioTestCase):
 
         def stream(*args, instructions, on_progress=None, **kwargs):
             nonlocal dispatches
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 dispatches += 1
                 return model.Result("Первая часть.", [], 0, False)
             on_progress()
             return model.Result("Вторая часть.", [], 0)
 
         def run_model(turns, **opts):
-            return model._compose(None, turns, False, "fixture", opts["question"], checkpoints=opts["checkpoints"])
+            return pipeline._compose(None, turns, False, "fixture", opts["question"], checkpoints=opts["checkpoints"])
 
         store.Checkpoints(self.ident).put("route:input:v1", dict(
             destination=[-202, 7, 0, 100], doc_id=None, question="write", quote="", history=[],
             research=False, draw=False, model="fixture"))
-        with (patch.object(model, "_stream", stream), patch.object(store.Checkpoints, "progress", progress),
-              patch.object(model, "_connection", return_value=("fixture", {}, "fixture-generation")),
-              patch.object(model, "_transport", nullcontext), patch.object(model, "_respond", side_effect=run_model)):
+        with (patch.object(codex, "_stream", stream), patch.object(store.Checkpoints, "progress", progress),
+              patch.object(codex, "_connection", return_value=("fixture", {}, "fixture-generation")),
+              patch.object(codex, "_transport", nullcontext), patch.object(model, "_respond", side_effect=run_model)):
             await self.attempt()
             self.assertEqual(store.state(self.ident), "queued")
             self.assertEqual(sent, ["Запрос сохранен. PSY продолжит его автоматически."])

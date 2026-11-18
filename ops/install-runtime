@@ -17,7 +17,11 @@ test -f "$repo/media/transcribe.py"
 test -f "$repo/media/audio-transcription-SKILL.md"
 test -f "$repo/profile/SOUL.md"
 test -f "$repo/gateway/group-manifest.json"
-install -d -m 0755 /usr/local/libexec /usr/local/lib/psy-group /opt/psy-upload /opt/psy-upload/static
+test -f "$repo/common/psy_common.py"
+install -d -m 0755 /usr/local/libexec /usr/local/lib/psy-group /usr/local/lib/psy-common /opt/psy-upload /opt/psy-upload/static
+# Shared helpers, root-owned. The uploader, the brokers, the checks and the gateway's upload handoff
+# load it by this path (the gateway preflight checks its digest); nothing adds it to sys.path.
+install -m 0644 "$repo/common/psy_common.py" /usr/local/lib/psy-common/psy_common.py
 for file in access_broker asr_client asr_sandbox asr_service psy_upload_common queue_health recording_grant recording_receipts server storage_capacity transcribe worker; do
     install -m 0644 "$repo/media/$file.py" /opt/psy-upload/
 done

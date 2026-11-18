@@ -1,11 +1,29 @@
 #!/usr/bin/python3
 """Local-only durable archive of generated media and conversation text."""
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
-import sqlite3
+import sys
 import tempfile
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 HOME = pathlib.Path('/home/hermes/.hermes')
 VAULT = HOME / 'vault'
@@ -16,14 +34,8 @@ MEDIA_CACHE = '.archive-media-cache.json'
 
 def atomic_write(path, data):
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=path.parent)
-    try:
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(data)
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
-    finally:
-        pathlib.Path(temporary).unlink(missing_ok=True)
+    # One file per message: the archive keeps its earlier pace and syncs nothing per file.
+    common.atomic_write(path, data, durable=False)
 
 
 def load_cache():
@@ -98,14 +110,8 @@ def archive_messages():
     if not database.exists():
         return 0
     count = 0
-    connection = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True, timeout=10)
-    try:
-        connection.execute('SELECT count(*) FROM sqlite_master').fetchone()
-    except sqlite3.OperationalError:
-        # WAL database between writes without -wal/-shm, which this read-only mount cannot create:
-        # it is fully checkpointed, so read the file itself.
-        connection.close()
-        connection = sqlite3.connect('file:' + str(database) + '?mode=ro&immutable=1', uri=True, timeout=10)
+    # A WAL database between writes has no -wal/-shm, which this read-only mount cannot create.
+    connection = common.open_readonly(database, timeout=10)
     try:
         rows = connection.execute('SELECT id, session_id, role, content, timestamp, tool_calls FROM messages WHERE id > ? ORDER BY id', (previous,))
         for message_id, session_id, role, content, timestamp, calls in rows:

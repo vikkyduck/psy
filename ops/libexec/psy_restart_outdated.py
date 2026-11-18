@@ -14,13 +14,31 @@ Otherwise it waits for the next run. A failed restart exits non-zero, which aler
 does a service left on outdated code for more than OUTDATED_ALERT seconds.
 """
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
 import socket
-import stat
 import subprocess
+import sys
 import time
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 # ops/inventory.json restart_order: the upload side first, the gateway that calls it last.
 RESTART_ORDER = ("psy-asr.service", "psy-upload-worker.service", "psy-upload.service", "hermes-gateway.service")
@@ -119,13 +137,8 @@ def owner_agent_busy():
 
 def last_inbound():
     """Time of the newest inbound Telegram message in the gateway log, or None."""
-    fd = os.open(GATEWAY_LOG, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as log:
-        if not stat.S_ISREG(os.fstat(log.fileno()).st_mode):
-            raise OSError("gateway log is not a regular file")
-        log.seek(0, 2)
-        log.seek(max(0, log.tell() - 262144))
-        lines = log.read().decode("utf-8", errors="replace").splitlines()
+    # Never follows a link or blocks on a FIFO the bot account planted in its log folder.
+    lines = common.read_regular(GATEWAY_LOG, 262144, tail=True).decode("utf-8", errors="replace").splitlines()
     for line in reversed(lines):
         if "inbound message: platform=telegram" in line:
             try:
@@ -222,9 +235,7 @@ def remember_outdated(now):
         since = now
         try:
             STATE.parent.mkdir(mode=0o700, exist_ok=True)
-            tmp = STATE.with_name(STATE.name + ".tmp")
-            tmp.write_text(json.dumps({"since": since}))
-            os.replace(tmp, STATE)
+            common.atomic_write(STATE, json.dumps({"since": since}).encode())
         except OSError:
             pass   # a missing state folder only delays the alert
     return since if since is not None else now

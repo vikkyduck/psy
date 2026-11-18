@@ -15,6 +15,8 @@ def main():
             PSY_BOT_USERNAME='fixture_bot', PSY_PUBLIC_URL='https://fixture.invalid',
             HERMES_HOME=temp, PSY_UPLOAD_ROOT=temp+'/state', PSY_UPLOAD_FILES=temp+'/files',
             PSY_ASR_PROGRESS=temp+'/progress', PSY_ACCESS_SOCKET=temp+'/member.sock',
+            # The services load /usr/local/lib/psy-common/psy_common.py; tests use the repository copy.
+            PSY_COMMON_PATH=str(MEDIA.parent/'common/psy_common.py'),
         )
         os.environ['CREDENTIALS_DIRECTORY'] = temp+'/fixture-credentials'
         Path(os.environ['CREDENTIALS_DIRECTORY']).mkdir()

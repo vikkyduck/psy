@@ -114,7 +114,7 @@ done < <(find "$H/media-vault/uploads" -type f -print0)
 
 # 4. One archive with everything else.
 cd /
-INCLUDE=(home/hermes/.hermes usr/local/lib/psy-group usr/local/libexec/psy-* usr/local/sbin/psy-* usr/local/bin/psy-*
+INCLUDE=(home/hermes/.hermes usr/local/lib/psy-group usr/local/lib/psy-common usr/local/libexec/psy-* usr/local/sbin/psy-* usr/local/bin/psy-*
          etc/systemd/system/psy-* etc/systemd/system/hermes-gateway.service etc/systemd/system/hermes-gateway.service.d
          etc/psy etc/psy-upload etc/psy-acme-staging etc/letsencrypt opt/psy-upload opt/psy-source-reader
          var/lib/psy-* srv/psy-*)

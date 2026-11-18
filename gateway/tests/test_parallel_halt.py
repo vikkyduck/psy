@@ -8,7 +8,8 @@ from collections import Counter
 from contextlib import nullcontext
 from unittest.mock import patch
 
-from psy_modules import psy_group_codex as model
+from psy_modules import psy_group_client as codex, psy_group_codex as model
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 
 
 class Memory:
@@ -35,14 +36,14 @@ class ParallelHalt(unittest.TestCase):
     def setUp(self):
         for name, value in (("_connection", lambda rejected=None: ("fixture", {}, "fixture-generation")),
                             ("_transport", nullcontext)):
-            patcher = patch.object(model, name, value)
+            patcher = patch.object(codex, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def run_lecture(self, stream, checkpoints):
-        with patch.object(model, "_stream", stream):
-            return model._compose(None, [model._user("synthetic lecture request")], False, "fixture",
-                                  "synthetic lecture request", checkpoints=checkpoints)
+        with patch.object(codex, "_stream", stream):
+            return pipeline._compose(None, [codex._user("synthetic lecture request")], False, "fixture",
+                                     "synthetic lecture request", checkpoints=checkpoints)
 
     def test_rate_limit_stops_remaining_sections_and_resume_reuses_written_ones(self):
         calls = Counter()
@@ -51,7 +52,7 @@ class ParallelHalt(unittest.TestCase):
         first = threading.Event()
 
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":90}', [], 0)
             if "Сейчас нужен внутренний редакционный" in instructions:
                 return model.Result(json.dumps(PLAN), [], 0)
@@ -74,7 +75,7 @@ class ParallelHalt(unittest.TestCase):
             self.fail("unexpected stage")
 
         saved = Memory()
-        with self.assertRaises(model._ResumeModelJob) as parked:
+        with self.assertRaises(codex._ResumeModelJob) as parked:
             self.run_lecture(stream, saved)
         self.assertEqual(parked.exception.issue.kind, "busy")
         # Section 3 may or may not have been picked up before the 429. Nothing later starts.
@@ -93,28 +94,28 @@ class ParallelHalt(unittest.TestCase):
 
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
             nonlocal reads
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":60,"public_topic":"Freud"}', [], 0)
-            if instructions == model.CENTRAL_READING:
+            if instructions == prompts.CENTRAL_READING:
                 reads += 1
                 reading.set()
                 self.assertTrue(refused.wait(3))
                 # An unfinished first pass would normally ask the reader for a second one.
                 return model.Result('{"scope":"partial","items":[],"gaps":["second pass needed"]}', [], 1)
-            if instructions == model.WEB_SYSTEM:
+            if instructions == prompts.WEB_SYSTEM:
                 self.assertTrue(reading.wait(3))
                 refused.set()
                 raise model.ModelIssue("busy", "http")
             self.fail("unexpected stage")
 
-        with patch.object(model, "_stream", stream), self.assertRaises(model._ResumeModelJob):
-            model._compose(None, [model._user("synthetic request")], False, "fixture",
-                           "Публичная тема: Sigmund Freud, Die Verdrängung", checkpoints=Memory())
+        with patch.object(codex, "_stream", stream), self.assertRaises(codex._ResumeModelJob):
+            pipeline._compose(None, [codex._user("synthetic request")], False, "fixture",
+                              "Публичная тема: Sigmund Freud, Die Verdrängung", checkpoints=Memory())
         self.assertEqual(reads, 1)
 
     def test_without_checkpoints_a_failed_section_still_leaves_a_gap(self):
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":90}', [], 0)
             if "Сейчас нужен внутренний редакционный" in instructions:
                 return model.Result(json.dumps(PLAN), [], 0)

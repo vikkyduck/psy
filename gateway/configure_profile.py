@@ -1,13 +1,29 @@
 """Reconcile the PSY profile in place. Run as hermes with the Hermes Python environment."""
 import fcntl
+import importlib.util
 from io import StringIO
 import os
 from pathlib import Path
 import pwd
-import re
 import sys
-import tempfile
 
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+# Run from a release checkout: use the shared module shipped with it.
+psy_common = _common(Path(__file__).resolve().parents[1] / "common/psy_common.py")
 HOME = Path(os.environ.get("HERMES_HOME", str(Path.home()/".hermes")))
 MODEL = "gpt-6.1-sol"
 
@@ -76,20 +92,7 @@ def stage_config(config, home, owner):
 
 
 def atomic_save(path, content):
-    with tempfile.NamedTemporaryFile('w',encoding='utf-8',dir=path.parent,delete=False) as target:
-        temp=Path(target.name)
-        try:
-            target.write(content)
-            target.flush()
-            os.fsync(target.fileno())
-            os.fchmod(target.fileno(),0o600)
-            target.close()
-            os.replace(temp,path)
-            fd=os.open(path.parent,os.O_RDONLY)
-            try:os.fsync(fd)
-            finally:os.close(fd)
-        finally:
-            temp.unlink(missing_ok=True)
+    psy_common.atomic_write(path, content.encode('utf-8'))
 
 
 def reconcile(home):
@@ -121,8 +124,10 @@ def reconcile(home):
         if token and proposed and token!=proposed:
             raise ValueError('Existing bot credential and pending credential differ')
         active = token or proposed or ""
-        if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{30,}",active) or active.partition(":")[0] != bot_id:
-            raise ValueError("Telegram credential must match PSY_BOT_ID")
+        try:
+            psy_common.bot_token(active, bot_id)
+        except ValueError:
+            raise ValueError("Telegram credential must match PSY_BOT_ID") from None
         if not token:
             policy['TELEGRAM_BOT_TOKEN']=proposed
         changed={k:v for k,v in policy.items() if values.get(k)!=v}

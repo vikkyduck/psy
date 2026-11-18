@@ -54,17 +54,17 @@ def selected_generation():
 def probe_model():
     from hermes_cli.config import load_config_readonly
     from agent.process_bootstrap import enable_happy_eyeballs_on_client
-    from . import psy_group_codex as group
+    from . import psy_group_client as client
     import httpx
 
     model = load_config_readonly()["model"]
     if model.get("provider") != policy.PROVIDER:
         return False
     prompt = "Ответь одним числом: 6 умножить на 7."
-    with group._transport(), httpx.Client(trust_env=False) as client:
-        enable_happy_eyeballs_on_client(client)
-        answer = group._authenticated_request(lambda token, headers: group._stream(
-            client, headers, [group._user(prompt)], False, model["default"],
+    with client._transport(), httpx.Client(trust_env=False) as http:
+        enable_happy_eyeballs_on_client(http)
+        answer = client._authenticated_request(lambda token, headers: client._stream(
+            http, headers, [client._user(prompt)], False, model["default"],
             instructions="Ответь только числом.", read_idle=25, progress_idle=30))
     return answer.complete and answer.text.strip().rstrip(".") == "42"
 

@@ -6,7 +6,9 @@ import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
-from psy_modules import psy_group_codex as m
+from psy_modules import psy_group_client as codex, psy_group_codex as m
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from psy_modules import psy_group_sources as sources
 
 
 def event(kind, **values):
@@ -23,8 +25,8 @@ class Duration(unittest.TestCase):
         self.timeout = module.TimeoutException
         self.reset = module.RequestError
         for scope in (patch.dict(sys.modules, {"httpx": module}),
-                      patch.object(m.time, "monotonic", side_effect=lambda: self.elapsed),
-                      patch.object(m, "_connection", side_effect=self.connection)):
+                      patch.object(codex.time, "monotonic", side_effect=lambda: self.elapsed),
+                      patch.object(codex, "_connection", side_effect=self.connection)):
             scope.start()
             self.addCleanup(scope.stop)
 
@@ -39,7 +41,7 @@ class Duration(unittest.TestCase):
             self.streams.append(json)
             return nullcontext(Mock(status_code=200, iter_lines=lambda: stage(json)))
         client = Mock(stream=stream)
-        return m._compose(client, [m._user(question)], research, "test", question)
+        return pipeline._compose(client, [codex._user(question)], research, "test", question)
 
     def answer(self, text, *, incomplete=False, citation=None):
         # Real reasoning progress keeps a long stream alive without a total deadline.
@@ -83,16 +85,16 @@ class Duration(unittest.TestCase):
                     url=url, access="full_text")
         def stage(payload):
             instructions = payload["instructions"]
-            if m.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return self.answer('PSY_TASK {"public_topic":"Academic topic"}')
-            if instructions == m.WEB_SYSTEM:
+            if instructions == prompts.WEB_SYSTEM:
                 return self.answer("notes", citation=url)
-            if instructions == m.SOURCE_CHECK:
+            if instructions == prompts.SOURCE_CHECK:
                 return self.answer(json.dumps({"claims": [card], "gaps": []}), citation=url)
-            if instructions == m.REVIEW:
+            if instructions == prompts.REVIEW:
                 return self.answer('{"edits":[]}')
             return self.answer("Verified analysis")
-        with patch.object(m.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")):
+        with patch.object(sources.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")):
             result = self.compose("Публичная тема: Academic topic", stage, research=True)
         self.assertTrue(result.complete)
         self.assertEqual(result.text, "Verified analysis")
@@ -188,8 +190,8 @@ class Duration(unittest.TestCase):
                     if len(self.streams) == 1:
                         yield event("response.output_text.delta", delta=short_marker)
                         raise self.timeout()
-                    self.assertIn(m.DISPATCH, payload["instructions"])
-                    self.assertEqual(payload["input"], [m._user("Напиши разбор")])
+                    self.assertIn(prompts.DISPATCH, payload["instructions"])
+                    self.assertEqual(payload["input"], [codex._user("Напиши разбор")])
                     yield event("response.output_text.delta", delta="Готовый ответ.")
                     yield event("response.completed")
                 result = self.compose("Напиши разбор", stage)

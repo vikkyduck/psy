@@ -80,7 +80,7 @@ class Renewal(unittest.TestCase):
     def question(self):
         with httpx.Client(transport=self.transport) as client:
             question = "6 * 7?"
-            return group._compose(client, [group._user(question)], False, "fixture", question).text
+            return pipeline._compose(client, [codex._user(question)], False, "fixture", question).text
 
     def native_refresh(self):
         return pools.load_pool("openai-codex").try_refresh_matching(credential_id="primary")
@@ -177,6 +177,8 @@ if __name__ == "__main__":
         # Import the Telegram plugin without starting the gateway or its polling loop.
         sys.path.insert(0, str(checkout / "plugins/platforms/telegram"))
         import psy_group_codex as group
+        import psy_group_client as codex
+        import psy_group_pipeline as pipeline
         monitor_path = Path(__file__).resolve().parents[2] / "ops/libexec/psy_codex_auth.py"
         spec = importlib.util.spec_from_file_location("psy_codex_auth", monitor_path)
         monitor = importlib.util.module_from_spec(spec)

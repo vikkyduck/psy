@@ -8,13 +8,18 @@ import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
-if os.environ.get("PSY_GROUP_TEST_INSTALLED"):
-    m = importlib.import_module("plugins.platforms.telegram.psy_group_codex")
-else:
+def plugin_module(name):
+    if os.environ.get("PSY_GROUP_TEST_INSTALLED"):
+        return importlib.import_module("plugins.platforms.telegram." + name)
     try:
-        m = importlib.import_module("psy_modules.psy_group_codex")
+        return importlib.import_module("psy_modules." + name)
     except ModuleNotFoundError:
-        m = importlib.import_module("psy_group_codex")
+        return importlib.import_module(name)
+
+
+m, codex, pipeline, sources, lecture, continuation, prompts = map(plugin_module, (
+    "psy_group_codex", "psy_group_client", "psy_group_pipeline", "psy_group_sources", "psy_group_lecture",
+    "psy_group_continuation", "psy_group_prompts"))
 
 
 class Depth(unittest.TestCase):
@@ -33,8 +38,8 @@ class Depth(unittest.TestCase):
         bootstrap = types.ModuleType("agent.process_bootstrap")
         bootstrap.enable_happy_eyeballs_on_client = lambda client: None
         mods = patch.dict(sys.modules, {"httpx": httpx, "agent.process_bootstrap": bootstrap})
-        auth = patch.object(m, "_connection", return_value=("fixture", {}, "fixture-generation"))
-        locate = patch.object(m.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context"))
+        auth = patch.object(codex, "_connection", return_value=("fixture", {}, "fixture-generation"))
+        locate = patch.object(sources.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context"))
         locate.start()
         self.addCleanup(locate.stop)
         auth.start()
@@ -45,8 +50,8 @@ class Depth(unittest.TestCase):
     def test_semantic_ordinary_and_analysis_use_one_request(self):
         for q in ("merci", "Qu'est-ce qui laisse penser que sa position a changé ?"):
             result = m.Result("réponse", [], 0)
-            with patch.object(m, "_stream", return_value=result) as stream:
-                self.assertEqual(m._compose(None, [m._user(q)], False, "fake", q).text, "réponse")
+            with patch.object(codex, "_stream", return_value=result) as stream:
+                self.assertEqual(pipeline._compose(None, [codex._user(q)], False, "fake", q).text, "réponse")
                 self.assertEqual(stream.call_count, 1)
                 self.assertFalse(stream.call_args.args[3])
                 self.assertIn("по умолчанию разбирай глубоко", stream.call_args.kwargs["instructions"])
@@ -54,30 +59,30 @@ class Depth(unittest.TestCase):
 
     def test_web_cannot_see_private_attachment_filename_quote_or_history(self):
         q = "Сопоставь с понятием вытеснения у Фрейда и проверь публикации"
-        turns = [m._user("secret-history"), {"role":"user", "content":[
+        turns = [codex._user("secret-history"), {"role":"user", "content":[
             {"type":"input_text","text":q+"\n\nЦитата из этого чата:\nsecret-quote"},
             {"type":"input_text","text":"Материал: secret-name\nsecret-transcript"}]}]
         def run(client, headers, messages, web, model, *, instructions):
-            if m.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return m.Result('PSY_TASK {"public_topic":"secret-private-topic"}', [], 0)
             if "Выдели только" in instructions:
-                self.assertEqual(messages, [m._user(q)])
+                self.assertEqual(messages, [codex._user(q)])
                 return m.Result('{"topic":"Freud Repression 1915"}', [], 0)
             if web:
-                self.assertEqual(messages[0], m._user("Freud Repression 1915"))
+                self.assertEqual(messages[0], codex._user("Freud Repression 1915"))
                 self.assertNotIn("secret-", str(messages))
-                if instructions == m.WEB_SYSTEM:
+                if instructions == prompts.WEB_SYSTEM:
                     return m.Result("Public notes", [], 1)
                 card = self.source_card()
                 return m.Result(json.dumps({"claims":[card], "gaps":[]}), [], 1, source_urls=(card["url"],))
-            if instructions == m.REVIEW:
+            if instructions == prompts.REVIEW:
                 self.assertIn("Готово", str(messages))
                 return m.Result('{"edits":[]}', [], 0)
             self.assertIn("secret-transcript", str(messages))
             self.assertIn("https://example.org", str(messages))
             return m.Result("Готово", [], 0)
-        with patch.object(m, "_stream", side_effect=run):
-            result = m._compose(None, turns, False, "fake", q)
+        with patch.object(codex, "_stream", side_effect=run):
+            result = pipeline._compose(None, turns, False, "fake", q)
         self.assertEqual(result.searches, 2)
 
     def test_untraceable_sources_are_not_released_as_confirmed(self):
@@ -85,7 +90,7 @@ class Depth(unittest.TestCase):
         public = m.Result(json.dumps({"claims":[fake],"gaps":[]}), [], 1,
                           source_urls=("https://example.org",))
         call = Mock(side_effect=[m.Result("search", [], 1), public, public])
-        r = m._primary_sources(call, "Academic topic")
+        r = sources._primary_sources(call, "Academic topic")
         self.assertFalse(r.complete)
         self.assertNotIn(fake["url"], r.text)
         self.assertTrue(all(c.kwargs.get("web") for c in call.call_args_list))
@@ -99,7 +104,7 @@ class Depth(unittest.TestCase):
                             source_urls=(card["url"],))
         call = Mock(side_effect=[m.Result("search", [], 1), metadata(a, ["Позиция в 1940"]),
                                  metadata(b, [])])
-        r = m._primary_sources(call, "Academic topic")
+        r = sources._primary_sources(call, "Academic topic")
         self.assertEqual(json.loads(r.text)["claims"], [dict(c,access="excerpt",location="HTML, абзац 1",context="fixture context") for c in (a,b)])
         self.assertIn("Позиция в 1940", call.call_args.args[0][-1]["content"])
 
@@ -109,7 +114,7 @@ class Depth(unittest.TestCase):
             {"before":"Первая часть. A порождает C.", "after":"Первая часть. A порождает B."},
             {"before":"Итог второй части: A порождает C.", "after":"Итог второй части: A порождает B."}]}
         call = Mock(return_value=m.Result(json.dumps(verdict), [], 0))
-        r = m._verify_draft(call, m.Result(text,[],0), json.dumps(self.source_card()))
+        r = sources._verify_draft(call, m.Result(text,[],0), json.dumps(self.source_card()))
         self.assertIn(text, call.call_args.args[0][-1]["content"])
         self.assertNotIn("C",r.text)
         self.assertEqual(r.text.count("порождает B"),2)
@@ -117,7 +122,7 @@ class Depth(unittest.TestCase):
     def test_bad_replacement_does_not_pass_as_validated(self):
         response = m.Result('{"edits":[{"before":"ambiguous","after":"altered"}]}', [], 0)
         with self.assertRaises(m.ModelIssue):
-            m._verify_draft(Mock(return_value=response), m.Result("ambiguous ambiguous", [], 0), "source")
+            sources._verify_draft(Mock(return_value=response), m.Result("ambiguous ambiguous", [], 0), "source")
 
     def test_full_review_failure_recovers_verified_sections_and_marks_only_failed_section(self):
         doc = "Title\n\n1. A (0-15 мин по плану)\n\nПроверенный раздел.\n\n2. B (15-30 мин по плану)\n\nUNSUPPORTED"
@@ -125,9 +130,9 @@ class Depth(unittest.TestCase):
             if "UNSUPPORTED" in str(turns):
                 raise m.ModelIssue("unavailable", "section")
             return m.Result('{"edits":[]}', [], 0)
-        r = m._recover_verified(check, m.Result(doc, [], 0),
-                                m.Result(json.dumps({"claims":[self.source_card()]}), [], 2),
-                                m.ModelIssue("context","whole"))
+        r = sources._recover_verified(check, m.Result(doc, [], 0),
+                                      m.Result(json.dumps({"claims":[self.source_card()]}), [], 2),
+                                      m.ModelIssue("context","whole"))
         self.assertIn("Проверенный раздел",r.text)
         self.assertIn("Сверку этого раздела",r.text)
         self.assertNotIn("UNSUPPORTED",r.text)
@@ -138,7 +143,7 @@ class Depth(unittest.TestCase):
         response.iter_lines.return_value = ["data: "+json.dumps(x) for x in events]
         client = Mock()
         client.stream.return_value = nullcontext(response)
-        res = m._stream(client, {}, [], research, "model")
+        res = codex._stream(client, {}, [], research, "model")
         payload = client.stream.call_args.kwargs["json"]
         self.assertNotIn("verbosity", str(payload))
         self.assertNotIn("max_output_tokens", payload)
@@ -162,7 +167,7 @@ class Depth(unittest.TestCase):
                       {"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}]:
             with self.assertRaises(m.ModelIssue):
                 self.stream([{"type":"response.output_text.delta","delta":"unfinished"},event])
-        self.assertEqual(m._failure(400,{"code":"context_length_exceeded"},"http").kind,"context")
+        self.assertEqual(codex._failure(400,{"code":"context_length_exceeded"},"http").kind,"context")
 
     def test_only_genuine_web_result_and_terminal_output_are_accepted(self):
         output=[{"type":"message","phase":"commentary","content":[{"type":"output_text","text":"private progress"}]},
@@ -178,12 +183,12 @@ class Depth(unittest.TestCase):
 
     def test_resume_waits_for_terminal_event_and_preserves_earlier_text(self):
         parts = [m.Result("first", [], 0, False),m.Result("last", [], 0, True)]
-        with patch.object(m, "_stream", side_effect=parts) as stream:
-            r = m._compose(None, [m._user("question")], False, "fake", "question")
+        with patch.object(codex, "_stream", side_effect=parts) as stream:
+            r = pipeline._compose(None, [codex._user("question")], False, "fake", "question")
             self.assertEqual((r.text,r.complete),("first\nlast",True))
             self.assertIn("first", str(stream.call_args.args[2]))
         call = Mock(side_effect=m.ModelIssue("timeout","upstream"))
-        partial = m._complete(call, [], m.SYSTEM, initial=parts[0])
+        partial = continuation._complete(call, [], prompts.SYSTEM, initial=parts[0])
         self.assertTrue(partial.text.startswith("first"))
         self.assertFalse(partial.complete)
         self.assertIn("Продолжение не завершено",partial.text)
@@ -191,7 +196,7 @@ class Depth(unittest.TestCase):
     def test_map_reads_every_character_once_and_answers_in_context(self):
         q="А дальше?"
         body=("0-17 " * 31523) + " конец записи"
-        turns=[m._user("обсуждали хронологию"), {"role":"user","content":[
+        turns=[codex._user("обсуждали хронологию"), {"role":"user","content":[
             {"type":"input_text","text":q},{"type":"input_text","text":"Материал: f.txt\n"+body}]}]
         read={}
         def run(messages, instructions):
@@ -200,7 +205,7 @@ class Depth(unittest.TestCase):
             read[i]=s.partition("Материал: f.txt\n")[2]
             self.assertIn("обсуждали хронологию", str(messages))
             return m.Result("свидетельство "+str(i),[],0)
-        notes=m._map_source(run,turns,q)
+        notes=pipeline._map_source(run,turns,q)
         self.assertEqual("".join(read[i] for i in sorted(read)),body)
         self.assertIn("свидетельство "+str(len(read)),notes[-1]["content"])
 
@@ -216,7 +221,7 @@ class Depth(unittest.TestCase):
             if "Проверь содержание раздела" in instructions:
                 return m.Result('{"missing":""}', [], 0)
             raise m.ModelIssue("quota","test")
-        r=m._lecture(call,[m._user("текст лекции")],30)
+        r=lecture._lecture(call,[codex._user("текст лекции")],30)
         self.assertFalse(r.complete)
         self.assertIn("Этот раздел не сформирован",r.text)
         self.assertIn("Материал Материал",r.text)
@@ -236,7 +241,7 @@ class Depth(unittest.TestCase):
                 return m.Result('{"missing":"Разбор реплики из источника"}', [], 0)
             self.assertIn("Разбор реплики из источника", turns[-1]["content"])
             return m.Result("Продолжение примера.", [], 0)
-        r = m._lecture(call, [m._user("рукопись")], 30)
+        r = lecture._lecture(call, [codex._user("рукопись")], 30)
         self.assertTrue(r.complete)
         self.assertIn(draft + "\n\nПродолжение примера.", r.text)
         self.assertIn("10 мин", r.text)
@@ -248,7 +253,7 @@ class Depth(unittest.TestCase):
                 doc = "Материал " * size
                 calls = []
                 def call(turns, instructions):
-                    self.assertEqual(turns[0], m._user(q))
+                    self.assertEqual(turns[0], codex._user(q))
                     calls.append(instructions)
                     if "редакционный" in instructions:
                         return m.Result(json.dumps({"title":"Разбор", "sections":[{"title":"Пример",
@@ -257,7 +262,7 @@ class Depth(unittest.TestCase):
                         return m.Result(doc, [], 0)
                     self.assertIn("Проверь содержание раздела", instructions)
                     return m.Result('{"missing":""}', [], 0)
-                r = m._lecture(call, [m._user(q)], 30)
+                r = lecture._lecture(call, [codex._user(q)], 30)
                 self.assertTrue(r.complete)
                 self.assertIn(doc, r.text)
                 self.assertEqual(len(calls), 3)
@@ -269,7 +274,7 @@ class Depth(unittest.TestCase):
                                                   "activity_minutes":0, "brief":"Разобрать эпизод"}]}
         call = Mock(side_effect=[m.Result(json.dumps(plan), [], 0), m.Result("Сохранить текст", [], 0),
                                  m.ModelIssue("quota", "test")])
-        r = m._lecture(call, [m._user("Лекция")], 30)
+        r = lecture._lecture(call, [codex._user("Лекция")], 30)
         self.assertFalse(r.complete)
         self.assertIn("Сохранить текст", r.text)
         self.assertIn("лимита", r.text)
@@ -278,7 +283,7 @@ class Depth(unittest.TestCase):
         opts=[{"id":16,"name":"пример"}]
         for value, expected in ((16,16),(17,"clarify"),(None,None),(True,"clarify")):
             result=m.Result(json.dumps({"source":value}),[],0)
-            with patch.object(m,"_connection",return_value=("fake",{}, "fixture-generation")), patch.object(m,"_stream",return_value=result) as stream:
+            with patch.object(codex,"_connection",return_value=("fake",{}, "fixture-generation")), patch.object(codex,"_stream",return_value=result) as stream:
                 self.assertEqual(m.choose_source("почему?",opts,16,model="fake"),expected)
                 self.assertFalse(stream.call_args.args[3])
 
@@ -300,7 +305,7 @@ def inventory(*numbers, trace=True):
 
 class CentralReading(unittest.TestCase):
     def setUp(self):
-        locate = patch.object(m.EvidenceReader, "locate", return_value=("PDF, страница 1", "fixture context"))
+        locate = patch.object(sources.EvidenceReader, "locate", return_value=("PDF, страница 1", "fixture context"))
         locate.start()
         self.addCleanup(locate.stop)
 
@@ -309,38 +314,38 @@ class CentralReading(unittest.TestCase):
         def call(turns, instructions, *, web):
             self.assertTrue(web)
             calls.append(instructions)
-            if instructions == m.CENTRAL_READING:
-                if calls.count(m.CENTRAL_READING) == 1:
+            if instructions == prompts.CENTRAL_READING:
+                if calls.count(prompts.CENTRAL_READING) == 1:
                     self.assertIn("Die Verdrängung", turns[0]["content"])
                     self.assertIn("#page=8", turns[0]["content"])
                     self.assertNotIn("Lacan", str(turns))
                     return inventory(1)
                 self.assertIn("[1] из 3", turns[-1]["content"])
                 return inventory(2, 3)
-            if instructions == m.WEB_SYSTEM:
+            if instructions == prompts.WEB_SYSTEM:
                 return m.Result("Comparative sources", [], 1)
-            self.assertEqual(instructions, m.SOURCE_CHECK)
+            self.assertEqual(instructions, prompts.SOURCE_CHECK)
             self.assertIn("distinct mechanism 3", str(turns))
             return m.Result(json.dumps({"claims":[card(1, 3)], "gaps":[]}), [], 1, source_urls=(URL,))
-        result = m._primary_sources(call, "Freud repression and French legacy", read_main=True)
+        result = sources._primary_sources(call, "Freud repression and French legacy", read_main=True)
         evidence = json.loads(result.text)
-        self.assertCountEqual(calls, [m.CENTRAL_READING, m.CENTRAL_READING, m.WEB_SYSTEM, m.SOURCE_CHECK])
-        self.assertEqual(calls[-1], m.SOURCE_CHECK)
+        self.assertCountEqual(calls, [prompts.CENTRAL_READING, prompts.CENTRAL_READING, prompts.WEB_SYSTEM, prompts.SOURCE_CHECK])
+        self.assertEqual(calls[-1], prompts.SOURCE_CHECK)
         self.assertEqual([c["number"] for c in evidence["central_reading"]], [1,2,3])
         self.assertEqual(evidence["gaps"], [])
 
     def test_partial_read_preserves_real_cells_and_labels_missing_elements(self):
         mock = Mock(side_effect=[inventory(1), inventory(2,3,trace=False)])
-        entries, gaps, count = m._read_central_work(mock, "Another author")
+        entries, gaps, count = sources._read_central_work(mock, "Another author")
         self.assertEqual([c["number"] for c in entries], [1])
         self.assertTrue(any("[1] из 3" in g for g in gaps))
         self.assertEqual(count, 2)
 
     def test_french_assignment_points_to_requested_sessions_and_later_publication(self):
-        text = m.reading_list("Recherche sur le refoulement chez Freud et les psychanalystes français")
+        text = prompts.reading_list("Recherche sur le refoulement chez Freud et les psychanalystes français")
         for locator in ("#page=197", "197-198", "Perrier", "Mannoni", "verworfen", "#page=14", "#page=9"):
             self.assertIn(locator, text)
-        self.assertEqual(m.reading_list("Different author and work"), "")
+        self.assertEqual(prompts.reading_list("Different author and work"), "")
 
 
 if __name__ == "__main__":
