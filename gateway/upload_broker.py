@@ -1,4 +1,5 @@
 """One systemd-accepted, UID-checked request -> a 5-minute upload session for PSY only."""
+import importlib.util
 import json
 import os
 import pwd
@@ -11,17 +12,22 @@ sys.path.insert(0,"/opt/psy-upload")
 import recording_grant
 import time
 
-def group_id():
-    value = os.environ.get("PSY_GROUP_ID", "")
-    if not value.startswith("-") or not value[1:].isascii() or not value[1:].isdecimal() or len(value) > 17:
-        raise ValueError("Invalid PSY_GROUP_ID")
-    group = int(value)
-    if str(group) != value or not -(2**52) < group < 0:
-        raise ValueError("Invalid PSY_GROUP_ID")
-    return group
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
 
 
-GROUP = group_id()
+GROUP = _common().telegram_id(os.environ.get("PSY_GROUP_ID", ""), "PSY_GROUP_ID", group=True)
 DATABASE = "/srv/psy-queue/state.sqlite3"
 
 

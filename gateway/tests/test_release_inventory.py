@@ -1,4 +1,4 @@
-"""apply.py's TRACKED and ADDED are the one release inventory; everything else follows them."""
+"""apply.py's TRACKED, ADDED and SHARED are the one release inventory; everything else follows them."""
 import importlib.util
 import json
 import re
@@ -12,6 +12,8 @@ import psy_modules
 
 CHECKOUT = Path(psy_modules.__path__[0]).parents[2]
 FILES = set(apply.TRACKED + apply.ADDED)
+# The shared files as the preflight would read them, taken from this repository.
+SHARED = {installed: apply.HERE.parent/source for installed, source in apply.SHARED.items()}
 
 
 def preflight():
@@ -25,20 +27,27 @@ class ReleaseInventory(unittest.TestCase):
     def test_committed_manifests_are_generated_from_the_inventory(self):
         manifest = apply.inventory(CHECKOUT)
         self.assertEqual(set(manifest["sha256"]), FILES)
+        self.assertEqual(set(manifest["shared"]), set(SHARED))
         self.assertEqual(json.loads((apply.HERE/"manifest.json").read_text()), manifest)
-        self.assertEqual(json.loads((apply.HERE/"group-manifest.json").read_text()), manifest["sha256"])
+        self.assertEqual(json.loads((apply.HERE/"group-manifest.json").read_text()),
+                         {**manifest["sha256"], **manifest["shared"]})
 
     def test_preflight_checks_every_release_file(self):
         check = preflight()
         self.assertEqual(check.EXPECTED, FILES)
+        self.assertEqual(set(check.SHARED), set(SHARED))
+        self.assertEqual({str(path) for path in check.SHARED.values()}, set(SHARED))
         group = json.loads((apply.HERE/"group-manifest.json").read_text())
+        shared = next(iter(SHARED))
         with tempfile.TemporaryDirectory() as folder:
             deploy = Path(folder)
-            with patch.object(check, "DEPLOY", deploy), patch.object(check, "CHECKOUT", CHECKOUT):
+            with patch.object(check, "DEPLOY", deploy), patch.object(check, "CHECKOUT", CHECKOUT), \
+                    patch.object(check, "SHARED", SHARED):
                 (deploy/"manifest.json").write_text(json.dumps(group))
                 check.verify()
                 for broken in ({**group, "tools/transcription_tools.py": "0" * 64},
-                               {k: v for k, v in group.items() if k != "tools/transcription_tools.py"}):
+                               {k: v for k, v in group.items() if k != "tools/transcription_tools.py"},
+                               {**group, shared: "0" * 64}, {k: v for k, v in group.items() if k != shared}):
                     (deploy/"manifest.json").write_text(json.dumps(broken))
                     with self.assertRaises(ValueError):
                         check.verify()

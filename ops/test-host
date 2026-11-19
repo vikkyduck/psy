@@ -45,6 +45,11 @@ for account in psy-upload psy-deliver; do
         'test -w "$1"; test ! -r /home/hermes/.hermes' sh "$db"
 done
 as_user psy-upload psy-upload 'BindReadOnlyPaths=/var/lib/psy-asr/progress:/srv/psy-progress' /usr/bin/test -r /srv/psy-progress
+# Every service and check loads the shared helpers from here: only root may change them.
+common=/usr/local/lib/psy-common
+[[ $(stat -c '%U %a %F' "$common") == 'root 755 directory' && \
+   $(stat -c '%U %a %F' "$common/psy_common.py") == 'root 644 regular file' ]] \
+    || { echo "$common must be root-owned and writable by root only" >&2; exit 1; }
 # The owner alerts keep working inside their sandbox (few capabilities, read-only home): run the
 # installed check read-only with the unit's own [Service] settings. No message is sent.
 mapfile -t sandbox < <(sed -n '/^\[Service\]/,$p' /etc/systemd/system/psy-alerts.service | grep -E '^[A-Za-z]+=' \

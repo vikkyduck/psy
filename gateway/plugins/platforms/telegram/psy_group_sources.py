@@ -1,0 +1,209 @@
+"""Research pipeline: public source search, primary-source cards checked against the located text,
+the independent reading of a central work, and verification of a finished draft against the cards."""
+import json
+import re
+from functools import partial
+from urllib.parse import urlsplit, urlunsplit
+
+if __package__:
+    from .psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
+    from .psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
+                                    reading_list)
+    from .psy_source_evidence import EvidenceReader
+else:
+    from psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
+    from psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
+                                   reading_list)
+    from psy_source_evidence import EvidenceReader
+
+
+def _web_json(text):
+    # _parts may append provider URL citations after the JSON object.
+    raw = text.strip()
+    if raw.startswith("```"):
+        raw = raw.partition("\n")[2]
+    try:
+        value, _ = json.JSONDecoder().raw_decode(raw.lstrip())
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        return {}
+
+
+def _source_page(url):
+    """Compare page identity while keeping query parameters that identify the work."""
+    try:
+        p = urlsplit(url)
+        if p.scheme not in ("https", "http") or not p.hostname or p.username or p.password:
+            return None
+        return urlunsplit((p.scheme, p.netloc.lower(), p.path.rstrip("/"), p.query, ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _source_card(entry, pages, reader):
+    fields = ("author", "work", "date", "location", "support", "claim", "url", "access")
+    if not isinstance(entry, dict) or not all(isinstance(entry.get(k), str) and entry[k].strip() for k in fields):
+        return None
+    page = _source_page(entry["url"])
+    if page and page in pages and entry["access"] in ("full_text", "excerpt"):
+        locator = reader.locate(entry["url"], entry["support"], entry["location"], entry["author"], entry["work"])
+        if locator:
+            # Only the located excerpt was checked. Bibliographic interpretation
+            # is still subject to the separate editorial review.
+            return dict({key: entry[key] for key in fields}, location=locator[0], context=locator[1], access="excerpt")
+    return None
+
+
+def _read_central_work(call, subject, reader=None):
+    reader = reader or EvidenceReader()
+    messages = [_user(subject)]
+    collected = {}
+    series_sizes = {}
+    gaps = []
+    searches = 0
+    for _ in range(2):
+        read = call(messages, CENTRAL_READING, web=True)
+        searches += read.searches
+        document = _web_json(read.text) if read.complete else {}
+        if document.get("scope") == "" and document.get("items") == [] and not document.get("gaps") and not collected:
+            return [], [], searches
+        pages = {_source_page(url) for url in read.source_urls}
+        missing = document.get("gaps")
+        gaps = [x for x in missing if isinstance(x, str) and x.strip()] if isinstance(missing, list) else []
+        items = document.get("items")
+        for entry in items if isinstance(items, list) else ():
+            card = _source_card(entry, pages, reader)
+            if not card:
+                continue
+            series, n, size = entry.get("series"), entry.get("number"), entry.get("total")
+            if not isinstance(series, str) or not series or type(n) != int or type(size) != int or not 1 <= n <= size:
+                continue
+            key = (card["work"], series)
+            series_sizes[key] = max(size, series_sizes.get(key, 0))
+            collected[(key, n)] = dict(card, series=series, number=n, total=size)
+        for (work, series), size in series_sizes.items():
+            found = sorted(n for (key, n) in collected if key == (work, series))
+            if len(found) != size:
+                gaps.append(f"{work}, серия {series}: подтверждены элементы {found} из {size}.")
+        if collected and not gaps:
+            break
+        messages.append(_user("Повтори чтение основной работы. Дочитай все недостающие элементы, "
+                              "сообщи их исходные номера и то же название серии. "
+                              "Приведи ссылки инструментом и верни указанный JSON.\n" + "\n".join(gaps)))
+    if not collected:
+        gaps.append("Сквозное чтение запрошенной работы по структуре подтвердить не удалось.")
+    return list(collected.values()), gaps, searches
+
+
+def _primary_sources(call, topic, *, read_main=False):
+    reader = EvidenceReader()
+    bibliography = reading_list(topic)
+    central, central_gaps, searches = [], [], 0
+    public = [_user(topic)]
+    if bibliography:
+        public.append(_user(bibliography))
+    if read_main:
+        # Both readers start independently. Only the sanitised public topic or the
+        # known primary title and its page locations reaches the dedicated reader.
+        (original, _), (notes, _) = _parallel(call, lambda stage: stage(), (
+            partial(_read_central_work, call, central_reading_subject(topic), reader),
+            partial(call, public, WEB_SYSTEM, web=True)), workers=2)
+        central, central_gaps, searches = original
+    else:
+        notes = call(public, WEB_SYSTEM, web=True)
+    if not notes.complete:
+        raise ModelIssue("timeout", "source_search")
+    public = [*public, _user("Материалы публичного поиска для перепроверки:\n" + notes.text)]
+    if central or central_gaps:
+        public.append(_user("Самостоятельное чтение основной работы, для независимой сверки:\n"
+                            + json.dumps({"items":central,"gaps":central_gaps}, ensure_ascii=False)))
+    searches += notes.searches
+    accepted = []
+    gaps = []
+    for attempt in range(2):
+        validation = call(public, SOURCE_CHECK, web=True)
+        searches += validation.searches
+        pages = {_source_page(url) for url in validation.source_urls}
+        verified = _web_json(validation.text) if validation.complete else {}
+        missing = verified.get("gaps")
+        if isinstance(missing, list):
+            gaps = [x for x in missing if isinstance(x, str) and x.strip()]
+        claims = verified.get("claims")
+        for entry in claims if isinstance(claims, list) else ():
+            card = _source_card(entry, pages, reader)
+            if card:
+                if card not in accepted:
+                    accepted.append(card)
+            elif isinstance(entry, dict) and isinstance(entry.get("work"), str):
+                gaps.append("Проверка ссылки или доступного текста не завершена: " + entry["work"])
+        if accepted and (not gaps or attempt):
+            return Result(json.dumps({"claims":accepted, "central_reading":central,
+                                      "gaps":central_gaps + gaps}, ensure_ascii=False), [], searches)
+        public.append(_user("Дополни проверку по недостающим центральным работам. Открой авторские тексты "
+                            "через веб-инструмент, укажи точные ссылки в стандартной веб-цитации. "
+                            "Верни карточки и перечисли остающиеся пробелы в том же JSON.\n" + "\n".join(gaps)))
+    if central:
+        central_gaps.append("Для сравнительной части повторная проверка других источников не завершена.")
+        return Result(json.dumps({"claims":central,"central_reading":central,"gaps":central_gaps + gaps},
+                                 ensure_ascii=False), [], searches)
+    return Result("Первичные авторские тексты, достаточные для проверки этих выводов, подтвердить "
+                  "не удалось. Можно повторить поиск или предоставить текст публикации.", [], searches, False)
+
+
+def _verify_draft(call, result, evidence):
+    """Patch exact spans of the assembled answer, protecting the rest of a long manuscript."""
+    original = result.text
+    turns = [_user("Карточки первоисточников и границы проверки:\n" + evidence),
+             _user("Готовый текст для сверки:\n" + original)]
+    for _ in range(2):
+        review = call(turns, REVIEW)
+        verdict = _json_value(review.text) if review.complete else None
+        edits = verdict.get("edits") if isinstance(verdict, dict) else None
+        spans = []
+        for edit in edits if isinstance(edits, list) else ():
+            if not isinstance(edit, dict):
+                break
+            before, after = edit.get("before"), edit.get("after")
+            if not isinstance(before, str) or not before or original.count(before) != 1 or not isinstance(after, str):
+                break
+            start = original.index(before)
+            spans.append((start, start + len(before), after))
+        if isinstance(edits, list) and len(spans) == len(edits):
+            spans.sort(reverse=True)
+            bound = len(original)
+            corrected = original
+            for start, end, after in spans:
+                if end > bound:
+                    break
+                corrected = corrected[:start] + after + corrected[end:]
+                bound = start
+            else:
+                if corrected.strip():
+                    result.text = corrected
+                    return result
+        turns.append(_user("Передай точные неперекрывающиеся фрагменты из исходного текста, "
+                           "включая регистр и знаки препинания. Верни валидный JSON."))
+    raise ModelIssue("unavailable", "source_edits")
+
+
+def _recover_verified(call, result, sources, issue):
+    # A whole-manuscript edit can fail on an ambiguous anchor or context size even
+    # when individual sections are fully recoverable. Never publish the rejected span.
+    sections = re.split(r"\n\n(?=\d+\. [^\n]+\(\d+-\d+ мин по плану\)\n)", result.text)
+    if issue.kind in ("unavailable", "context") and len(sections) > 1:
+        def check(section):
+            try:
+                return _verify_draft(call, Result(section, [], 0), sources.text)
+            except ModelIssue:
+                return Result("Сверку этого раздела по первоисточникам завершить не удалось.", [], 0, False)
+        recovered = [section for section, _ in _parallel(call, check, sections[1:])]
+        if any(section.complete for section in recovered):
+            all_verified = result.complete and all(section.complete for section in recovered)
+            text = "\n\n".join([sections[0], *(section.text for section in recovered)])
+            return Result(text, [], sources.searches, all_verified)
+    cards = json.loads(sources.text)["claims"]
+    output = ["Проверка готового ответа по первоисточникам не завершена. " + issue.public(),
+              "Найденные дословные фрагменты и их местоположение:"]
+    for card in cards:
+        output.append(f"{card['support']} ({card['location']}). {card['url']}")
+    return Result("\n\n".join(output), [], sources.searches, False)

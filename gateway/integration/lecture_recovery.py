@@ -55,8 +55,9 @@ def telegram_types():
 class TestEndpoints:
     """Only raw model responses, browser approval and Telegram recipients are simulated."""
 
-    def __init__(self, group, token_url):
+    def __init__(self, group, prompts, token_url):
         self.group = group
+        self.prompts = prompts
         self.token_url = token_url
         now = int(time.time())
         self.old_access = synthetic_token(now + 86400)
@@ -73,7 +74,7 @@ class TestEndpoints:
             assert headers["Authorization"] == "Bearer " + self.new_access
             self.proofs += 1
             text = "42"
-        elif self.group.DISPATCH in instructions:
+        elif self.prompts.DISPATCH in instructions:
             text = 'PSY_TASK {"minutes":60}'
         elif "Сейчас нужен внутренний редакционный" in instructions:
             plan = [{"title": f"Chapter {i}", "brief": "argument", "minutes": 15, "activity_minutes": 0}
@@ -110,6 +111,7 @@ class TestEndpoints:
 async def exercise(home, patches):
     from hermes_cli import auth, auth_codex, config, psy_codex_policy as policy, psy_codex_incident as incident
     from psy_modules import psy_group_codex as group, psy_group_queue as queue, psy_group_store as store
+    from psy_modules import psy_group_client as codex, psy_group_pipeline as pipeline, psy_group_prompts as prompts
     from psy_modules import psy_owner_recovery as owner, psy_group_route as route
 
     assert auth._auth_file_path().parent.resolve() == home
@@ -117,7 +119,7 @@ async def exercise(home, patches):
     assert global_store is None or global_store.resolve().is_relative_to(home)
     assert (route.OWNER, route.GROUP, route.BOT) == (OWNER, GROUP, BOT)
     patches.enter_context(patch.object(policy, "MARKERS", home))
-    endpoints = TestEndpoints(group, auth_codex.CODEX_OAUTH_TOKEN_URL)
+    endpoints = TestEndpoints(group, prompts, auth_codex.CODEX_OAUTH_TOKEN_URL)
     primary = dict(id="main", priority=0, source="manual:device_code", auth_type="oauth",
                    access_token=endpoints.old_access, refresh_token="fixture-grant")
     store_path = home / "group"
@@ -132,7 +134,7 @@ async def exercise(home, patches):
                               reply_document=endpoints.receive_document, reply_text=notice)
 
     def compose(turns, *, research, model, question, checkpoints, **kwargs):
-        return group._compose(None, turns, research, model, question, checkpoints=checkpoints)
+        return pipeline._compose(None, turns, research, model, question, checkpoints=checkpoints)
 
     def oauth_client(**kwargs):
         return httpx.Client(transport=httpx.MockTransport(endpoints.refuse_renewal))
@@ -147,7 +149,8 @@ async def exercise(home, patches):
     patches.enter_context(patch.object(queue, "typing", AsyncMock()))
     patches.enter_context(patch.object(auth_codex, "_codex_http_client", oauth_client))
     patches.enter_context(patch.object(group, "_respond", compose))
-    patches.enter_context(patch.object(group, "_stream", endpoints.stream))
+    # The client is the one seam: chapters and the owner's sign-in probe both stream through it.
+    patches.enter_context(patch.object(codex, "_stream", endpoints.stream))
     patches.enter_context(patch.object(config, "load_config_readonly", return_value={
         "model": {"provider": policy.PROVIDER, "default": "fixture-model"}}))
 

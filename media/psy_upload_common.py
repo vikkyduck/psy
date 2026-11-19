@@ -2,6 +2,7 @@
 import contextlib
 import hashlib
 import hmac
+import importlib.util
 import json
 import logging
 import os
@@ -10,39 +11,30 @@ import re
 import secrets
 import recording_grant as grants
 import sqlite3
+import sys
 import threading
 import time
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl
 from storage_capacity import MAX_UPLOAD_BYTES, SYSTEM_RESERVE_BYTES
 
-def telegram_id(name, *, group=False):
-    raw = os.environ[name]
-    pattern = r'-[1-9][0-9]*' if group else r'[1-9][0-9]*'
-    if not re.fullmatch(pattern, raw) or abs(int(raw)) >= 2**52:
-        raise ValueError(f'Invalid {name}')
-    return int(raw)
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
 
 
-def https_origin(raw):
-    parsed = urlsplit(raw)
-    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None
-            or parsed.password is not None or parsed.path not in ('', '/') or parsed.query
-            or parsed.fragment or not 0 < (parsed.port if parsed.port is not None else 443) <= 65535
-            or not raw.isascii() or any(ord(c) < 33 or ord(c) == 127 for c in raw)
-            or chr(92) in raw):
-        raise ValueError('PSY_PUBLIC_URL must be an HTTPS origin')
-    return 'https://' + parsed.netloc
-
-
-OWNER = telegram_id('PSY_OWNER_ID')
-GROUP = telegram_id('PSY_GROUP_ID', group=True)
-BOT_ID = telegram_id('PSY_BOT_ID')
-BOT_USERNAME = os.environ['PSY_BOT_USERNAME']
-if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_]{4,31}', BOT_USERNAME) or not BOT_USERNAME.lower().endswith('bot'):
-    raise ValueError('PSY_BOT_USERNAME must contain the bot username without @')
-if BOT_ID == OWNER:
-    raise ValueError('PSY_BOT_ID and PSY_OWNER_ID must differ')
-PUBLIC_URL = https_origin(os.environ['PSY_PUBLIC_URL'])
+common = _common()
+# The same rules as the gateway and ops/instance_env.py; an invalid value stops the import.
+OWNER, GROUP, BOT_ID, BOT_USERNAME, PUBLIC_URL = common.instance()
 HOME = Path(os.environ.get('HERMES_HOME', Path.home() / '.hermes'))
 ROOT = Path(os.environ.get('PSY_UPLOAD_ROOT', HOME / 'vault' / 'uploads'))
 FILES = Path(os.environ.get('PSY_UPLOAD_FILES', HOME / 'media-vault' / 'uploads'))
@@ -316,9 +308,11 @@ def file_path(job, suffix=None):
 def bot_settings():
     credentials = Path(os.environ['CREDENTIALS_DIRECTORY'])
     token = (credentials / 'telegram').read_text().strip()
-    if not re.fullmatch(rf'{BOT_ID}:[A-Za-z0-9_-]{{30,}}', token):
-        raise RuntimeError('Telegram credential missing or belongs to a different bot')
-    return token, 'https://api.telegram.org/bot'
+    try:
+        common.bot_token(token, BOT_ID)
+    except ValueError:
+        raise RuntimeError('Telegram credential missing or belongs to a different bot') from None
+    return token, common.BOT_API
 
 
 def member_allowed(member):

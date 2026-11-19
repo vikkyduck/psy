@@ -7,7 +7,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from psy_modules import psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_lecture as lecture, psy_group_pipeline as pipeline
+from psy_modules import psy_group_prompts as prompts
 
 
 MODEL = "fixture"
@@ -31,7 +33,7 @@ def save_v1(checkpoints, turns, instructions, text, *, prose=False, complete=Tru
 
 def v1_lecture(checkpoints, turns, parts):
     """Use the plan and chapter prompts to seed the old per-call rows, ending inside the supplement."""
-    save_v1(checkpoints, turns, model.SYSTEM + model.DISPATCH,
+    save_v1(checkpoints, turns, prompts.SYSTEM + prompts.DISPATCH,
             'PSY_TASK {"minutes":30}', prose=True)
     review_turns = []
 
@@ -54,26 +56,26 @@ def v1_lecture(checkpoints, turns, parts):
         return model.Result(CHAPTER, [], 0)
 
     try:
-        model._lecture(editor, turns, 30, write_prose=draft)
+        lecture._lecture(editor, turns, 30, write_prose=draft)
     except ReviewSaved:
         pass
     else:
         raise AssertionError("Fixture did not reach the chapter review")
     assert review_turns[-1] == {"role": "assistant", "content": CHAPTER}
     # In v1 every next request hashed this entire chapter and every prior addition.
-    prompt = [*review_turns, model._user(OLD_SUPPLEMENT + MISSING)]
-    instructions = model.SYSTEM + "\n" + model.ATTRIBUTION
+    prompt = [*review_turns, codex._user(OLD_SUPPLEMENT + MISSING)]
+    instructions = prompts.SYSTEM + "\n" + prompts.ATTRIBUTION
     save_v1(checkpoints, prompt, instructions, parts[0], prose=True, complete=False)
     for index in range(1, len(parts)):
         prior = "\n".join(parts[:index])
-        messages = [*prompt, {"role": "assistant", "content": prior}, model._user(OLD_CONTINUE)]
+        messages = [*prompt, {"role": "assistant", "content": prior}, codex._user(OLD_CONTINUE)]
         save_v1(checkpoints, messages, instructions, parts[index], prose=True, complete=False)
 
 
 class LegacyContinuation(unittest.TestCase):
     def test_recovers_each_v1_supplement_without_resending_the_chapter(self):
         question = "Write a lecture"
-        turns = [model._user(question)]
+        turns = [codex._user(question)]
         parts = [f"Supplement {i}|" + str(i) * 3600 + f"|end {i}." for i in range(1, 5)]
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -88,11 +90,11 @@ class LegacyContinuation(unittest.TestCase):
                 sent.append(messages)
                 return model.Result("A new ending.", [], 0)
 
-            with patch.object(model, "_transport", nullcontext), \
-                    patch.object(model, "_authenticated_request", side_effect=lambda send: send("fixture", {})), \
-                    patch.object(model, "_stream", side_effect=endpoint):
-                result = model._compose(None, turns, False, MODEL, question,
-                                        checkpoints=store.Checkpoints(17, root=root))
+            with patch.object(codex, "_transport", nullcontext), \
+                    patch.object(codex, "_authenticated_request", side_effect=lambda send: send("fixture", {})), \
+                    patch.object(codex, "_stream", side_effect=endpoint):
+                result = pipeline._compose(None, turns, False, MODEL, question,
+                                           checkpoints=store.Checkpoints(17, root=root))
 
         self.assertTrue(result.complete)
         self.assertIn(CHAPTER + "\n\n" + "\n".join(parts + ["A new ending."]), result.text)

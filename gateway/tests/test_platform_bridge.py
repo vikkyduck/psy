@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import pwd
+import select
 import socket
 import subprocess
 import sys
@@ -22,7 +23,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs
 
 from hermes_cli import psy_platform_bridge as bridge
-from psy_modules import psy_group_codex as group
+from psy_modules import psy_group_client as group
 
 try:  # Loaded before any test swaps sys.modules. The Hermes runtime ships Pillow, a bare system Python may not.
     from PIL import Image, ImageOps, PngImagePlugin  # noqa: F401
@@ -429,15 +430,26 @@ class PlatformBridge(unittest.TestCase):
                                   str(CHECKOUT)], pass_fds=(listener.fileno(),), stdout=subprocess.DEVNULL,
                                  stderr=subprocess.PIPE, env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                                                               "PSY_PLATFORM_PEERS": ME})
+        seen = b""
         try:
             conn = UnixConnection(path)
             conn.request("GET", "/health")
             response = conn.getresponse()
             self.assertEqual((response.status, json.loads(response.read())), (200, {"ok": True}))
             conn.close()
+            # The bridge logs a request after it has answered it: wait for that line before stopping
+            # the process, or a fast reader terminates it in between (seen on a single-core host).
+            deadline = time.monotonic() + 10
+            while b"path=/health status=200" not in seen and time.monotonic() < deadline:
+                ready, _, _ = select.select([child.stderr], [], [], max(0, deadline - time.monotonic()))
+                chunk = os.read(child.stderr.fileno(), 4096) if ready else b""
+                if not chunk:
+                    break
+                seen += chunk
         finally:
             child.terminate()
-            _, errors = child.communicate(timeout=10)
+            _, rest = child.communicate(timeout=10)
+        errors = seen + rest
         self.assertIn(b"INFO listening on the systemd socket", errors)
         self.assertIn(b"INFO request method=GET path=/health status=200", errors)
 

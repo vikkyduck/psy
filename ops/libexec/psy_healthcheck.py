@@ -1,14 +1,31 @@
 #!/usr/bin/python3
 """External gateway watchdog. Never fetches/acknowledges Telegram updates."""
 import argparse
+import importlib.util
 import json
 import pathlib
 import os
 import socket
-import stat
 import subprocess
+import sys
 import time
-import urllib.request
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 HOME = pathlib.Path('/home/hermes/.hermes')
 STATE = pathlib.Path('/var/lib/psy-healthcheck/state.json')
@@ -16,18 +33,6 @@ ALERTS = pathlib.Path('/var/lib/psy-alerts/state.json')
 STALL = 300
 COOLDOWN = 900
 ALERTS_STALE = 600   # psy-alerts runs every minute
-
-
-def read_tail(path, limit):
-    """The last `limit` bytes of a regular file. Files below /home/hermes are writable by the bot
-    (and its owner's terminal agent): never follow a link or block on a FIFO planted there."""
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
-    with os.fdopen(fd, 'rb') as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError('not a regular file')
-        stream.seek(0, 2)
-        stream.seek(max(0, stream.tell() - limit))
-        return stream.read(limit)
 
 
 def control_status():
@@ -48,25 +53,16 @@ def control_status():
 
 
 def telegram_pending():
-    token = None
-    for line in read_tail(HOME / '.env', 1 << 20).decode('utf-8', errors='replace').splitlines():
-        key, sep, value = line.partition('=')
-        if sep and key.strip() == 'TELEGRAM_BOT_TOKEN':
-            token = value.strip().strip('\"\'')
-            break
+    # Files below /home/hermes are writable by the bot (and its owner's terminal agent): read_regular
+    # never follows a link or blocks on a FIFO planted there.
+    token = common.env_value(common.read_regular(HOME / '.env').decode('utf-8', errors='replace'), 'TELEGRAM_BOT_TOKEN')
     if not token:
         raise ValueError('missing bot credential')
-    base = 'https://api.telegram.org/bot'
-    request = urllib.request.Request(base + token + '/getWebhookInfo', data=b'')
-    with urllib.request.urlopen(request, timeout=18) as response:
-        result = json.load(response)
-    if not result.get('ok'):
-        raise ValueError('Bot API rejected request')
-    return int(result['result']['pending_update_count'])
+    return int(common.bot_call(token, 'getWebhookInfo', timeout=18)['pending_update_count'])
 
 
 def last_ingress():
-    lines = read_tail(HOME / 'logs/gateway.log', 262144).decode('utf-8', errors='replace').splitlines()
+    lines = common.read_regular(HOME / 'logs/gateway.log', 262144, tail=True).decode('utf-8', errors='replace').splitlines()
     for line in reversed(lines):
         if 'inbound message: platform=telegram' in line:
             return line[:23]  # Timestamp only, never message content.
@@ -200,10 +196,7 @@ def gateway(args):
     if reason:
         state['last_restart'] = now
     STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = STATE.with_suffix('.tmp')
-    temporary.write_text(json.dumps(state))
-    temporary.chmod(0o600)
-    temporary.replace(STATE)
+    common.atomic_write(STATE, json.dumps(state).encode())
     if reason:
         print('RECOVERY: restarting hermes-gateway; reason=' + reason, flush=True)
         subprocess.run(['systemctl', 'restart', 'hermes-gateway'], timeout=100, check=True)

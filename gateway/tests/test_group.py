@@ -30,6 +30,13 @@ class TestGuard(unittest.IsolatedAsyncioTestCase):
             bad.message.reply_text.assert_awaited_once()
         for update in (event(42,42),event(-55,route.OWNER),S(effective_chat=None,effective_user=None,message=None)):
             self.assertTrue(await route.intercept(None,update))
+        # Hermes' self-update never reaches Hermes, in any spelling; other owner commands still do.
+        for text in ("/update", "/Update", "/update@" + route.BOT_USERNAME, " /update now ", "/update\n"):
+            owner = event(route.OWNER,route.OWNER,text)
+            self.assertTrue(await route.intercept(None,owner))
+            owner.message.reply_text.assert_awaited_once_with(route.SELF_UPDATE_REPLY)
+        for text in ("/updates", "/model", "please /update", "update"):
+            self.assertFalse(await route.intercept(None,event(route.OWNER,route.OWNER,text)))
         other = event(42,42,"/start upload_"+"a"*32)
         self.assertEqual(route.scope(other),"upload")
         self.assertEqual(route.scope(event(42,42,"/start upload_bad")),"deny")

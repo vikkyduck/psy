@@ -121,7 +121,7 @@ class Undelivered(Exception):
 
 
 def classify(status, detail):
-    """psy_group_codex._failure for the platform: (kind, resets_at) of a refusal before the stream."""
+    """psy_group_client._failure for the platform: (kind, resets_at) of a refusal before the stream."""
     if status in (408, 504):
         return "timeout", None
     detail = detail if isinstance(detail, dict) else {}
@@ -199,7 +199,7 @@ def identity(token):
 
 
 def authenticated(attempt):
-    """psy_group_codex._authenticated_request: one retry with a fresh credential after a refused login."""
+    """psy_group_client._authenticated_request: one retry with a fresh credential after a refused login."""
     token, generation = credentials()
     try:
         return attempt(token)

@@ -1,29 +1,34 @@
 """Give live recordings priority over the optional, resumable official Bot API build."""
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
-import stat
 import subprocess
+import sys
 import time
+
+
+def _common(default="/usr/local/lib/psy-common/psy_common.py"):
+    """The shared PSY helpers, loaded by explicit path and never through sys.path: `default`, the
+    root-owned installed copy unless a release tool passes the one shipped with it, or in tests
+    the copy PSY_COMMON_PATH names."""
+    module = sys.modules.get("psy_common")
+    if module is None:
+        path = str(os.environ.get("PSY_COMMON_PATH") or default)
+        spec = importlib.util.spec_from_file_location("psy_common", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module = sys.modules.setdefault("psy_common", module)
+    return module
+
+
+common = _common()
 
 HOME=Path('/home/hermes/.hermes')
 STATE=Path('/var/lib/psy-audio-priority/state.json')
 BUILD='psy-telegram-build.service'
-
-def open_readonly(db):
-    """Root reads the uploads queue without ever creating files next to it. A WAL database that no
-    process holds open has no -wal/-shm, and a read-only open would try to create them (root-owned,
-    breaking the service accounts); it is fully checkpointed then, so read the file itself."""
-    fd=os.open(db,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW|os.O_CLOEXEC)
-    with os.fdopen(fd,'rb') as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):raise OSError('not a regular file')
-        header=f.read(100)
-    wal=len(header)>=20 and header[18]==2
-    if wal and not all(os.path.exists(str(db)+side) for side in ('-wal','-shm')):
-        return sqlite3.connect(db.as_uri()+'?mode=ro&immutable=1',uri=True,timeout=3)
-    return sqlite3.connect(db.as_uri()+'?mode=ro',uri=True,timeout=3)
 
 def audio_busy():
     """True or False; None when the queue cannot be read (the caller then changes nothing)."""
@@ -31,7 +36,8 @@ def audio_busy():
     busy=False
     if db.exists():
         try:
-            c=open_readonly(db)
+            # Root never creates files next to the queue: -wal/-shm it made would lock out the services.
+            c=common.open_readonly(db)
             try:busy=bool(c.execute("SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('queued','processing','sending') OR (state='uploading' AND updated>?))",(int(time.time())-120,)).fetchone()[0])
             finally:c.close()
         except (OSError,sqlite3.Error):
@@ -77,7 +83,7 @@ def main():
     if action:
         subprocess.run(['systemctl',action,BUILD],check=True,timeout=10)
         print('Optional Telegram build paused for audio processing' if action=='freeze' else 'Optional Telegram build resumed after audio processing')
-    tmp=STATE.with_suffix('.tmp');tmp.write_text(json.dumps(state));tmp.chmod(0o600);tmp.replace(STATE)
+    common.atomic_write(STATE,json.dumps(state).encode())
 
 if __name__=='__main__':
     try:main()

@@ -17,9 +17,9 @@
 
 ```sh
 python3.12 -m venv /opt/psy-upload-venv
-/opt/psy-upload-venv/bin/python -m pip install -r requirements.lock.txt
+/opt/psy-upload-venv/bin/python -m pip install --require-hashes -r requirements.lock.txt
 python3.12 -m venv /opt/psy-asr-venv
-/opt/psy-asr-venv/bin/python -m pip install -r asr-requirements.lock.txt
+/opt/psy-asr-venv/bin/python -m pip install --require-hashes -r asr-requirements.lock.txt
 ```
 
 ## Модель

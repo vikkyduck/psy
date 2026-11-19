@@ -7,7 +7,9 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from psy_modules import psy_group_codex as model
+from psy_modules import psy_group_client as codex, psy_group_codex as model
+from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from psy_modules import psy_group_sources as sources
 from psy_modules import psy_source_evidence as evidence
 
 
@@ -22,12 +24,12 @@ class Evidence(unittest.TestCase):
                     support="This invented passage sounds entirely plausible", claim="Unverified conclusion",
                     url=URL, access="full_text")
         with patch.object(evidence, "retrieve", return_value=("text/html","utf-8",BODY)) as get:
-            self.assertIsNone(model._source_card(card, {URL}, reader))
-            self.assertIsNone(model._source_card(dict(card,support="Private fake quote"), {URL}, reader))
+            self.assertIsNone(sources._source_card(card, {URL}, reader))
+            self.assertIsNone(sources._source_card(dict(card,support="Private fake quote"), {URL}, reader))
             real = dict(card,support="Observed wording from the original publication.")
-            self.assertIsNone(model._source_card(dict(real,author="Other Writer"), {URL}, reader))
-            self.assertIsNone(model._source_card(dict(real,work="Different publication"), {URL}, reader))
-            result = model._source_card(real, {URL}, reader)
+            self.assertIsNone(sources._source_card(dict(real,author="Other Writer"), {URL}, reader))
+            self.assertIsNone(sources._source_card(dict(real,work="Different publication"), {URL}, reader))
+            result = sources._source_card(real, {URL}, reader)
             self.assertEqual((result["access"],result["location"]), ("excerpt","HTML, абзац 4"))
             get.assert_called_once()
 
@@ -48,14 +50,14 @@ class Evidence(unittest.TestCase):
     def test_single_turn_model_topic_never_escapes(self):
         question = "Сравни случай Условный Маркер Сосна с вытеснением у Фрейда"
         def stream(client, headers, turns, web, model_id, *, instructions, **kw):
-            if model.DISPATCH in instructions:
+            if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"public_topic":"Условный Маркер Сосна, вытеснение"}', [], 0)
             return model.Result("Ответ", [], 0)
-        def sources(call, topic, *, read_main):
+        def find_sources(call, topic, *, read_main):
             self.assertEqual(topic, "Freud Repression 1915")
             return model.Result("Проверка",[],0,False)
-        with patch.object(model,"_transport",nullcontext),patch.object(model,"_stream",stream),patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),patch.object(model,"_primary_sources",side_effect=sources) as lookup:
-            model._compose(None,[model._user(question)],False,"fixture",question)
+        with patch.object(codex,"_transport",nullcontext),patch.object(codex,"_stream",stream),patch.object(codex,"_connection",return_value=("fixture",{}, "fixture-generation")),patch.object(pipeline,"_primary_sources",side_effect=find_sources) as lookup:
+            pipeline._compose(None,[codex._user(question)],False,"fixture",question)
             lookup.assert_called_once()
         self.assertEqual(evidence.public_topic("Разбери Условный Маркер Сосна"), "")
         self.assertEqual(evidence.public_topic("Публичная тема: RFC 9110\nУсловный Маркер Сосна"),"RFC 9110")
@@ -74,10 +76,10 @@ class Evidence(unittest.TestCase):
     def test_unknown_requested_research_asks_for_release_instead_of_inventing_sources(self):
         question = "Разбери Условный Маркер"
         stream = lambda *args,**kwargs: model.Result('PSY_TASK {"public_topic":"Условный Маркер"}', [], 0)
-        with (patch.object(model,"_transport",nullcontext),patch.object(model,"_stream",stream),
-              patch.object(model,"_connection",return_value=("fixture",{}, "fixture-generation")),
-              patch.object(model,"_primary_sources") as search):
-            result=model._compose(None,[model._user(question)],False,"fixture",question)
+        with (patch.object(codex,"_transport",nullcontext),patch.object(codex,"_stream",stream),
+              patch.object(codex,"_connection",return_value=("fixture",{}, "fixture-generation")),
+              patch.object(pipeline,"_primary_sources") as search):
+            result=pipeline._compose(None,[codex._user(question)],False,"fixture",question)
         self.assertIn("Публичная тема",result.text)
         search.assert_not_called()
 

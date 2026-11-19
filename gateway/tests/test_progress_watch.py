@@ -4,7 +4,7 @@ import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
-from psy_modules import psy_group_codex as model, psy_group_store as store
+from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 
 
 class ProgressWatch(unittest.TestCase):
@@ -16,9 +16,9 @@ class ProgressWatch(unittest.TestCase):
                 clock[0] += 45
                 yield 'data: ' + json.dumps({"type":"response.output_text.delta", "item_id":"c", "delta":"working"})
         client = Mock(stream=Mock(return_value=nullcontext(Mock(status_code=200, iter_lines=lines))))
-        with patch.object(model.time, "monotonic", side_effect=lambda:clock[0]):
+        with patch.object(codex.time, "monotonic", side_effect=lambda:clock[0]):
             with self.assertRaises(model.ModelIssue):
-                model._stream(client, {}, [], False, "test")
+                codex._stream(client, {}, [], False, "test")
         self.assertLessEqual(clock[0], 315)
 
     def test_keepalive_cannot_hold_a_stage_forever(self):
@@ -29,9 +29,9 @@ class ProgressWatch(unittest.TestCase):
                 yield ": keepalive"
             yield 'data: ' + json.dumps({"type":"response.completed"})
         client = Mock(stream=Mock(return_value=nullcontext(Mock(status_code=200, iter_lines=lines))))
-        with patch.object(model.time, "monotonic", side_effect=lambda:clock[0]):
+        with patch.object(codex.time, "monotonic", side_effect=lambda:clock[0]):
             with self.assertRaises(model.ModelIssue) as error:
-                model._stream(client, {}, [], False, "test")
+                codex._stream(client, {}, [], False, "test")
         self.assertEqual(error.exception.kind, "timeout")
         self.assertLessEqual(clock[0], 315)
 
@@ -45,8 +45,8 @@ class ProgressWatch(unittest.TestCase):
             yield 'data: ' + json.dumps({"type":"response.completed"})
         report = Mock()
         client = Mock(stream=Mock(return_value=nullcontext(Mock(status_code=200, iter_lines=lines))))
-        with patch.object(model.time, "monotonic", side_effect=lambda:clock[0]):
-            result = model._stream(client, {}, [], False, "test", on_progress=report)
+        with patch.object(codex.time, "monotonic", side_effect=lambda:clock[0]):
+            result = codex._stream(client, {}, [], False, "test", on_progress=report)
         self.assertEqual(result.text, "finished")
         self.assertGreater(clock[0], 86400)
         self.assertGreater(report.call_count, 1)

@@ -54,10 +54,10 @@ sudo -Hu hermes bash -c 'cd "$1" && python3 -c "import hermes_bootstrap, pm; pm.
 
 ```sh
 sudo python3 -m venv /opt/psy-upload-venv
-sudo /opt/psy-upload-venv/bin/pip install -r media/requirements.lock.txt
+sudo /opt/psy-upload-venv/bin/pip install --require-hashes -r media/requirements.lock.txt
 sudo /opt/psy-upload-venv/bin/pip check
 sudo python3 -m venv /opt/psy-asr-venv
-sudo /opt/psy-asr-venv/bin/pip install -r media/asr-requirements.lock.txt
+sudo /opt/psy-asr-venv/bin/pip install --require-hashes -r media/asr-requirements.lock.txt
 sudo /opt/psy-asr-venv/bin/pip check
 ```
 
@@ -68,7 +68,7 @@ sudo bash ops/install-runtime --new-profile
 sudo bash ops/test-host --units
 ```
 
-Ключ --new-profile ставит публичный SOUL.md в новый профиль и при необходимости сохраняет первоначальный SOUL.md от Hermes рядом как SOUL.md.before-psy. При восстановлении личного профиля используйте install-runtime без ключа. Установщик располагает копию навыка и скрипта по пути skills/media/audio-transcription, исходники Mini App в /opt/psy-upload и независимый манифест границы группы в /usr/local/lib/psy-group. При каждом старте шлюза preflight сверяет файлы адаптера, политики OAuth и проверки экземпляра с манифестом релиза.
+Ключ --new-profile ставит публичный SOUL.md в новый профиль и при необходимости сохраняет первоначальный SOUL.md от Hermes рядом как SOUL.md.before-psy. При восстановлении личного профиля используйте install-runtime без ключа. Установщик располагает копию навыка и скрипта по пути skills/media/audio-transcription, исходники Mini App в /opt/psy-upload, общий модуль common/psy_common.py в /usr/local/lib/psy-common и независимый манифест границы группы в /usr/local/lib/psy-group. Общий модуль содержит проверку параметров экземпляра, вызов Bot API, атомарную запись файлов и чтение SQLite без создания служебных файлов. Службы, проверки и брокеры загружают его по явному пути, без изменения sys.path; переменную PSY_COMMON_PATH задают только тесты. При каждом старте шлюза preflight сверяет файлы адаптера, политики OAuth и проверки экземпляра, а также общий модуль, с манифестом релиза.
 
 ## Локальные учетные данные
 
@@ -161,6 +161,8 @@ sudo python3 ops/update_live.py rollback /var/lib/psy-deploy/<папка>
 ```
 
 Файлы в папке Hermes принадлежат hermes, и под этой учетной записью работает агент с командной строкой. Поэтому root их не открывает: чтение, запись, резервную копию и возврат делает вспомогательный процесс от имени hermes. Он отказывается работать со ссылками. Файлы в системных папках открываются без перехода по ссылкам и только там, где папку может менять один root. preflight запускается от имени hermes, как в самой службе.
+
+Собственное обновление Hermes этим путем не пользуется и на работающем узле запрещено. Команду /update в личном чате владельца перехватывает ПСИ и отвечает, что обновление идет через выкатку: иначе Hermes спрятал бы правки ПСИ и перешел на другую версию, а проверка целостности остановила бы бота. Команду hermes update из командной строки агента это не закрывает; см. задачу о переносе правок Hermes в точки подключения.
 
 Проверки, которые требуют Telegram, перечислены в [инструкции восстановления](../docs/RESTORE.md). Они включают настройку кнопки, пробную загрузку и подтверждение результата в целевом чате.
 

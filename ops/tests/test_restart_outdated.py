@@ -8,6 +8,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+# Installed scripts load /usr/local/lib/psy-common/psy_common.py; tests use the repository copy.
+os.environ.setdefault('PSY_COMMON_PATH', str(Path(__file__).resolve().parents[2] / 'common/psy_common.py'))
 import psy_restart_outdated as nightly
 
 NEEDRESTART = """NEEDRESTART-VER: 3.6

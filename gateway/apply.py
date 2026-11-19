@@ -1,6 +1,6 @@
 """Apply or verify the reviewed PSY gateway release at the pinned Hermes commit.
 
-TRACKED and ADDED are the single release inventory. `release` regenerates manifest.json and
+TRACKED, ADDED and SHARED are the single release inventory. `release` regenerates manifest.json and
 group-manifest.json (checked before every gateway start by ops/libexec/preflight.py) from it."""
 import argparse
 import hashlib
@@ -19,13 +19,17 @@ TRACKED = (
     "hermes_cli/auth_codex.py", TELEGRAM + "adapter.py", TELEGRAM + "update_admission.py",
     "tools/transcription_tools.py",
 )
-MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_queue", "psy_group_route",
-           "psy_owner_recovery", "psy_source_evidence", "psy_group_store", "psy_instance",
+MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_client", "psy_group_pipeline",
+           "psy_group_sources", "psy_group_lecture", "psy_group_continuation", "psy_group_queue",
+           "psy_group_route", "psy_owner_recovery", "psy_source_evidence", "psy_group_store", "psy_instance",
            "psy_upload_handoff", "psy_group_admin", "psy_group_prompts")
 ADDED = tuple(TELEGRAM + name + ".py" for name in MODULES) + (
     "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_platform_bridge.py",
 )
 HANDOFF = TELEGRAM + "psy_upload_handoff.py"
+# Root-owned files outside the checkout that the gateway loads by explicit path (installed by
+# ops/install-runtime and ops/update_live.py): installed path -> source in this repository.
+SHARED = {"/usr/local/lib/psy-common/psy_common.py": "common/psy_common.py"}
 
 
 def git(repo, *args):
@@ -60,14 +64,19 @@ def inventory(repo):
             sums[relative] = digest((tree/relative).read_bytes())
     for relative in ADDED:
         sums[relative] = digest(source(relative).read_bytes())
-    return {"base": BASE, "patch_sha256": digest(patch.read_bytes()), "sha256": sums}
+    return {"base": BASE, "patch_sha256": digest(patch.read_bytes()), "sha256": sums, "shared": shared()}
+
+
+def shared():
+    return {installed: digest((HERE.parent/relative).read_bytes()) for installed, relative in SHARED.items()}
 
 
 def release(repo):
     manifest = inventory(repo)
     write_json(HERE/"manifest.json", manifest)
-    # The boundary check before service start covers the same files, by checkout-relative path.
-    write_json(HERE/"group-manifest.json", manifest["sha256"])
+    # The boundary check before service start covers the same files, by checkout-relative path,
+    # and the shared files by their absolute installed path.
+    write_json(HERE/"group-manifest.json", {**manifest["sha256"], **manifest["shared"]})
 
 
 def run(repo, apply):
@@ -82,6 +91,8 @@ def run(repo, apply):
     if (manifest["base"] != BASE or set(sums) != set(TRACKED + ADDED)
             or digest(patch.read_bytes()) != manifest["patch_sha256"]):
         raise ValueError("Release inventory or patch integrity mismatch")
+    if manifest.get("shared") != shared():
+        raise ValueError("Release source integrity mismatch: " + ", ".join(SHARED.values()))
     dirty = set(filter(None, git(repo, "diff", "--name-only", "-z", BASE).decode().split("\0")))
     if dirty.difference(TRACKED):
         raise ValueError("Checkout contains independently modified tracked files")

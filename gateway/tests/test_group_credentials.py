@@ -11,7 +11,8 @@ from types import ModuleType
 from unittest.mock import ANY, Mock, patch
 import json
 
-from psy_modules import psy_group_codex as adapter
+from psy_modules import psy_group_client as codex, psy_group_codex as adapter
+from psy_modules import psy_group_pipeline as pipeline
 
 
 class OAuthError(Exception):
@@ -28,7 +29,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.markers = Path(dirs.name)
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(patch.object(adapter.codex_policy, "MARKERS", self.markers))
+        stack.enter_context(patch.object(codex.codex_policy, "MARKERS", self.markers))
         self.primary = dict(id="first", priority=0, auth_type="oauth", source="manual:device_code",
                             access_token="live", refresh_token="first-grant")
         self.other = dict(self.primary, id="other", priority=1, access_token="other", refresh_token="alternate-grant")
@@ -45,7 +46,7 @@ class TestPreferredCredentials(unittest.TestCase):
         constants.httpx = self.modules["httpx"]
         for name in ("PoolTimeout", "ConnectTimeout", "ConnectError", "ReadTimeout", "WriteError"):
             setattr(constants.httpx, name, type(name, (constants.httpx.RequestError,), {}))
-        stack.enter_context(patch.object(adapter.codex_policy, "_incident"))
+        stack.enter_context(patch.object(codex.codex_policy, "_incident"))
         self.auth._auth_file_path = lambda: self.markers / "test-auth.json"
         self.auth._load_auth_store = lambda: deepcopy(self.store)
         self.auth._save_auth_store = Mock(side_effect=self._save)
@@ -78,8 +79,8 @@ class TestPreferredCredentials(unittest.TestCase):
         self.store = deepcopy(new_store)
 
     def issue(self, kind):
-        with self.assertRaises(adapter.CredentialIssue) as caught:
-            adapter.get_credentials()
+        with self.assertRaises(codex.CredentialIssue) as caught:
+            codex.get_credentials()
         self.assertEqual(caught.exception.kind, kind)
 
     def cooldown(self, reason):
@@ -90,9 +91,9 @@ class TestPreferredCredentials(unittest.TestCase):
         for reason in (None, "usage_limit_reached", "insufficient_quota"):
             if reason:
                 self.cooldown(reason)
-            self.assertEqual(adapter.get_credentials(), {"provider":"openai-codex",
+            self.assertEqual(codex.get_credentials(), {"provider":"openai-codex",
                              "base_url":"https://chatgpt.com/backend-api/codex", "api_key":"live",
-                             "generation":adapter.codex_policy.generation(self.primary)})
+                             "generation":codex.codex_policy.generation(self.primary)})
         self.auth._save_auth_store.assert_not_called()
         self.codex.refresh_codex_oauth_pure.assert_not_called()
 
@@ -109,7 +110,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.primary.update(last_status_at=now-30, last_error_message="Error code: 429")
         self.issue("access_wait")
         self.primary["last_status_at"] = now-301
-        self.assertEqual(adapter.get_credentials()["api_key"], "live")
+        self.assertEqual(codex.get_credentials()["api_key"], "live")
         self.primary["last_error_reset_at"] = now+90
         self.issue("access_wait")
         self.primary.update(last_error_reset_at=now+86400, last_error_message="Requests per minute exceeded")
@@ -120,7 +121,7 @@ class TestPreferredCredentials(unittest.TestCase):
     def test_semantic_quota_message(self):
         self.cooldown(None)
         self.primary["last_error_message"] = "You've hit your usage limit."
-        self.assertEqual(adapter.get_credentials()["api_key"], "live")
+        self.assertEqual(codex.get_credentials()["api_key"], "live")
 
     def test_wrong_or_ambiguous_primary_is_rejected(self):
         for field, value in (("source","device_code"), ("base_url","https://test.invalid"), ("last_status","dead"),
@@ -144,7 +145,7 @@ class TestPreferredCredentials(unittest.TestCase):
     def install_grant_guard(self):
         # Keep the public plugin, Hermes grant guard and store transaction real, replace
         # only the underlying HTTP exchange, filesystem root and interprocess lock.
-        policy = adapter.codex_policy
+        policy = codex.codex_policy
         self.network = self.codex.refresh_codex_oauth_pure
         self.auth._auth_file_path = lambda: self.markers / "test-auth.json"
         self.auth._global_auth_file_path = lambda: None
@@ -219,7 +220,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.network.assert_called_once()
         self.network.side_effect = self._refresh
         with patch("time.time", return_value=time.time()+120):
-            self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+            self.assertEqual(codex.get_credentials()["api_key"], "renewed")
         self.assertEqual(self.network.call_count, 2)
 
     def test_conflicting_account_claim_cannot_receive_a_rotated_grant(self):
@@ -261,7 +262,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.install_grant_guard()
         directory = self.markers / "psy-codex-renewals"
         directory.mkdir()
-        path = directory / (adapter.codex_policy.fingerprint("first-grant") + ".json")
+        path = directory / (codex.codex_policy.fingerprint("first-grant") + ".json")
         for damaged in ("{", "null", "{}", '{"state":"wait"}'):
             path.write_text(damaged)
             with self.assertRaises(OAuthError) as issue:
@@ -290,7 +291,7 @@ class TestPreferredCredentials(unittest.TestCase):
     def test_legacy_alias_renewed_in_same_transaction_and_independent_login_preserved(self):
         self.primary["access_token"] = "old"
         self.rows.append(dict(self.primary, id="alias", priority=2, label="alias", last_error_code=429))
-        self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+        self.assertEqual(codex.get_credentials()["api_key"], "renewed")
         rows = self.store["credential_pool"]["openai-codex"]
         self.assertEqual(rows[0], self.other)
         self.assertEqual([r["refresh_token"] for r in rows[1:]], ["rotated", "rotated"])
@@ -310,7 +311,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.primary["access_token"] = "soon"
         old_status = {k:v for k,v in self.primary.items() if k.startswith("last_error") or k=="last_status"}
         for i in range(2):
-            self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+            self.assertEqual(codex.get_credentials()["api_key"], "renewed")
         rows = self.store["credential_pool"]["openai-codex"]
         self.assertEqual(rows[0], self.other)
         self.assertEqual({k:rows[1][k] for k in old_status}, old_status)
@@ -320,7 +321,7 @@ class TestPreferredCredentials(unittest.TestCase):
     def test_concurrent_rotation_and_replacement(self):
         self.primary["access_token"] = "old"
         self.on_lock = lambda: self.primary.update(access_token="peer-live",refresh_token="peer-grant")
-        self.assertEqual(adapter.get_credentials()["api_key"], "peer-live")
+        self.assertEqual(codex.get_credentials()["api_key"], "peer-live")
         self.primary["access_token"] = "old"
         self.on_lock = lambda: self.primary.update(id="different",access_token="different-login")
         self.issue("access_wait")
@@ -345,7 +346,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.assertNotEqual(self.store["credential_pool"]["openai-codex"][1].get("last_status"), "dead")
         self.network.side_effect = self._refresh
         with patch("time.time", return_value=time.time()+65):
-            self.assertEqual(adapter.get_credentials()["api_key"], "renewed")
+            self.assertEqual(codex.get_credentials()["api_key"], "renewed")
 
     def group_question(self, reply):
         headers = ModuleType("agent.codex_headers")
@@ -361,7 +362,7 @@ class TestPreferredCredentials(unittest.TestCase):
                     'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"42"}]}]}}'])
             return nullcontext(response)
         with patch.dict(sys.modules, {"agent.codex_headers": headers}):
-            return adapter._compose(Mock(stream=stream), [adapter._user("6 * 7?")], False, "test", "6 * 7?")
+            return pipeline._compose(Mock(stream=stream), [codex._user("6 * 7?")], False, "test", "6 * 7?")
 
     def test_model_401_before_local_expiry_rotates_once_and_completes_question(self):
         reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)

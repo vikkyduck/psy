@@ -15,15 +15,23 @@ EXPECTED = {
     *(PLATFORM + name for name in (
         "adapter.py", "update_admission.py", "psy_instance.py", "psy_group_route.py", "psy_source_evidence.py",
         "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py", "psy_group_queue.py",
-        "psy_owner_recovery.py", "psy_upload_handoff.py", "psy_group_admin.py", "psy_group_prompts.py")),
+        "psy_owner_recovery.py", "psy_upload_handoff.py", "psy_group_admin.py", "psy_group_prompts.py",
+        "psy_group_client.py", "psy_group_pipeline.py", "psy_group_sources.py", "psy_group_lecture.py",
+        "psy_group_continuation.py")),
 }
+# gateway/apply.py SHARED: root-owned code outside the checkout that the gateway loads by explicit
+# path. Manifest key -> the file checked.
+SHARED = {"/usr/local/lib/psy-common/psy_common.py": Path("/usr/local/lib/psy-common/psy_common.py")}
 
 def verify():
     manifest = json.loads((DEPLOY/"manifest.json").read_text())
-    if set(manifest) != EXPECTED:
+    if set(manifest) != EXPECTED | set(SHARED):
         raise ValueError()
     for name in EXPECTED:
         if hashlib.sha256((CHECKOUT/name).read_bytes()).hexdigest() != manifest[name]:
+            raise ValueError()
+    for name, path in SHARED.items():
+        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest[name]:
             raise ValueError()
     source = (CHECKOUT/PLATFORM/"adapter.py").read_text()
     flow = ('builder.application_class(TelegramApplication, {"adapter": self})',

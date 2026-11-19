@@ -8,20 +8,28 @@
     "hermes_cli/auth_codex.py": "12341379d489a03199700d41d3a15da0478ff0ce0f8c521f6af942f9a1ee2de2",
     "hermes_cli/psy_codex_incident.py": "ca64f2656d2767210a1ab78a1112c917f58f92f3a194d2d834f1150de8351350",
     "hermes_cli/psy_codex_policy.py": "bd8c030a836c2346a1256e824ecc5496be2e401a0f09ef44142f41f968ba4102",
-    "hermes_cli/psy_platform_bridge.py": "2d7e15c1d9af161b24ccf1280fb58ed80c4632dddeece16208bcdd588dca8566",
+    "hermes_cli/psy_platform_bridge.py": "44fd26797086f84c0ac27f202530321f9663ce66c8f5d20c99f25ddea874925b",
     "plugins/platforms/telegram/adapter.py": "134fefbcfc439d389bae0eb09d6d2190f8b339ec5d59e557261683baa33f1ad1",
     "plugins/platforms/telegram/psy_group_admin.py": "b849c4b4174f6ce15190b241b26eae883000d4a9e72d8dfadc4786993e58e3e4",
     "plugins/platforms/telegram/psy_group_audio.py": "497b2f377c4a9058d36f2702fea7a65e1424cfc741c821c67df6e37bbad65873",
-    "plugins/platforms/telegram/psy_group_codex.py": "b646b2946582d5a8081988a7ff5e4519d625df309b603d6c2eeb9cd99ffe20e7",
+    "plugins/platforms/telegram/psy_group_client.py": "2f1176622378878c278fefcae002b5353b5d4b9d40c0bc5ce66e5872d8d3bbcd",
+    "plugins/platforms/telegram/psy_group_codex.py": "a1c452f803a54ebaec8bf58435b6e4b56c8d01fd1d387a23205d1cee1b82ed81",
+    "plugins/platforms/telegram/psy_group_continuation.py": "861d389848fde8cc871effc6cda61bebaa42241cf71aeae88113887d578dbaea",
+    "plugins/platforms/telegram/psy_group_lecture.py": "e320dceb843c35a53d98023d24af99f7f424930f1ffe131f9f8c13e313b8cb92",
+    "plugins/platforms/telegram/psy_group_pipeline.py": "552b85c09fe1d2f9ff0cb631d802af74293ec982e59c6db5ca9d6237fea20e6d",
     "plugins/platforms/telegram/psy_group_prompts.py": "d83466d6d99afb6905416f2a2b1d8feee331c55ed45cf77449b6df5ea406f39b",
     "plugins/platforms/telegram/psy_group_queue.py": "3234ead38aff60b42a084775a6aafd5846164ca39ceb32d091c5b777ea687756",
-    "plugins/platforms/telegram/psy_group_route.py": "2fd2795be164e651efa31e44c64f6e193906f31874f35a6572f3d940aa5cc9da",
+    "plugins/platforms/telegram/psy_group_route.py": "9cd5844d6809136cc948c5ca09a5404d64d06c59b488e10f85f021d2792b1192",
+    "plugins/platforms/telegram/psy_group_sources.py": "b394ffbe63e0fcd76488e183f8d0c6c6eda57bf904592c8ce4fee1fa4321f043",
     "plugins/platforms/telegram/psy_group_store.py": "f834b118f13569b76f260a9a52aaac79010fae043e56f17dda345dff02726b3b",
-    "plugins/platforms/telegram/psy_instance.py": "75bb8b8deaa5571f0f33ac37b57eaacabfe410feacf039c30b9dab75eebe7b01",
-    "plugins/platforms/telegram/psy_owner_recovery.py": "bfaa38373e9a24965d34cf35510a1d1aa965f69982e26a51ee6baa569b71207d",
+    "plugins/platforms/telegram/psy_instance.py": "0ee509a6d64accffea2192a9d53b157105effea342d50b4d10c3fd1873c44c10",
+    "plugins/platforms/telegram/psy_owner_recovery.py": "637e1dee25d4eb2530342ece6ae134c5d2451586efb746fba675f7623255bd63",
     "plugins/platforms/telegram/psy_source_evidence.py": "0aaa0b30a2764bfa9cd09670c4074dadb91a4aaa057a06639e3fcbb9c7495660",
     "plugins/platforms/telegram/psy_upload_handoff.py": "191fa36f158b7527792d453f199922407b10faeacb640201f13836ec27a05392",
     "plugins/platforms/telegram/update_admission.py": "4bfc788deb2a61869c2cff56ec519b51d05fd90e179688f8b7177b10e3cf4ec6",
     "tools/transcription_tools.py": "dcb54798d0b21be57e75e2060e919ac2b9e1f6ade1d63d907f2ef39ac0842139"
+  },
+  "shared": {
+    "/usr/local/lib/psy-common/psy_common.py": "bba9e0754566ff0670ce6c8e183ac18be7b1c6a9fdaec5879e13a0500e44336d"
   }
 }

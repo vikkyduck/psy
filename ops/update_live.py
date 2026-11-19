@@ -37,6 +37,7 @@ REPO = Path(__file__).resolve().parents[1]
 CHECKOUT = Path("/home/hermes/.hermes/hermes-agent")
 SYSTEMD = Path("/etc/systemd/system")
 GROUP_LIB = Path("/usr/local/lib/psy-group")
+COMMON = Path("/usr/local/lib/psy-common")
 LIBEXEC = Path("/usr/local/libexec")
 UPLOAD = Path("/opt/psy-upload")
 INSTANCE = Path("/etc/psy/instance.env")
@@ -108,8 +109,10 @@ def hermes_git(*args, text=True):
 # ---------- what the release says the host should contain ----------
 
 def system_entries(hermes_uid):
-    entries = [Entry(UPLOAD / f"{name}.py", (REPO / f"media/{name}.py").read_bytes(), f"media/{name}.py")
-               for name in MEDIA]
+    # The shared helpers first: the files after it load it by its path as soon as they are replaced.
+    entries = [Entry(COMMON / "psy_common.py", (REPO / "common/psy_common.py").read_bytes(), "common/psy_common.py")]
+    entries += [Entry(UPLOAD / f"{name}.py", (REPO / f"media/{name}.py").read_bytes(), f"media/{name}.py")
+                for name in MEDIA]
     entries += [Entry(UPLOAD / "static" / f.name, f.read_bytes(), f"media/static/{f.name}")
                 for f in sorted((REPO / "media/static").iterdir()) if f.is_file()]
     entries += [Entry(GROUP_LIB / "upload_broker.py", (REPO / "gateway/upload_broker.py").read_bytes(), "gateway/upload_broker.py"),
@@ -144,12 +147,14 @@ def new_timers(targets):
 
 
 def release_sums():
+    """Release digests: checkout files by relative path, shared root-owned files by installed path."""
     manifest = json.loads((REPO / "gateway/manifest.json").read_bytes())
     sums = manifest["sha256"]
     if (manifest["base"] != RELEASE.BASE or set(sums) != set(RELEASE.TRACKED + RELEASE.ADDED)
+            or manifest.get("shared") != RELEASE.shared()
             or sha256((REPO / "gateway/hermes.patch").read_bytes()) != manifest["patch_sha256"]):
         raise ValueError("gateway/manifest.json does not describe this patch and file list")
-    return sums
+    return {**sums, **manifest["shared"]}
 
 
 def check_group_manifest(sums):
@@ -389,8 +394,14 @@ def write_plain(target, data, uid, gid, mode):
 
 
 def write(target, data, owner, mode):
-    """Install one root-side file; an existing file keeps its owner and mode."""
+    """Install one root-side file; an existing file keeps its owner and mode. A folder created for it
+    is 0755 whatever root's umask, as install-runtime makes it: the services read code there."""
     import pwd
+    folder = Path(target).parent
+    if not folder.exists():
+        check_root_dir(folder)
+        folder.mkdir(parents=True)
+        folder.chmod(0o755)
     current = read_plain(target)
     if current is not None:
         info = current[1]
@@ -429,6 +440,10 @@ def units_for(target):
         return {"hermes-gateway", *ACTIVATED.values()}
     if text.startswith(str(UPLOAD) + "/"):
         return {"psy-asr", "psy-upload-worker", "psy-upload"} | ({"hermes-gateway"} if target.name in GATEWAY_IMPORTS else set())
+    if text.startswith(str(COMMON) + "/"):
+        # Loaded at start by the uploader and the worker, and in the gateway by the upload handoff,
+        # whose preflight checks these bytes. Brokers and timer checks load it on their next run.
+        return {"psy-upload-worker", "psy-upload", "hermes-gateway"}
     if text.startswith(str(SYSTEMD) + "/"):
         name = Path(text).relative_to(SYSTEMD).parts[0].removesuffix(".d")
         unit = name.removesuffix(".service")
@@ -439,9 +454,11 @@ def units_for(target):
 
 
 def check_instance():
-    """Import the release's settings readers with this host's instance.env before anything changes."""
+    """Import the release's settings readers with this host's instance.env before anything changes.
+    They load the release's psy_common, which is not installed yet at this point."""
     parser = load(REPO / "ops/instance_env.py", "psy_instance_env")
-    env = {"PATH": "/usr/bin:/bin", **parser.parse(INSTANCE.read_text(), complete=True)}
+    env = {"PATH": "/usr/bin:/bin", **parser.parse(INSTANCE.read_text(), complete=True),
+           "PSY_COMMON_PATH": str(REPO / "common/psy_common.py")}
     probes = [("/usr/bin/python3", REPO / "gateway" / RELEASE.TELEGRAM, "import psy_instance"),
               ("/usr/bin/python3", REPO / "gateway", "import upload_broker"),
               (UPLOAD_PYTHON, REPO / "media", "import psy_upload_common")]
@@ -658,7 +675,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action", choices=("plan", "apply", "rollback"))
     parser.add_argument("backup", nargs="?", help="for rollback: the /var/lib/psy-deploy folder to put back")
-    parser.add_argument("--force", action="store_true", help="apply even while group or recording work is in progress")
+    parser.add_argument("--force", action="store_true", help="apply even while group or recording work is in progress; rollback a backup that is not the latest")
     parser.add_argument("--commit", default=None, help="label for the record when the checkout has no .git")
     opts = parser.parse_args()
     if os.geteuid() != 0:
@@ -666,6 +683,13 @@ def main():
     if opts.action == "rollback":
         if not opts.backup or Path(opts.backup).resolve().parent != BACKUPS:
             sys.exit(f"rollback needs a folder directly under {BACKUPS}")
+        # An older backup removes files that later releases added and still need (psy_common, new
+        # modules). Only the backup of the update the host runs now can be put back safely.
+        record = read_plain(RECORD)
+        latest = dict(line.split("=", 1) for line in (record[0].decode() if record else "").splitlines() if "=" in line)
+        if latest.get("backup") != str(Path(opts.backup).resolve()) and not opts.force:
+            sys.exit(f"{opts.backup} is not the backup of the current update ({latest.get('backup', 'none recorded')}); "
+                     "roll back the newer updates first, or pass --force")
         still = roll_back_to(Backup(root=Path(opts.backup).resolve()))
         sys.exit(f"still not running: {', '.join(still)}" if still else f"Restored {opts.backup}.")
     import pwd

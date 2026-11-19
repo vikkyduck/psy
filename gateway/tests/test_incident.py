@@ -1,7 +1,7 @@
 import json, unittest, time
 from unittest.mock import patch, Mock
 from contextlib import nullcontext
-from psy_modules import psy_group_codex as m
+from psy_modules import psy_group_client as codex, psy_group_codex as m
 
 
 class Incident(unittest.TestCase):
@@ -27,7 +27,7 @@ class Incident(unittest.TestCase):
         bootstrap=ModuleType("agent.process_bootstrap")
         bootstrap.enable_happy_eyeballs_on_client=lambda c:None
         modules={"httpx":httpx,"agent.codex_headers":headers,"agent.process_bootstrap":bootstrap}
-        with patch.dict(sys.modules,modules), patch.object(m,"_credentials",return_value={
+        with patch.dict(sys.modules,modules), patch.object(codex,"_credentials",return_value={
                 "provider":"openai-codex","base_url":m.ENDPOINT,"api_key":"test-only", "generation":"fixture-generation"}):
             self.assertEqual(m._respond([{"role":"user","content":"test"}],research=False,draw=False,model="test").text,"ok")
         client.get.assert_not_called()
@@ -42,8 +42,8 @@ class Incident(unittest.TestCase):
             client.stream.return_value=nullcontext(resp)
             resp.iter_bytes.return_value=[json.dumps({"error":err}).encode()]
             resp.iter_lines.return_value=['data: '+json.dumps({"type":"response.failed","response":{"error":err}})]
-            with self.assertRaises(m.ModelIssue) as caught:m._stream(client,{},[],False,"m")
+            with self.assertRaises(m.ModelIssue) as caught:codex._stream(client,{},[],False,"m")
             self.assertEqual(caught.exception.kind,"quota")
             self.assertNotIn("sensitive",caught.exception.public())
-        self.assertEqual(m._failure(429,{},"http").kind,"busy")
-        self.assertEqual(m._failure(401,{},"http").kind,"signin")
+        self.assertEqual(codex._failure(429,{},"http").kind,"busy")
+        self.assertEqual(codex._failure(401,{},"http").kind,"signin")
