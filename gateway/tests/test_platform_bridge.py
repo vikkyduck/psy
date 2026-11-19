@@ -229,11 +229,23 @@ class PlatformBridge(unittest.TestCase):
         self.assertEqual((response.status, response.getheader("Content-Encoding"), response.read()), (200, "gzip", packed))
         conn.close()
 
+    def test_full_effort_ladder_and_search_depth_pass(self):
+        # gpt-6.1-sol and gpt-6-astra take low..max on Codex; the platform asks for the deep end.
+        for extra in ({"reasoning": {"effort": "xhigh"}}, {"reasoning": {"effort": "max", "summary": "auto"}},
+                      {"tools": [{"type": "web_search", "search_context_size": "high"}], "tool_choice": "required"}):
+            with self.subTest(extra=extra):
+                self.codex.replies.append(sse(STREAM))
+                request = {**MINIMAL, **extra}
+                self.assertEqual(self.call("POST", "/responses", request)[0], 200)
+                self.assertEqual(json.loads(self.codex.seen[-1][2]), dict(request, stream=True, store=False))
+
     def test_payload_outside_the_accepted_subset_is_refused(self):
         for wrong in ({"temperature": 0.2}, {"previous_response_id": "resp_1"}, {"tools": [{"type": "web_search", "filters": {}}]},
                       {"tools": [{"type": "code_interpreter"}]}, {"tools": {"type": "web_search"}}, {"model": "gpt 6"},
                       {"model": "x" * 65}, {"model": 6}, {"instructions": None}, {"input": {"role": "user"}},
-                      {"tool_choice": "any"}, {"include": ["file_search_call.results"]}, {"reasoning": {"effort": "max"}},
+                      {"tool_choice": "any"}, {"include": ["file_search_call.results"]}, {"reasoning": {"effort": "ultra"}},
+                      {"tools": [{"type": "web_search", "search_context_size": "huge"}]},
+                      {"tools": [{"type": "web_search", "search_context_size": "high", "filters": {}}]},
                       {"reasoning": {"summary": "auto"}}, {"reasoning": {"effort": "low", "budget": 1}},
                       {"text": "plain"}, {"prompt_cache_key": "k" * 65}, {"parallel_tool_calls": 1},
                       {"stream": False}, {"store": True}):

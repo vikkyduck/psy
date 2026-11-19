@@ -54,7 +54,8 @@ MAX_IMAGE_RESPONSE = 40 * 1024**2
 MAX_IMAGE_B64 = 28_000_000
 CONCURRENCY = 8
 CONNECT_SECONDS = 10
-READ_IDLE_SECONDS = 300
+# xhigh/max reasoning can think silently for many minutes before the first output byte.
+READ_IDLE_SECONDS = 900
 IMAGE_CONNECT_SECONDS = 30
 IMAGE_READ_SECONDS = 300
 CLIENT_SECONDS = 60
@@ -67,14 +68,22 @@ ROUTES = {"/health": "GET", "/responses": "POST", "/images": "POST", "/notify": 
 MODEL = re.compile(r"[A-Za-z0-9._:-]{1,64}")
 SIZE = re.compile(r"([1-9][0-9]{2,3})x([1-9][0-9]{2,3})")
 REQUIRED = ("model", "instructions", "input")
-EFFORTS = ("low", "medium", "high")
+# The full ladder gpt-6.1-sol and gpt-6-astra accept on Codex (verified upstream 2026-11-19).
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
+SEARCH_CONTEXT = ("low", "medium", "high")
 SUMMARIES = ("auto", "concise", "detailed")
+def web_search_tool(item):
+    """{"type": "web_search"}, optionally with search_context_size - nothing else of the tool spec."""
+    return (isinstance(item, dict) and item.get("type") == "web_search" and set(item) <= {"type", "search_context_size"}
+            and ("search_context_size" not in item or item["search_context_size"] in SEARCH_CONTEXT))
+
+
 # The accepted subset of the Responses API. stream and store may only repeat the forced values.
 VALID = {
     "model": lambda v: isinstance(v, str) and MODEL.fullmatch(v) is not None,
     "instructions": lambda v: isinstance(v, str),
     "input": lambda v: isinstance(v, (str, list)),
-    "tools": lambda v: isinstance(v, list) and all(item == {"type": "web_search"} for item in v),
+    "tools": lambda v: isinstance(v, list) and all(web_search_tool(item) for item in v),
     "tool_choice": lambda v: isinstance(v, str) and v in ("auto", "required", "none"),
     "include": lambda v: isinstance(v, list) and all(item == "web_search_call.action.sources" for item in v),
     "reasoning": lambda v: (isinstance(v, dict) and set(v) <= {"effort", "summary"}

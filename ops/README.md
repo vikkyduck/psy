@@ -178,7 +178,7 @@ sudo python3 ops/update_live.py rollback /var/lib/psy-deploy/<папка>
 | Запрос | Что делает |
 |---|---|
 | `GET /health` | Отвечает `{"ok": true}` без обращения к учетным данным. С `?deep=1` проверяет вход Codex и отвечает `{"ok": true, "codex": "ready"}` или 503 с видом проблемы, например `{"ok": false, "codex": "signin"}` |
-| `POST /responses` | Принимает запрос Responses API: model, instructions, input и только поля tools (web_search), tool_choice, include, reasoning, text, prompt_cache_key, parallel_tool_calls. Мост сам выставляет `stream: true` и `store: false` и без изменений передает поток SSE от Codex |
+| `POST /responses` | Принимает запрос Responses API: model, instructions, input и только поля tools (web_search, с необязательным search_context_size), tool_choice, include, reasoning (effort от low до max), text, prompt_cache_key, parallel_tool_calls. Мост сам выставляет `stream: true` и `store: false` и без изменений передает поток SSE от Codex |
 | `POST /images` | Создает изображение gpt-image-2 нужного размера, по умолчанию 1536x864, и возвращает PNG в base64 |
 | `POST /notify` | Отправляет владельцу текст до 3500 символов. Тот же текст в течение 10 минут повторно не отправляется, за час проходит не больше 30 сообщений |
 
