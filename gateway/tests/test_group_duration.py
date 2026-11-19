@@ -37,7 +37,10 @@ class Duration(unittest.TestCase):
     def compose(self, question, stage, *, research=False):
         def stream(method, endpoint, *, headers, json, timeout):
             self.assertEqual(headers["fixture-issued"], self.elapsed)
-            self.assertEqual(timeout, (10, 160 if json["tools"] else 90, 60, 10))
+            # A long job thinks at max and may stay silent longer; an ordinary reply thinks at high.
+            deep = json.get("reasoning", {}).get("effort") == codex.DEEP_EFFORT
+            idle = codex.DEEP_IDLE_SECONDS if deep else codex.READ_IDLE_SECONDS[bool(json["tools"])]
+            self.assertEqual(timeout, (10, idle, 60, 10))
             self.streams.append(json)
             return nullcontext(Mock(status_code=200, iter_lines=lambda: stage(json)))
         client = Mock(stream=stream)

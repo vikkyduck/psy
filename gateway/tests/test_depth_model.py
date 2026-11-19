@@ -62,7 +62,7 @@ class Depth(unittest.TestCase):
         turns = [codex._user("secret-history"), {"role":"user", "content":[
             {"type":"input_text","text":q+"\n\nЦитата из этого чата:\nsecret-quote"},
             {"type":"input_text","text":"Материал: secret-name\nsecret-transcript"}]}]
-        def run(client, headers, messages, web, model, *, instructions):
+        def run(client, headers, messages, web, model, *, instructions, **kwargs):
             if prompts.DISPATCH in instructions:
                 return m.Result('PSY_TASK {"public_topic":"secret-private-topic"}', [], 0)
             if "Выдели только" in instructions:
@@ -148,6 +148,50 @@ class Depth(unittest.TestCase):
         self.assertNotIn("verbosity", str(payload))
         self.assertNotIn("max_output_tokens", payload)
         return res
+
+    def payload_of(self, research=False, **options):
+        response = Mock(status_code=200)
+        response.iter_lines.return_value = ["data: " + json.dumps(x) for x in (
+            {"type": "response.output_text.delta", "item_id": "a", "delta": "ответ"}, {"type": "response.completed"})]
+        client = Mock()
+        client.stream.return_value = nullcontext(response)
+        try:
+            codex._stream(client, {}, [], research, "model", **options)
+        except m.ModelIssue:
+            pass  # only the request matters here: a search stream without a completed search is refused
+        return client.stream.call_args.kwargs["json"], client.stream.call_args.kwargs["timeout"]
+
+    def test_depth_quick_reply_deep_job_and_service_calls(self):
+        # Owner's decision 2026-11-19: ordinary replies think at high, long jobs at max with full
+        # prose and deep web search; calls outside a job send no effort at all.
+        quick, timeout = self.payload_of(effort=codex.QUICK_EFFORT)
+        self.assertEqual(quick["reasoning"], {"effort": "high"})
+        self.assertNotIn("text", quick)
+        self.assertEqual(timeout[1], codex.READ_IDLE_SECONDS[False])
+        deep, timeout = self.payload_of(research=True, effort=codex.DEEP_EFFORT, deep=True, verbose=True)
+        self.assertEqual(deep["reasoning"], {"effort": "max"})
+        self.assertEqual(deep["text"], {"verbosity": "high"})
+        self.assertEqual(deep["tools"], [{"type": "web_search", "search_context_size": "high"}])
+        self.assertEqual(timeout[1], codex.DEEP_IDLE_SECONDS)
+        plain, _ = self.payload_of(research=True)
+        self.assertNotIn("reasoning", plain)
+        self.assertEqual(plain["tools"], [{"type": "web_search"}])
+
+    def test_a_job_turns_deep_once_it_is_admitted_long(self):
+        seen = []
+        def run(client, headers, messages, web, model, *, instructions, **kwargs):
+            seen.append((kwargs.get("effort"), kwargs.get("deep"), kwargs.get("verbose")))
+            return m.Result("ответ", [], 0)
+        with patch.object(codex, "_stream", side_effect=run):
+            pipeline._compose(None, [codex._user("merci")], False, "fake", "merci")
+        self.assertEqual(seen, [("high", False, False)])
+        seen.clear()
+        with patch.object(codex, "_stream", side_effect=run):
+            call, _ = codex._job_calls(None, "fake", None)
+            pipeline._admit_long(None, call)
+            call([codex._user("лекция")], "instr", prose=True)
+            call([codex._user("поиск")], "instr", web=True)
+        self.assertEqual(seen, [("max", True, True), ("max", True, False)])
 
     def test_commentary_never_becomes_a_response_or_a_continuation(self):
         prefix = [{"type":"response.output_item.added","item":{"id":"c","type":"message","phase":"commentary"}},
