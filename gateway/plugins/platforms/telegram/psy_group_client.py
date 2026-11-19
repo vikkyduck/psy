@@ -36,7 +36,15 @@ class Result:
 
 # HTTPX measures read timeouts between received bytes, including before the
 # first response. A lecture or research job has no deadline across reads/calls.
-READ_IDLE_SECONDS = {False: 90, True: 160}
+# At high effort the model may think for minutes before the first byte.
+READ_IDLE_SECONDS = {False: 300, True: 300}
+# Reasoning depth of a group job (owner's decision 2026-11-19): a long job - research, lecture,
+# analysis of a recording - thinks at the deep end with full prose and deep web search; an ordinary
+# reply stays quick. Calls outside a job (source choice, recovery checks) send no effort at all.
+QUICK_EFFORT = "high"
+DEEP_EFFORT = "max"
+# At max the model can stay silent - no bytes, no visible text - for many minutes.
+DEEP_IDLE_SECONDS = 900
 
 
 class ModelIssue(Exception):
@@ -202,13 +210,21 @@ def _parallel(call, func, items, *, workers=3, tolerate=()):
     return [(None, f.exception()) if f.exception() is not None else (f.result(), None) for f in futures]
 
 
-def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=300, on_progress=None):
+def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=300, on_progress=None,
+            effort=None, deep=False, verbose=False):
     if read_idle is None:
-        read_idle = READ_IDLE_SECONDS[bool(research)]
-    tools = [{"type": "web_search"}] if research else []
+        read_idle = DEEP_IDLE_SECONDS if deep else READ_IDLE_SECONDS[bool(research)]
+    if deep and progress_idle:
+        progress_idle = max(progress_idle, DEEP_IDLE_SECONDS)
+    search = {"type": "web_search", "search_context_size": "high"} if deep else {"type": "web_search"}
+    tools = [search] if research else []
     payload = dict(model=model, instructions=instructions, input=turns, tools=tools,
                    store=False, stream=True,
                    tool_choice="required" if research else "auto")
+    if effort:
+        payload["reasoning"] = {"effort": effort}
+    if verbose:
+        payload["text"] = {"verbosity": "high"}
     if research:
         payload["include"] = ["web_search_call.action.sources"]
     with client.stream("POST", ENDPOINT + "/responses", headers=headers, json=payload,
@@ -460,7 +476,9 @@ def _job_calls(client, model, checkpoints):
         try:
             with _transport():
                 result = _authenticated_request(lambda token, headers: _stream(
-                    client, headers, messages, web, model, instructions=instructions, **options))
+                    client, headers, messages, web, model, instructions=instructions,
+                    effort=DEEP_EFFORT if call.deep else QUICK_EFFORT, deep=call.deep,
+                    verbose=call.deep and prose, **options))
         except ModelIssue as exc:
             if checkpoints is not None and exc.retryable:
                 # Parallel siblings must not keep calling a model that just refused.
@@ -489,4 +507,6 @@ def _job_calls(client, model, checkpoints):
         return call(messages, instructions, prose=True, key=key), False
 
     call.halt = halt
+    # Set by the pipeline once the job turns out long (_admit_long): later stages think deep.
+    call.deep = False
     return call, continuation_call

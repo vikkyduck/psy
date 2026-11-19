@@ -18,9 +18,12 @@ else:
     from psy_source_evidence import public_topic
 
 
-def _admit_long(checkpoints):
+def _admit_long(checkpoints, call=None):
     # Admission is attached only to durable group jobs. Direct CLI uses and isolated
     # composition remain synchronous and have no shared group queue to reserve.
+    # A long job also thinks deep from here on (psy_group_client.DEEP_EFFORT).
+    if call is not None:
+        call.deep = True
     admit = getattr(checkpoints, "admit_long", None)
     if admit is not None:
         admit()
@@ -32,7 +35,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
                           continuation_call=continuation_call if checkpoints is not None else None)
     dispatch = SYSTEM + DISPATCH
     if research:
-        _admit_long(checkpoints)
+        _admit_long(checkpoints, call)
         dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
                      "публичной темой. Если искать приватно нельзя, верни пустую public_topic.")
     try:
@@ -40,7 +43,7 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
     except ModelIssue as exc:
         if exc.kind != "context":
             raise
-        _admit_long(checkpoints)
+        _admit_long(checkpoints, call)
         turns = _map_source(call, turns, question)
         initial = call(turns, dispatch, prose=not research)
 
@@ -62,14 +65,14 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
         if research:
             raise ModelIssue("unavailable", "research_dispatch")
         if not initial.complete:
-            _admit_long(checkpoints)
+            _admit_long(checkpoints, call)
         result = write_prose(turns, SYSTEM, initial=initial)
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
         return result
 
     # Dispatch is already checkpointed. A parked job can resume at this point.
-    _admit_long(checkpoints)
+    _admit_long(checkpoints, call)
     minutes = task.get("minutes")
     long_form = type(minutes) is int and minutes >= 30
     wants_sources = bool(task.get("public_topic")) or research
