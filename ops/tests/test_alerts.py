@@ -234,6 +234,21 @@ class OwnerAlerts(unittest.TestCase):
             self.assertTrue(result[0].endswith(': 1.'))
             self.assertNotIn('secret', str(result))
 
+    def test_deep_model_call_may_stay_silent_until_the_gateway_gives_up(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'group.sqlite3'
+            with sqlite3.connect(path) as db:
+                db.executescript('CREATE TABLE requests(id INTEGER,state TEXT); CREATE TABLE job_progress(request_id INTEGER,updated REAL,stage TEXT);')
+                db.executemany('INSERT INTO requests VALUES(?,?)', [(1,'running'),(2,'running')])
+                db.executemany('INSERT INTO job_progress VALUES(?,?,?)', [(1,100,'model_deep'),(2,500,'model')])
+            self.assertEqual(alerts.group_status(path, 900), [])
+            # 15 minutes into a silent deep call is still normal; the ordinary stage is stalled.
+            result = alerts.group_status(path, 1000)
+            self.assertEqual(len(result), 1)
+            self.assertTrue(result[0].endswith(': 1.'))
+            # Past the gateway's own 15-minute limit plus a minute, the deep call is stalled too.
+            self.assertTrue(alerts.group_status(path, 1061)[0].endswith(': 2.'))
+
     def test_sender_rejects_group_address_before_loading_credential(self):
         with patch.dict(alerts.os.environ, {'PSY_OWNER_ID':'-202'}), patch.object(alerts, 'token') as token:
             with self.assertRaises(ValueError):

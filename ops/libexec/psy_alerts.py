@@ -58,6 +58,11 @@ BACKUP_SUCCESS = Path("/var/lib/psy-backup/last-success")
 BACKUP_MAX_AGE = 26 * 3600
 CLEAR_AFTER = 3            # clean runs in a row before a problem counts as resolved
 HOURLY_CAP = 4             # messages to the owner per rolling hour
+# A running group job is stalled after this long without a progress mark. A deep model call
+# (stage model_deep) may legitimately think silently for up to 15 minutes before the gateway
+# itself gives up (psy_group_client.DEEP_IDLE_SECONDS), so it gets that plus a minute.
+STALL_SECONDS = 420
+DEEP_STALL_SECONDS = 960
 REMIND = (3600, 3 * 3600, 6 * 3600)   # gaps between reminders of one unresolved problem
 FAILING_AFTER = 3          # failed deliveries in a row before the run itself fails
 EVENTS = ("restart:", "gateway_health")   # one-off events: reported once, never "resolved"
@@ -138,7 +143,8 @@ def group_status(path, now):
         if "job_progress" not in tables:
             return []
         stalled = db.execute("""SELECT count(*) FROM requests r JOIN job_progress p ON p.request_id=r.id
-                              WHERE r.state='running' AND p.updated<?""", (now - 420,)).fetchone()[0]
+                              WHERE r.state='running' AND p.updated < CASE WHEN p.stage='model_deep'
+                              THEN ? ELSE ? END""", (now - DEEP_STALL_SECONDS, now - STALL_SECONDS)).fetchone()[0]
         # Queued jobs may intentionally wait for OAuth or Telegram flood control.
         uncertain = db.execute("SELECT count(*) FROM requests WHERE state='uncertain'").fetchone()[0]
         # Kept with their text and checkpoints after an unexpected defect, until the operator acts.
@@ -151,7 +157,8 @@ def group_status(path, now):
         db.close()
     messages = []
     if stalled:
-        messages.append(f"Задания группы без признаков прогресса более 7 минут: {stalled}.")
+        messages.append("Задания группы без признаков прогресса более 7 минут "
+                        f"(при глубоком размышлении модели более 16 минут): {stalled}.")
     if uncertain:
         messages.append(f"Задания с неподтвержденным результатом отправки: {uncertain}. Нужна проверка доставки.")
     if failed:

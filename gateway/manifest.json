@@ -12,7 +12,7 @@
     "plugins/platforms/telegram/adapter.py": "134fefbcfc439d389bae0eb09d6d2190f8b339ec5d59e557261683baa33f1ad1",
     "plugins/platforms/telegram/psy_group_admin.py": "b849c4b4174f6ce15190b241b26eae883000d4a9e72d8dfadc4786993e58e3e4",
     "plugins/platforms/telegram/psy_group_audio.py": "497b2f377c4a9058d36f2702fea7a65e1424cfc741c821c67df6e37bbad65873",
-    "plugins/platforms/telegram/psy_group_client.py": "1a0de38b3e104ede424d22558dc8a113c7ffb4d4c8e4e7de8fff9f1843b09022",
+    "plugins/platforms/telegram/psy_group_client.py": "be6f5edb9aa2fadfbdf87b65721d0681d3d3c13300cef00f9f57f567201e6eb5",
     "plugins/platforms/telegram/psy_group_codex.py": "a1c452f803a54ebaec8bf58435b6e4b56c8d01fd1d387a23205d1cee1b82ed81",
     "plugins/platforms/telegram/psy_group_continuation.py": "861d389848fde8cc871effc6cda61bebaa42241cf71aeae88113887d578dbaea",
     "plugins/platforms/telegram/psy_group_lecture.py": "e320dceb843c35a53d98023d24af99f7f424930f1ffe131f9f8c13e313b8cb92",
