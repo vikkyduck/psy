@@ -25,6 +25,13 @@ jobs:
           python3 gateway/apply.py verify "$target"
           python3 gateway/test_gateway.py "$target"
           python3 gateway/apply.py apply "$target"
+      - name: Reproduce shutdown, monitor and release transaction failures
+        env:
+          PSY_TEST_GATEWAY: ${{ runner.temp }}/hermes
+        run: |
+          python3 -B -m unittest discover -s tests/reliability -p 'test_*_release.py' -v
+          python3 -B -m unittest discover -s tests/isolated -p 'test_fixture_guards.py' -v
+          node --check tests/isolated/upload_ui_example.cjs
       - name: Test Codex renewal across the gateway, monitor and Hermes
         run: |
           python3 -m venv "$RUNNER_TEMP/oauth-tests"
@@ -58,13 +65,13 @@ jobs:
   recognition:
     name: Verify pinned Whisper and Linux isolation
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install checked dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg python3-venv
+          sudo apt-get install -y --no-install-recommends ffmpeg espeak-ng python3-venv
           python3 -m venv "$RUNNER_TEMP/asr"
           "$RUNNER_TEMP/asr/bin/pip" install --require-hashes -r media/asr-requirements.lock.txt
       - name: Verify the public model before running it on generated audio
@@ -77,3 +84,22 @@ jobs:
           done
           (cd "$model" && sha256sum --check "$GITHUB_WORKSPACE/media/model.sha256")
           "$RUNNER_TEMP/asr/bin/python" media/tests/offline_smoke.py --model "$model"
+      - name: Exercise one-tap large upload and real ASR with no external network
+        run: |
+          stage="/var/tmp/psy-isolated-ci-$GITHUB_RUN_ID"
+          sudo install -d -m 0755 "$stage"
+          sudo cp -R media common tests "$stage/"
+          sudo chmod -R a+rX "$stage/media" "$stage/common" "$stage/tests"
+          sudo python3 -m venv "$stage/upload-venv"
+          sudo "$stage/upload-venv/bin/pip" install --require-hashes -r media/requirements.lock.txt
+          sudo python3 -m venv "$stage/asr-venv"
+          sudo "$stage/asr-venv/bin/pip" install --require-hashes -r media/asr-requirements.lock.txt
+          sudo cp -R "$RUNNER_TEMP/whisper-base" "$stage/model"
+          sudo chmod -R a+rX "$stage/model"
+          sudo useradd --system --no-create-home --shell /usr/sbin/nologin psy-deliver
+          sudo python3 "$stage/tests/isolated/generate_reference.py" \
+            --fixture-dir "$stage/fixture" --output "$stage/fixture/reference.wav"
+          sudo python3 "$stage/tests/isolated/run_on_host.py" upload \
+            --fixture-dir "$stage/fixture" --source "$stage/fixture/reference.wav" \
+            --upload-python "$stage/upload-venv/bin/python" \
+            --asr-python "$stage/asr-venv/bin/python" --model "$stage/model"

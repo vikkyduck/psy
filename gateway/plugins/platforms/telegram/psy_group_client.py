@@ -4,12 +4,14 @@ and the checkpointed model call shared by the parallel stages of one job.
 Closed interface: no filesystem tools, MCP, callbacks, local execution or previous response IDs."""
 import hashlib
 import json
+import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
 from hermes_cli import psy_codex_policy as codex_policy
 
@@ -19,6 +21,7 @@ else:
     from psy_group_prompts import SYSTEM
 
 ENDPOINT = "https://chatgpt.com/backend-api/codex"
+log = logging.getLogger("psy.group")
 
 
 @dataclass
@@ -28,6 +31,8 @@ class Result:
     searches: int
     complete: bool = True
     source_urls: tuple = ()
+    # Set on a fragment kept from a cut-off stream: seconds it ran without visible progress.
+    silent: float = field(default=None, compare=False, repr=False)
 
     @property
     def searched(self):
@@ -45,6 +50,17 @@ QUICK_EFFORT = "high"
 DEEP_EFFORT = "max"
 # At max the model can stay silent - no bytes, no visible text - for many minutes.
 DEEP_IDLE_SECONDS = 900
+# A deep call that showed no visible text or reasoning for this long and was then cut off - by
+# DEEP_IDLE_SECONDS above, or by the provider, which on 2026-11-24 closed every silent max-effort
+# source check exactly 15 minutes after the request - fails the same way on every retry (retries
+# have no limit), and a source check that returns a fragment is simply asked again. After such a
+# cut every later deep call of the job thinks at FALLBACK_EFFORT. The mark is a job checkpoint
+# (EFFORT_MARK), so it survives restarts and is dropped with the model stages once the answer is saved.
+SILENT_CUT_SECONDS = 600
+FALLBACK_EFFORT = QUICK_EFFORT
+EFFORT_MARK = "model:effort:v1"
+# job_progress stage of a deep model call: psy-alerts allows it DEEP_IDLE_SECONDS of silence.
+DEEP_PROGRESS_STAGE = "model_deep"
 
 
 class ModelIssue(Exception):
@@ -61,6 +77,8 @@ class ModelIssue(Exception):
     def __init__(self, kind, stage, reset=None):
         super().__init__(kind)
         self.kind, self.stage, self.reset = kind, stage, reset
+        # Seconds an interrupted stream ran without any visible text or reasoning; None otherwise.
+        self.silent = None
 
     @property
     def retryable(self):
@@ -252,7 +270,8 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
         unsaved_chars = 0
         last_save = time.monotonic() if save_prefix else 0
         last_progress = time.monotonic() if progress_idle else None
-        last_report = time.monotonic()
+        last_report = started = time.monotonic()
+        visible = False
         if on_progress:
             on_progress()
         for line in _lines(response):
@@ -277,12 +296,14 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if typ in ("response.output_item.added", "response.output_item.done") and item.get("phase") == "commentary":
                 commentary.add(item_id)
                 commentary.add(event.get("output_index", item_id))
-            if progress_idle and item_id not in commentary and event.get("delta") and typ in (
+            if item_id not in commentary and event.get("delta") and typ in (
                     "response.output_text.delta", "response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
-                last_progress = time.monotonic()
-                if on_progress and last_progress - last_report >= 15:
-                    on_progress()
-                    last_report = last_progress
+                visible = True
+                if progress_idle:
+                    last_progress = time.monotonic()
+                    if on_progress and last_progress - last_report >= 15:
+                        on_progress()
+                        last_report = last_progress
             if typ == "response.output_item.added" and item.get("type") == "message" and item.get("phase") == "final_answer":
                 final_items.add(item_id)
             part = event.get("part") or {}
@@ -354,8 +375,10 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if typ in ("error", "response.failed", "response.incomplete"):
                 raise _failure(None, body.get("error") or event.get("error") or event, "stream")
         partial = _written(written, commentary)
+        silent = None if visible else time.monotonic() - started
         if partial and not refused and (not research or searches):
-            return Result(partial, images, searches, False, tuple(sorted(source_urls)))
+            return Result(partial, images, searches, False, tuple(sorted(source_urls)), silent=silent)
+        interruption.silent = silent
         raise interruption
 
 
@@ -469,17 +492,42 @@ def _job_calls(client, model, checkpoints):
             saved_prefix = True
 
         options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
+        effort = DEEP_EFFORT if call.deep else QUICK_EFFORT
+        marking, cuts = call.deep and checkpoints is not None, 0
+        if marking:
+            saved_cuts = checkpoints.get(EFFORT_MARK)
+            cuts = saved_cuts.get("silent_cuts", 0) if isinstance(saved_cuts, dict) else 0
+            if cuts:
+                effort = FALLBACK_EFFORT
+
+        def silent_cut(silent):
+            if not (marking and effort != FALLBACK_EFFORT and silent is not None and silent >= SILENT_CUT_SECONDS):
+                return
+            try:
+                checkpoints.put(EFFORT_MARK, {"silent_cuts": cuts + 1})
+                log.warning("group model call silent for %.0fs at effort=%s; the rest of the job uses effort=%s",
+                            silent, effort, FALLBACK_EFFORT)
+            except Exception as error:
+                log.warning("group model silent cut not recorded: %s", type(error).__name__)
+
         if checkpoints is not None:
             report = getattr(checkpoints, "progress", None)
             if report is not None:
-                options["on_progress"] = report
+                options["on_progress"] = partial(report, DEEP_PROGRESS_STAGE) if call.deep else report
+        started = time.monotonic()
         try:
             with _transport():
                 result = _authenticated_request(lambda token, headers: _stream(
                     client, headers, messages, web, model, instructions=instructions,
-                    effort=DEEP_EFFORT if call.deep else QUICK_EFFORT, deep=call.deep,
+                    effort=effort, deep=call.deep,
                     verbose=call.deep and prose, **options))
         except ModelIssue as exc:
+            silent = exc.silent
+            if silent is None and (exc.kind, exc.stage) == ("timeout", "transport"):
+                # No response at all: the whole attempt was silent.
+                silent = time.monotonic() - started
+            if exc.retryable:
+                silent_cut(silent)
             if checkpoints is not None and exc.retryable:
                 # Parallel siblings must not keep calling a model that just refused.
                 deferred = _ResumeModelJob(exc)
@@ -490,6 +538,9 @@ def _job_calls(client, model, checkpoints):
             if saved_prefix:
                 checkpoints.put(key, None)
             raise
+        if not result.complete:
+            # A fragment kept from a cut-off stream: a source check asks again with a new prompt.
+            silent_cut(result.silent)
         if checkpoints is not None and (result.complete or (prose and result.text and not _dispatch_marker(result.text, complete=False))):
             save(result)
         return result

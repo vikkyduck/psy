@@ -9,7 +9,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 PRIVATE_DIRS = {"vault", "media-vault", "backups", "outputs", "transcripts", "recordings", "node_modules"}
 PRIVATE_SUFFIX = {".log", ".db", ".sqlite", ".sqlite3", ".wav", ".mp3", ".m4a", ".ogg", ".mp4",
-                  ".webm", ".jpg", ".jpeg", ".png", ".pdf", ".docx", ".zip", ".gz", ".pkl", ".safetensors",
+                  ".webm", ".aiff", ".aif", ".caf", ".flac", ".aac", ".opus", ".mov", ".jpg", ".jpeg", ".png", ".pdf", ".docx", ".zip", ".gz", ".pkl", ".safetensors",
                   ".pem", ".pfx", ".key", ".session"}
 SECRETS = [
     rb"\b\d{7,15}:[A-Za-z0-9_-]{30,}\b",

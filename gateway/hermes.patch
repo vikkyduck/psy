@@ -1,5 +1,5 @@
 diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
-index 10a5b181..600ab0ee 100644
+index 10a5b1814e..600ab0ee7a 100644
 --- a/agent/auxiliary_client.py
 +++ b/agent/auxiliary_client.py
 @@ -3837,9 +3837,27 @@ def _refresh_copilot_credentials() -> bool:
@@ -60,7 +60,7 @@ index 10a5b181..600ab0ee 100644
              if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                  # The stale client is cached under the route label (e.g. "auto"), not the
 diff --git a/agent/credential_pool.py b/agent/credential_pool.py
-index 9682aedc..402684d6 100644
+index 9682aedcf6..402684d6d4 100644
 --- a/agent/credential_pool.py
 +++ b/agent/credential_pool.py
 @@ -1186,7 +1186,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
@@ -276,8 +276,135 @@ index 9682aedc..402684d6 100644
          base_url = auth_mod.DEFAULT_CODEX_BASE_URL
          custom_label = str(state.get("label") or "").strip()
      else:
+diff --git a/gateway/run.py b/gateway/run.py
+index a9e9855ec9..cdba5bafe6 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -5697,12 +5697,43 @@ def _start_gateway_start_cron_and_housekeeping(runner):
+     return cron_stop, cron_provider, cron_thread, housekeeping_thread
+ 
+ 
++async def _prepare_gateway_process_exit(runner, signal_initiated_shutdown: bool):
++    """Wait for durable stop, then arm CLI-only finalization and store the verdict."""
++    # wait_for_shutdown() observes an event set before SessionDB close and durable
++    # exit-state persistence. Wait for the actual stop task before any final-exit
++    # deadline can be armed. Shield it so cancellation cannot interrupt a checkpoint.
++    _stop_task = getattr(runner, "_stop_task", None)
++    _durable_stop = _stop_task is not None and _stop_task is not asyncio.current_task()
++    if _durable_stop:
++        await asyncio.shield(_stop_task)
++
++    # Resolve once but defer SystemExit until the cooperative tail is complete.
++    # This preserves restart/configuration exit codes even if finalization wedges.
++    _pending_exit = None
++    try:
++        _exit_verdict = _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown)
++        _final_exit_code = 0 if _exit_verdict else 1
++    except SystemExit as _exit_error:
++        _pending_exit = _exit_error
++        _final_exit_code = (0 if _exit_error.code is None else
++                            _exit_error.code if isinstance(_exit_error.code, int) else 1)
++        _exit_verdict = False
++    if _durable_stop:
++        from hermes_cli.psy_gateway_exit import arm_after_durable_shutdown
++        arm_after_durable_shutdown(_final_exit_code)
++
++    return _exit_verdict, _pending_exit
++
++
+ async def _start_gateway_shutdown_tail(
+     runner, _control_server, cron_stop: threading.Event, cron_provider,
+     cron_thread: Any, housekeeping_thread: threading.Thread,
+     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
+     _signal_initiated_shutdown: list) -> bool:
+     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
++    _exit_verdict, _pending_exit = await _prepare_gateway_process_exit(
++        runner, _signal_initiated_shutdown[0])
++
+     # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
+     # successor must be able to bind. Early-exit paths rely on the atexit cleanup_files hook instead.
+     if _control_server is not None:
+@@ -5742,9 +5773,11 @@ async def _start_gateway_shutdown_tail(
+     except Exception:
+         logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+ 
+-    # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
+-    # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
+-    return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
++    # Propagate the stored verdict only AFTER cooperative teardown. Embedded callers
++    # do not install the process-exit guard and retain this full cleanup behavior.
++    if _pending_exit is not None:
++        raise _pending_exit
++    return _exit_verdict
+ 
+ 
+ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
+@@ -5911,11 +5944,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool =
+         # Startup aborted by restart/shutdown before running mode; preserve that path without starting cron.
+         try:
+             await runner.wait_for_shutdown()
++            _exit_verdict, _pending_exit = await _prepare_gateway_process_exit(
++                runner, _signal_initiated_shutdown[0])
+             try:
+                 await _shutdown_mcp_servers_nonblocking(config=getattr(runner, "config", None))
+             except Exception:
+                 logger.warning("MCP shutdown failed; connections may be left open", exc_info=True)
+-            return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
++            if _pending_exit is not None:
++                raise _pending_exit
++            return _exit_verdict
+         finally:
+             _shutdown_gateway_health_export(runner)
+ 
+@@ -6011,25 +6048,27 @@ def main():
+         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
+         log_multiplex_decision(resolve_multiplex_mode(config))
+ 
+-    # start_gateway() completes teardown before returning/raising SystemExit; force-exit after so a
+-    # wedged non-daemon worker can't block Py_FinalizeEx's join. SystemExit caught so EVERY path exits.
+-    try:
+-        # start_gateway() performs the full graceful teardown (adapters disconnected, sessions saved +
+-        # flushed, SQLite closed, cron/MCP stopped, PID file + runtime lock released) before it returns OR
+-        # raises SystemExit with an explicit code. Force-exit afterwards so a wedged non-daemon worker
+-        # thread (e.g. a ThreadPoolExecutor tool/LLM call blocked with no timeout) cannot block interpreter
+-        # finalization (Py_FinalizeEx joins all non-daemon threads, incl. concurrent.futures' _python_exit)
+-        # and strand the gateway half-shut down with the supervisor unable to restart it (#53107).
+-        # SystemExit is caught explicitly: start_gateway raises it on the clean-fatal-config (#51228),
+-        # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
+-        # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
+-        # boolean-return ones.
+-        success = asyncio.run(start_gateway(config))
+-        exit_code = 0 if success else 1
+-    except SystemExit as e:
+-        # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
+-        exit_code = 0 if e.code is None else e.code if isinstance(e.code, int) else 1
+-    _exit_after_graceful_shutdown(exit_code)
++    from hermes_cli.psy_gateway_exit import GatewayProcessExitGuard
++    # The guard is armed by the durable shutdown barrier, never by elapsed run time.
++    # Keep it alive through asyncio.run cancellation and the normal exit cleanup.
++    with GatewayProcessExitGuard(_exit_after_graceful_shutdown):
++        try:
++            # start_gateway() performs the full graceful teardown (adapters disconnected, sessions saved +
++            # flushed, SQLite closed, cron/MCP stopped, PID file + runtime lock released) before it returns OR
++            # raises SystemExit with an explicit code. Force-exit afterwards so a wedged non-daemon worker
++            # thread (e.g. a ThreadPoolExecutor tool/LLM call blocked with no timeout) cannot block interpreter
++            # finalization (Py_FinalizeEx joins all non-daemon threads, incl. concurrent.futures' _python_exit)
++            # and strand the gateway half-shut down with the supervisor unable to restart it (#53107).
++            # SystemExit is caught explicitly: start_gateway raises it on the clean-fatal-config (#51228),
++            # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
++            # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
++            # boolean-return ones.
++            success = asyncio.run(start_gateway(config))
++            exit_code = 0 if success else 1
++        except SystemExit as e:
++            # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
++            exit_code = 0 if e.code is None else e.code if isinstance(e.code, int) else 1
++        _exit_after_graceful_shutdown(exit_code)
+ 
+ 
+ def _exit_after_graceful_shutdown(exit_code: int) -> None:
 diff --git a/hermes_cli/auth.py b/hermes_cli/auth.py
-index e296bbb6..a5879acb 100644
+index e296bbb623..a5879acb2f 100644
 --- a/hermes_cli/auth.py
 +++ b/hermes_cli/auth.py
 @@ -75,6 +75,7 @@ from hermes_cli.auth_xai import (
@@ -321,7 +448,7 @@ index e296bbb6..a5879acb 100644
      "xai-oauth": OAuthProviderFlow(
          "xai-oauth", "resolve_xai_oauth_runtime_credentials", "get_xai_oauth_auth_status",
 diff --git a/hermes_cli/auth_codex.py b/hermes_cli/auth_codex.py
-index 257b4314..2ace588a 100644
+index 257b43145c..2ace588a73 100644
 --- a/hermes_cli/auth_codex.py
 +++ b/hermes_cli/auth_codex.py
 @@ -16,7 +16,7 @@ import json
@@ -811,8 +938,65 @@ index 257b4314..2ace588a 100644
  def _login_openai_codex(args, pconfig: ProviderConfig, *, force_new_login: bool = False) -> None:
      """OpenAI Codex login: device code by default, browser PKCE when opted in (``--browser`` /
      ``auth.codex_login_flow``). Tokens stored in ~/.hermes/auth.json."""
+diff --git a/hermes_cli/gateway.py b/hermes_cli/gateway.py
+index 99be52478b..75bb00ff70 100644
+--- a/hermes_cli/gateway.py
++++ b/hermes_cli/gateway.py
+@@ -4664,28 +4664,31 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
+         from gateway.run import _exit_after_graceful_shutdown
+         _exit_after_graceful_shutdown(code)
+ 
+-    success = False
+-    try:
+-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
+-        _exit_diag("asyncio.run.returned", success=success)
+-    except KeyboardInterrupt:
+-        # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
+-        _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())
+-        print("\nGateway stopped.")
++    from hermes_cli.psy_gateway_exit import GatewayProcessExitGuard
++    # This guard starts only after durable shutdown, not while a lecture is running.
++    with GatewayProcessExitGuard(_hard_exit_after_gateway_teardown):
++        success = False
++        try:
++            success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
++            _exit_diag("asyncio.run.returned", success=success)
++        except KeyboardInterrupt:
++            # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
++            _exit_diag("asyncio.run.KeyboardInterrupt", traceback=_traceback.format_exc())
++            print("\nGateway stopped.")
++            _hard_exit_after_gateway_teardown(0)
++            return  # unreachable in production (os._exit); guard for test stubs
++        except SystemExit as e:
++            _exit_diag("asyncio.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
++            _hard_exit_after_gateway_teardown(0 if e.code is None else e.code if isinstance(e.code, int) else 1)
++        except BaseException as e:
++            # Everything else (CancelledError, exotic BaseExceptions): log the cause, then re-raise.
++            _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
++            raise
++        if not success:
++            _exit_diag("gateway.exit_nonzero")
++            _hard_exit_after_gateway_teardown(1)
++        _exit_diag("gateway.exit_clean")
+         _hard_exit_after_gateway_teardown(0)
+-        return  # unreachable in production (os._exit); guard for test stubs
+-    except SystemExit as e:
+-        _exit_diag("asyncio.run.SystemExit", code=e.code, traceback=_traceback.format_exc())
+-        _hard_exit_after_gateway_teardown(0 if e.code is None else e.code if isinstance(e.code, int) else 1)
+-    except BaseException as e:
+-        # Everything else (CancelledError, exotic BaseExceptions): log the cause, then re-raise.
+-        _exit_diag("asyncio.run.exception", exc_type=type(e).__name__, exc_repr=repr(e), traceback=_traceback.format_exc())
+-        raise
+-    if not success:
+-        _exit_diag("gateway.exit_nonzero")
+-        _hard_exit_after_gateway_teardown(1)
+-    _exit_diag("gateway.exit_clean")
+-    _hard_exit_after_gateway_teardown(0)
+ 
+ 
+ # =============================================================================
 diff --git a/plugins/platforms/telegram/adapter.py b/plugins/platforms/telegram/adapter.py
-index 54b6eb8f..179069c3 100644
+index 54b6eb8f70..179069c333 100644
 --- a/plugins/platforms/telegram/adapter.py
 +++ b/plugins/platforms/telegram/adapter.py
 @@ -6482,6 +6482,10 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
@@ -850,7 +1034,7 @@ index 54b6eb8f..179069c3 100644
                  return await self._dispatch_with_text(
                      event, f"The document is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
 diff --git a/plugins/platforms/telegram/update_admission.py b/plugins/platforms/telegram/update_admission.py
-index 7b3a161c..9e61753c 100644
+index 7b3a161c3e..9e61753c36 100644
 --- a/plugins/platforms/telegram/update_admission.py
 +++ b/plugins/platforms/telegram/update_admission.py
 @@ -275,6 +275,13 @@ class TelegramApplication(Application):
@@ -882,7 +1066,7 @@ index 7b3a161c..9e61753c 100644
          except BaseException:
              claim.failed = True
 diff --git a/tools/transcription_tools.py b/tools/transcription_tools.py
-index 072eed5f..4271d846 100644
+index 072eed5f03..4271d8466b 100644
 --- a/tools/transcription_tools.py
 +++ b/tools/transcription_tools.py
 @@ -132,7 +132,12 @@ def _has_openai_audio_backend() -> bool:

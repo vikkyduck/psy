@@ -2,9 +2,10 @@
 """Owner-only alerts independent of Hermes, the model and the Telegram update loop.
 
 One run collects every problem, then sends at most one digest message to the owner. A problem is
-reported once and reminded with growing gaps; it counts as resolved only after CLEAR_AFTER clean
-runs in a row, and events (a restart that already happened) are never "resolved". The owner gets
-at most HOURLY_CAP messages per hour; anything held back goes into the next digest. Delivery
+reported once and reminded with growing gaps. Most problems need CLEAR_AFTER clean runs to resolve.
+A service recovery is confirmed from its live state (and Telegram readiness for the gateway). Events
+are never "resolved". HOURLY_CAP limits new alerts and reminders, while recovery of a previously
+reported problem bypasses that cap. All delivery still respects Telegram retry_after. Delivery
 failures are logged with the HTTP status only. After FAILING_AFTER failed deliveries in a row the
 run exits non-zero, so the broken alert path shows in `systemctl --failed` and in psy-healthcheck.
 """
@@ -57,7 +58,14 @@ TIMERS = {
 BACKUP_SUCCESS = Path("/var/lib/psy-backup/last-success")
 BACKUP_MAX_AGE = 26 * 3600
 CLEAR_AFTER = 3            # clean runs in a row before a problem counts as resolved
-HOURLY_CAP = 4             # messages to the owner per rolling hour
+HOURLY_CAP = 4             # new-alert/reminder digests per rolling hour
+SERVICE_TRANSITION_GRACE = 120  # startup/stop grace only, never a limit on lectures or model work
+TRANSITION_STATES = ("activating", "deactivating", "reloading")
+# A running group job is stalled after this long without a progress mark. A deep model call
+# (stage model_deep) may legitimately think silently for up to 15 minutes before the gateway
+# itself gives up (psy_group_client.DEEP_IDLE_SECONDS), so it gets that plus a minute.
+STALL_SECONDS = 420
+DEEP_STALL_SECONDS = 960
 REMIND = (3600, 3 * 3600, 6 * 3600)   # gaps between reminders of one unresolved problem
 FAILING_AFTER = 3          # failed deliveries in a row before the run itself fails
 EVENTS = ("restart:", "gateway_health")   # one-off events: reported once, never "resolved"
@@ -66,7 +74,7 @@ UNIT_NAME = re.compile(r"[A-Za-z0-9@_.:\\-]{1,200}")
 
 
 def properties(unit, *names):
-    names = names or ("ActiveState", "Result", "NRestarts")
+    names = names or ("ActiveState", "Result", "NRestarts", "MainPID", "StateChangeTimestampMonotonic", "Job")
     command = ["systemctl", "show", unit]
     for name in names:
         command += ["-p", name]
@@ -138,7 +146,8 @@ def group_status(path, now):
         if "job_progress" not in tables:
             return []
         stalled = db.execute("""SELECT count(*) FROM requests r JOIN job_progress p ON p.request_id=r.id
-                              WHERE r.state='running' AND p.updated<?""", (now - 420,)).fetchone()[0]
+                              WHERE r.state='running' AND p.updated < CASE WHEN p.stage='model_deep'
+                              THEN ? ELSE ? END""", (now - DEEP_STALL_SECONDS, now - STALL_SECONDS)).fetchone()[0]
         # Queued jobs may intentionally wait for OAuth or Telegram flood control.
         uncertain = db.execute("SELECT count(*) FROM requests WHERE state='uncertain'").fetchone()[0]
         # Kept with their text and checkpoints after an unexpected defect, until the operator acts.
@@ -151,7 +160,8 @@ def group_status(path, now):
         db.close()
     messages = []
     if stalled:
-        messages.append(f"Задания группы без признаков прогресса более 7 минут: {stalled}.")
+        messages.append("Задания группы без признаков прогресса более 7 минут "
+                        f"(при глубоком размышлении модели более 16 минут): {stalled}.")
     if uncertain:
         messages.append(f"Задания с неподтвержденным результатом отправки: {uncertain}. Нужна проверка доставки.")
     if failed:
@@ -168,9 +178,77 @@ def memory_status(state, available, pressure):
     return state["memory_fails"] >= 3
 
 
+def gateway_ready(main_pid):
+    """Read transport readiness only. Never poll Telegram or import the gateway into this monitor."""
+    try:
+        expected_pid = int(main_pid or 0)
+        if expected_pid <= 0:
+            return False
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect(str(HOME / "gateway.sock"))
+            client.sendall(b'{"verb":"status"}\n')
+            data = b""
+            while b"\n" not in data and len(data) < 524288:
+                chunk = client.recv(min(8192, 524288 - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+        answer = json.loads(data)
+        result = answer.get("result", {})
+        return (answer.get("ok") is True and result.get("answering_pid") == expected_pid
+                and result.get("platforms", {}).get("telegram", {}).get("state") == "connected")
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def service_problem(unit, info, previous, now):
+    """Observe a core service without treating a bounded restart transition as a failed start.
+
+    Persist a fallback clock for systems without systemd's state-change timestamp. Use the kernel
+    monotonic clock when available, so a monitor restart cannot grant a stuck unit a fresh grace.
+    A fault already reported to the owner stays open until recovery is positively confirmed.
+    """
+    key = "service:" + unit
+    prior = previous.get("alerts", {}).get(key, {})
+    transitions = previous.setdefault("service_transitions", {})
+    state = info.get("ActiveState", "unknown")
+    # A systemd restart can briefly report inactive between stopping and starting, while the
+    # restart job is still queued. That is distinct from an inactive unit with no pending job.
+    pending_job = str(info.get("Job", "0") or "0").split()[0]
+    if state == "inactive" and pending_job.isdecimal() and int(pending_job) > 0:
+        state = "restart-pending"
+    if state in TRANSITION_STATES or state == "restart-pending":
+        transition = transitions.get(unit)
+        if not isinstance(transition, dict) or transition.get("state") != state:
+            transition = transitions[unit] = {"state": state, "since": now}
+        age = max(0.0, now - transition.get("since", now))
+        try:
+            changed = int(info.get("StateChangeTimestampMonotonic", 0) or 0) / 1000000
+            if 0 < changed <= time.monotonic():
+                age = time.monotonic() - changed
+        except (ValueError, TypeError):
+            pass
+        within_grace = age < SERVICE_TRANSITION_GRACE
+        if within_grace:
+            # Do not resolve an existing incident merely because an operator started a restart.
+            return (prior.get("summary") if prior.get("notified", prior.get("sent", False)) else None), True
+        phase = {"activating": "запуска", "deactivating": "остановки", "reloading": "перезагрузки настроек"}.get(state, "перезапуска")
+        return f"Служба {unit} остается в состоянии {phase} более 2 минут. Требуется проверить завершение перезапуска.", False
+    transitions.pop(unit, None)
+    if state != "active":
+        return f"Служба {unit} остановлена или не смогла запуститься.", False
+    if prior:
+        if unit == "hermes-gateway" and not gateway_ready(info.get("MainPID")):
+            return "Служба hermes-gateway запущена, но ее подключение к Telegram пока не подтверждено.", False
+        previous.setdefault("confirmed_service_recoveries", []).append(key)
+    return None, False
+
+
 def collect(previous, now):
     problems = {}
     counters = {}
+    previous["confirmed_service_recoveries"] = []
     for unit in CORE + CHECKS:
         try:
             info = properties(unit)
@@ -179,10 +257,17 @@ def collect(previous, now):
             continue
         counter = int(info.get("NRestarts", 0) or 0)
         counters[unit] = counter
-        if unit in CORE and info.get("ActiveState") != "active":
-            problems["service:" + unit] = f"Служба {unit} остановлена или не смогла запуститься."
+        transition_grace = False
+        if unit in CORE:
+            summary, transition_grace = service_problem(unit, info, previous, now)
+            if summary:
+                problems["service:" + unit] = summary
         if info.get("Result", "success") not in ("", "success"):
-            problems["failure:" + unit] = f"Сбой службы {unit}. Подробности сохранены в закрытом журнале сервера."
+            failure_key = "failure:" + unit
+            prior_failure = previous.get("alerts", {}).get(failure_key, {})
+            if not transition_grace or prior_failure.get("notified"):
+                problems[failure_key] = (prior_failure.get("summary") or
+                    f"Сбой службы {unit}. Подробности сохранены в закрытом журнале сервера.")
         old = previous.get("counters", {}).get(unit)
         if old is not None and counter > old:
             problems["restart:" + unit] = f"Служба {unit} автоматически перезапускалась."
@@ -288,7 +373,7 @@ def is_event(key):
 def digest(new, ongoing, resolved, note):
     parts = ["ПСИ. Личное уведомление владельцу."]
     for title, items in (("Требуется внимание:", new), ("Все еще не устранено:", ongoing),
-                         (f"Больше не наблюдается ({CLEAR_AFTER} проверки подряд без сбоя):", resolved)):
+                         ("Восстановлено:", resolved)):
         if items:
             parts.append(title + "\n" + "\n".join("• " + item for item in items))
     if note:
@@ -297,6 +382,14 @@ def digest(new, ongoing, resolved, note):
     if len(text) > MAX_TEXT:
         text = text[:MAX_TEXT].rsplit("\n", 1)[0] + "\n…остальное в закрытом журнале сервера."
     return text
+
+
+def recovery_summary(key, previous_summary):
+    if key == "service:hermes-gateway":
+        return "ПСИ снова подключен к Telegram."
+    if key.startswith("service:"):
+        return "Служба " + key.split(":", 1)[1] + " снова работает."
+    return previous_summary
 
 
 def update_alerts(state, problems, now, sender=send_owner):
@@ -322,7 +415,8 @@ def update_alerts(state, problems, now, sender=send_owner):
                 del alerts[key]         # reported once; an event has nothing to resolve
         elif not record["notified"]:
             del alerts[key]             # gone before anyone was told
-        elif record["clean"] >= CLEAR_AFTER:
+        elif (key in state.get("confirmed_service_recoveries", ())
+              or record["clean"] >= CLEAR_AFTER):
             record["resolved"] = True
 
     new = [k for k, r in alerts.items() if not r["notified"]]
@@ -336,17 +430,22 @@ def update_alerts(state, problems, now, sender=send_owner):
     if now < delivery.get("retry_at", 0):
         return
     if len(sent) >= HOURLY_CAP:
-        if not delivery.get("capped_at"):
-            print(f"alerts_held hourly_cap={HOURLY_CAP} pending={len(new) + len(ongoing) + len(resolved)}")
-            delivery["capped_at"] = now
-        return
+        if resolved:
+            # Closing an incident is not a reminder. Do not leave the owner believing it is ongoing.
+            # Do not piggyback new alerts past their cap, or consume another cap slot for recovery.
+            new, ongoing = [], []
+        else:
+            if not delivery.get("capped_at"):
+                print(f"alerts_held hourly_cap={HOURLY_CAP} pending={len(new) + len(ongoing)}")
+                delivery["capped_at"] = now
+            return
     note = None
     if delivery.get("failures"):
         note = (f"Предыдущие уведомления не доставлены: попыток {delivery['failures']}, "
                 f"причина {delivery.get('reason', 'unknown')}.")
     try:
         sender(digest([alerts[k]["summary"] for k in new], [alerts[k]["summary"] for k in ongoing],
-                      [alerts[k]["summary"] for k in resolved], note))
+                      [recovery_summary(k, alerts[k]["summary"]) for k in resolved], note))
     except Exception as error:
         later = error if isinstance(error, Later) else Later(60, "error=" + type(error).__name__)
         delivery.update(failures=delivery.get("failures", 0) + 1, reason=later.reason,
@@ -354,7 +453,8 @@ def update_alerts(state, problems, now, sender=send_owner):
         print(f"alerts_delivery_failed {later.reason} failures={delivery['failures']} retry_in={int(later.seconds)}s")
         return
     state["delivery"] = {"failures": 0}
-    sent.append(now)
+    if new or ongoing:
+        sent.append(now)
     for key in ongoing:
         alerts[key]["reminders"] += 1
     for key in new + ongoing:
