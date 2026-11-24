@@ -15,8 +15,8 @@ ORIGIN = "https://github.com/NousResearch/hermes-agent"
 HERE = Path(__file__).resolve().parent
 TELEGRAM = "plugins/platforms/telegram/"
 TRACKED = (
-    "agent/auxiliary_client.py", "agent/credential_pool.py", "hermes_cli/auth.py",
-    "hermes_cli/auth_codex.py", TELEGRAM + "adapter.py", TELEGRAM + "update_admission.py",
+    "agent/auxiliary_client.py", "agent/credential_pool.py", "gateway/run.py", "hermes_cli/auth.py",
+    "hermes_cli/auth_codex.py", "hermes_cli/gateway.py", TELEGRAM + "adapter.py", TELEGRAM + "update_admission.py",
     "tools/transcription_tools.py",
 )
 MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_client", "psy_group_pipeline",
@@ -25,6 +25,7 @@ MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_client", "psy_group_
            "psy_upload_handoff", "psy_group_admin", "psy_group_prompts")
 ADDED = tuple(TELEGRAM + name + ".py" for name in MODULES) + (
     "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_platform_bridge.py",
+    "hermes_cli/psy_gateway_exit.py",
 )
 HANDOFF = TELEGRAM + "psy_upload_handoff.py"
 # Root-owned files outside the checkout that the gateway loads by explicit path (installed by

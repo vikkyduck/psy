@@ -40,7 +40,7 @@ class OwnerAlerts(unittest.TestCase):
         self.assertEqual(sender.call_count, 2)
         alerts.update_alerts(state, {}, 500, sender)
         self.assertEqual(sender.call_count, 3)
-        self.assertIn('Больше не наблюдается', sender.call_args[0][0])
+        self.assertIn('Восстановлено:', sender.call_args[0][0])
         self.assertIn('safe summary', sender.call_args[0][0])
         self.assertEqual(state['alerts'], {})
 

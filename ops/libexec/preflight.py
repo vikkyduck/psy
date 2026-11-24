@@ -9,7 +9,8 @@ CHECKOUT = Path("/home/hermes/.hermes/hermes-agent")
 PLATFORM = "plugins/platforms/telegram/"
 # The release inventory of gateway/apply.py (TRACKED + ADDED). A gateway test keeps them equal.
 EXPECTED = {
-    "agent/auxiliary_client.py", "agent/credential_pool.py", "hermes_cli/auth.py", "hermes_cli/auth_codex.py",
+    "agent/auxiliary_client.py", "agent/credential_pool.py", "gateway/run.py", "hermes_cli/auth.py", "hermes_cli/auth_codex.py",
+    "hermes_cli/gateway.py", "hermes_cli/psy_gateway_exit.py",
     "hermes_cli/psy_codex_incident.py", "hermes_cli/psy_codex_policy.py", "hermes_cli/psy_platform_bridge.py",
     "tools/transcription_tools.py",
     *(PLATFORM + name for name in (
