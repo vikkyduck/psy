@@ -9,7 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 
@@ -31,6 +31,8 @@ class Result:
     searches: int
     complete: bool = True
     source_urls: tuple = ()
+    # Set on a fragment kept from a cut-off stream: seconds it ran without visible progress.
+    silent: float = field(default=None, compare=False, repr=False)
 
     @property
     def searched(self):
@@ -48,13 +50,15 @@ QUICK_EFFORT = "high"
 DEEP_EFFORT = "max"
 # At max the model can stay silent - no bytes, no visible text - for many minutes.
 DEEP_IDLE_SECONDS = 900
-# A deep stage that showed no visible text or reasoning for this long and was then cut off - by
-# DEEP_IDLE_SECONDS above, or by the provider, which on 2026-11-24 closed a silent max-effort stream
-# exactly 15 minutes after the request - would fail the same way on every retry, and retries have
-# no limit. Its next attempt therefore thinks at FALLBACK_EFFORT. The mark is a stage checkpoint,
-# so it survives restarts and is dropped with the other stages once the answer is saved.
+# A deep call that showed no visible text or reasoning for this long and was then cut off - by
+# DEEP_IDLE_SECONDS above, or by the provider, which on 2026-11-24 closed every silent max-effort
+# source check exactly 15 minutes after the request - fails the same way on every retry (retries
+# have no limit), and a source check that returns a fragment is simply asked again. After such a
+# cut every later deep call of the job thinks at FALLBACK_EFFORT. The mark is a job checkpoint
+# (EFFORT_MARK), so it survives restarts and is dropped with the model stages once the answer is saved.
 SILENT_CUT_SECONDS = 600
 FALLBACK_EFFORT = QUICK_EFFORT
+EFFORT_MARK = "model:effort:v1"
 # job_progress stage of a deep model call: psy-alerts allows it DEEP_IDLE_SECONDS of silence.
 DEEP_PROGRESS_STAGE = "model_deep"
 
@@ -371,10 +375,10 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             if typ in ("error", "response.failed", "response.incomplete"):
                 raise _failure(None, body.get("error") or event.get("error") or event, "stream")
         partial = _written(written, commentary)
+        silent = None if visible else time.monotonic() - started
         if partial and not refused and (not research or searches):
-            return Result(partial, images, searches, False, tuple(sorted(source_urls)))
-        if not visible:
-            interruption.silent = time.monotonic() - started
+            return Result(partial, images, searches, False, tuple(sorted(source_urls)), silent=silent)
+        interruption.silent = silent
         raise interruption
 
 
@@ -489,13 +493,23 @@ def _job_calls(client, model, checkpoints):
 
         options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
         effort = DEEP_EFFORT if call.deep else QUICK_EFFORT
-        cut_key, cuts = None, 0
-        if call.deep and checkpoints is not None and key is not None:
-            cut_key = key + ":effort"
-            saved_cuts = checkpoints.get(cut_key)
+        marking, cuts = call.deep and checkpoints is not None, 0
+        if marking:
+            saved_cuts = checkpoints.get(EFFORT_MARK)
             cuts = saved_cuts.get("silent_cuts", 0) if isinstance(saved_cuts, dict) else 0
             if cuts:
                 effort = FALLBACK_EFFORT
+
+        def silent_cut(silent):
+            if not (marking and effort != FALLBACK_EFFORT and silent is not None and silent >= SILENT_CUT_SECONDS):
+                return
+            try:
+                checkpoints.put(EFFORT_MARK, {"silent_cuts": cuts + 1})
+                log.warning("group model call silent for %.0fs at effort=%s; the rest of the job uses effort=%s",
+                            silent, effort, FALLBACK_EFFORT)
+            except Exception as error:
+                log.warning("group model silent cut not recorded: %s", type(error).__name__)
+
         if checkpoints is not None:
             report = getattr(checkpoints, "progress", None)
             if report is not None:
@@ -512,14 +526,8 @@ def _job_calls(client, model, checkpoints):
             if silent is None and (exc.kind, exc.stage) == ("timeout", "transport"):
                 # No response at all: the whole attempt was silent.
                 silent = time.monotonic() - started
-            if (cut_key is not None and exc.retryable and effort != FALLBACK_EFFORT
-                    and silent is not None and silent >= SILENT_CUT_SECONDS):
-                try:
-                    checkpoints.put(cut_key, {"silent_cuts": cuts + 1})
-                    log.warning("group model stage silent for %.0fs at effort=%s; next attempt uses effort=%s",
-                                silent, effort, FALLBACK_EFFORT)
-                except Exception as error:
-                    log.warning("group model silent cut not recorded: %s", type(error).__name__)
+            if exc.retryable:
+                silent_cut(silent)
             if checkpoints is not None and exc.retryable:
                 # Parallel siblings must not keep calling a model that just refused.
                 deferred = _ResumeModelJob(exc)
@@ -530,6 +538,9 @@ def _job_calls(client, model, checkpoints):
             if saved_prefix:
                 checkpoints.put(key, None)
             raise
+        if not result.complete:
+            # A fragment kept from a cut-off stream: a source check asks again with a new prompt.
+            silent_cut(result.silent)
         if checkpoints is not None and (result.complete or (prose and result.text and not _dispatch_marker(result.text, complete=False))):
             save(result)
         return result
