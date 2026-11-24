@@ -170,7 +170,13 @@ class PlatformBridge(unittest.TestCase):
         try:
             if data is None and body is not None:
                 data = json.dumps(body).encode()
-            conn.request(method, path, body=data)
+            try:
+                conn.request(method, path, body=data)
+            except BrokenPipeError:
+                # An early HTTP refusal can close the write side before a body
+                # is sent. Still require an actual, complete HTTP response below.
+                # A missing or malformed response must remain a test failure.
+                pass
             response = conn.getresponse()
             return response.status, response.getheader("Content-Type"), response.read()
         finally:
@@ -406,6 +412,44 @@ class PlatformBridge(unittest.TestCase):
                 self.assertEqual(self.json_call(method, path, {}), (status, {"error": {"kind": kind}}))
         self.assertTrue(self.logged("request method=GET path=- status=404"))
         self.assertFalse([line for line in self.capture.lines if "secret" in line or "deep" in line])
+
+    def test_busy_reply_remains_readable_when_the_server_closes_before_the_body(self):
+        payload = json.dumps(MINIMAL).encode()
+        send = UnixConnection.send
+        shutdown_request = self.server.shutdown_request
+        closed = threading.Event()
+        write_failures = []
+
+        def close_then_signal(request):
+            shutdown_request(request)
+            closed.set()
+
+        def send_body_after_close(conn, data):
+            if data == payload:
+                # Headers already reached the saturated bridge. Wait for its
+                # actual early 503 and socket close before the second send.
+                self.assertTrue(closed.wait(5), "bridge did not finish the early refusal")
+                try:
+                    return send(conn, data)
+                except BrokenPipeError:
+                    write_failures.append(True)
+                    raise
+            return send(conn, data)
+
+        for _ in range(bridge.CONCURRENCY):
+            self.server.slots.acquire()
+        try:
+            with patch.object(self.server, "shutdown_request", close_then_signal), \
+                 patch.object(UnixConnection, "send", send_body_after_close):
+                self.assertEqual(self.json_call("POST", "/responses", MINIMAL),
+                                 (503, {"error": {"kind": "busy"}}))
+        finally:
+            for _ in range(bridge.CONCURRENCY):
+                self.server.slots.release()
+        self.assertEqual(write_failures, [True])
+        self.credentials.assert_not_called()
+        self.assertEqual(self.codex.seen, [])
+        self.assertEqual(self.telegram.seen, [])
 
     def test_concurrency_and_size_limits(self):
         for _ in range(bridge.CONCURRENCY):
