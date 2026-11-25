@@ -6,8 +6,9 @@ hermes. --checkout selects the runtime and its existing shared OAuth controller.
 --module-dir optionally selects candidate group modules from a separate checkout.
 No Telegram transport is created. Queue/delivery acceptance is a separate test.
 
-The source reader retains its public-IP checks and production parser. Only
-explicit --source-host domains can be fetched locally. --allow-pdf permits only
+The source reader retains its public-IP checks and production parser. By default
+only explicit --source-host domains can be fetched. --all-public-sources lets
+only the source reader authorize additional public hosts. --allow-pdf permits only
 the exact production PDF decoder command with bounded input, private output and
 the decoder's existing seccomp/Landlock sandbox. No general subprocess is allowed.
 
@@ -109,9 +110,11 @@ def source_host(value):
 
 
 class QualityNetworkGuard(group_example.NetworkGuard):
-    """No Telegram or loopback receiver. Explicit public source domains only."""
-    def __init__(self, hosts):
+    """No Telegram or loopback. Additional hosts require the source-reader path."""
+    def __init__(self, hosts, *, all_public_sources=False):
         self.source_hosts = frozenset(source_host(host) for host in hosts)
+        self.all_public_sources = all_public_sources
+        self.dynamic_source_hosts = set()
         super().__init__(-1, allow_model=True)
         self.HOSTS = set(super().HOSTS) | self.source_hosts
         original_dns = self.real_getaddrinfo
@@ -128,6 +131,16 @@ class QualityNetworkGuard(group_example.NetworkGuard):
 
         self.real_getaddrinfo = public_dns
 
+    def authorize_source(self, value):
+        """Called only by the patched production PublicConnection constructor."""
+        host = source_host(value)
+        if host not in self.source_hosts:
+            if not self.all_public_sources:
+                raise ValueError("source hostname outside evaluation allowlist")
+            self.dynamic_source_hosts.add(host)
+            self.HOSTS.add(host)
+        return host
+
     def allowed_url(self, value):
         parsed = urlsplit(str(value))
         if (parsed.scheme != "https" or parsed.username is not None or parsed.password is not None
@@ -137,7 +150,7 @@ class QualityNetworkGuard(group_example.NetworkGuard):
         return super().allowed_url(value)
 
 
-def restrict_source_reader(module, hosts, stack, *, allow_pdf=False):
+def restrict_source_reader(module, hosts, stack, *, allow_pdf=False, authorize_source=None):
     """Keep production retrieval/SSRF/parser checks and narrow allowed origins."""
     allowed = frozenset(hosts)
     excluded = {"host": 0, "pdf": 0}
@@ -146,10 +159,15 @@ def restrict_source_reader(module, hosts, stack, *, allow_pdf=False):
 
     class DeclaredConnection(original_connection):
         def __init__(self, host, *args, **kwargs):
-            if host.lower().rstrip(".") not in allowed:
+            try:
+                if authorize_source is not None:
+                    host = authorize_source(host)
+                elif host.lower().rstrip(".") not in allowed:
+                    raise ValueError("source hostname outside evaluation allowlist")
+            except ValueError:
                 excluded["host"] += 1
                 # Expected source coverage limit, not an actual network request.
-                raise ValueError("source hostname outside evaluation allowlist")
+                raise
             super().__init__(host, *args, **kwargs)
 
     def html_retrieve(url):
@@ -220,14 +238,16 @@ def module_hashes(directory):
             for path in sorted(directory.glob("psy_*.py")) if not path.is_symlink()}
 
 
-def recovery_manifest(case, variant, module_dir, *, model=None, historical_attempts=None, resumed_from=None):
+def recovery_manifest(case, variant, module_dir, *, model=None, historical_attempts=None, resumed_from=None,
+                      source_policy=None):
     """Public helper for packaging an operator's atomic synthetic SQLite backup."""
     encoded = json.dumps(case_turns(CASES[case]), ensure_ascii=False, sort_keys=True,
                          separators=(",", ":")).encode("utf-8")
     return {"format": 1, "case": case, "variant": variant,
             "input_sha256": hashlib.sha256(encoded).hexdigest(),
             "source_sha256": module_hashes(Path(module_dir)), "model_requested": model,
-            "historical_attempts": historical_attempts or [], "resumed_from": resumed_from}
+            "historical_attempts": historical_attempts or [], "resumed_from": resumed_from,
+            "source_policy": source_policy}
 
 
 def read_private_file(path, *, limit):
@@ -335,7 +355,8 @@ def export_recovery(store, fixture, output, label, args, model, history, provena
     validate_recovery_database(temporary)
     write_private_bytes(destination / "group.sqlite3", temporary.read_bytes())
     manifest = recovery_manifest(args.case, args.variant, args.module_dir, model=model,
-                                 historical_attempts=history, resumed_from=provenance)
+                                 historical_attempts=history, resumed_from=provenance,
+                                 source_policy=getattr(args, "source_policy", None))
     write_private(destination / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     temporary.unlink()
     return str(destination)
@@ -436,7 +457,9 @@ def evaluate(args, fixture, guard):
         original_database = store.database
         stack.enter_context(patch.object(store, "ROOT", fixture))
         stack.enter_context(patch.object(store, "database", lambda *_args, **_kw: original_database(fixture)))
-        exclusions = restrict_source_reader(evidence, guard.source_hosts, stack, allow_pdf=args.allow_pdf)
+        exclusions = restrict_source_reader(evidence, guard.source_hosts, stack, allow_pdf=args.allow_pdf,
+            authorize_source=guard.authorize_source if args.all_public_sources else None)
+        args.source_exclusions = exclusions
         snapshot = lambda: export_recovery(store, fixture, args.output_root, args.label, args,
                                            model["default"], args.retry_history, args.resumed_from)
         result = compose_with_retries(codex, store, fixture, checkpoints, case, model["default"],
@@ -454,9 +477,13 @@ def evaluate(args, fixture, guard):
                 "provider": model["provider"], "model_requested": model["default"],
                 "composition_only": True, "delivery_tested": False, "real_telegram_requests": 0,
                 "synthetic_inputs_only": True, "temporary_database_verified": True,
-                "source_reader_mode": ("declared public hosts, production HTML and sandboxed PDF parser"
-                                       if args.allow_pdf else "declared public hosts, production HTML parser, PDF excluded"),
+                "source_reader_mode": (("all public sources through production reader" if args.all_public_sources
+                                        else "declared public hosts") +
+                                       (", production HTML and sandboxed PDF parser" if args.allow_pdf
+                                        else ", production HTML parser, PDF excluded")),
+                "all_public_sources": args.all_public_sources,
                 "source_hosts": sorted(guard.source_hosts), "source_exclusions": exclusions,
+                "dynamically_authorized_source_hosts": sorted(guard.dynamic_source_hosts),
                 "codex_http_requests": guard.codex_http, "network_guard_denials": len(guard.denied),
                 "legacy_pipeline_complete": bool(result.complete),
                 "generation_complete": generation_complete(result),
@@ -478,6 +505,8 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--source-host", action="append", default=[])
     parser.add_argument("--allow-pdf", action="store_true", help="use the exact production sandboxed PDF decoder")
+    parser.add_argument("--all-public-sources", action="store_true",
+                        help="let only the production source reader authorize additional public hosts")
     parser.add_argument("--max-attempts", type=int, choices=(1, 2, 3), default=3)
     parser.add_argument("--resume-state", type=Path, help="private synthetic snapshot below output-root/recovery")
     args = parser.parse_args()
@@ -495,6 +524,10 @@ def main():
     label = "answer-" + secrets.token_hex(6)
     args.output_root, args.label = output, label
     args.retry_history, args.resumed_from = [], None
+    args.source_policy = {"all_public_sources": args.all_public_sources, "allow_pdf": args.allow_pdf,
+                          "declared_hosts": args.source_host}
+    args.source_exclusions = None
+    guard = None
     for key in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "NOUS_API_KEY"):
         os.environ.pop(key, None)
     os.environ.update(PSY_OWNER_ID=str(group_example.OWNER), PSY_GROUP_ID=str(group_example.GROUP),
@@ -522,7 +555,7 @@ def main():
             # private fixture, even if the launcher exported another TMPDIR.
             tempfile.tempdir = str(fixture)
             os.environ.update(TMPDIR=str(fixture), TMP=str(fixture), TEMP=str(fixture))
-            with QualityNetworkGuard(args.source_host) as guard:
+            with QualityNetworkGuard(args.source_host, all_public_sources=args.all_public_sources) as guard:
                 bootstrap = initialize_transport_without_startup(dependencies)
                 text, metadata = evaluate(args, fixture, guard)
             metadata["bootstrap"] = bootstrap
@@ -530,7 +563,7 @@ def main():
             metadata["dependency_environment"] = str(environment.resolve())
         case = CASES[args.case]
         review = ("Задание\n" + case["question"] + "\n\n" +
-                  ("Учебный материал\n" + case["material"] + "\n\n" if case.get("material") else "") +
+                  ("Учебный материал: Synthetic teaching case.txt\n" + case["material"] + "\n\n" if case.get("material") else "") +
                   "Ответ\n" + text + "\n")
         write_private(output / "review" / (label + ".txt"), review)
         metadata.update(label=label, status="generated", started_at=started,
@@ -543,7 +576,9 @@ def main():
         metadata = {"status": "failed", "label": label, "case": args.case, "variant": args.variant,
                     "error_class": type(error).__name__, "started_at": started,
                     "elapsed_seconds": round(time.time() - started, 2),
-                    "retry_history": args.retry_history, "resumed_from": args.resumed_from}
+                    "retry_history": args.retry_history, "resumed_from": args.resumed_from,
+                    "source_policy": args.source_policy, "source_exclusions": args.source_exclusions,
+                    "dynamically_authorized_source_hosts": sorted(guard.dynamic_source_hosts) if guard else []}
         frames = []
         cursor = error.__traceback__
         while cursor:

@@ -98,6 +98,81 @@ class SourceRestrictionTests(unittest.TestCase):
             self.assertEqual(module.retrieve("https://example.org/work"), body)
             self.assertEqual(exclusions, {"host": 0, "pdf": 0})
 
+    def test_all_public_mode_authorizes_only_hosts_requested_by_the_reader(self):
+        guard = quality.QualityNetworkGuard([], all_public_sources=True)
+        module = self.fixture(("text/html", "utf-8", b"synthetic"))
+        self.assertNotIn("primary.example.org", guard.HOSTS)
+        with self.assertRaises(group_example.IsolationViolation):
+            guard.allowed_url("https://primary.example.org/work")
+        with ExitStack() as stack:
+            excluded = quality.restrict_source_reader(module, guard.source_hosts, stack,
+                authorize_source=guard.authorize_source)
+            connection = module.PublicConnection("primary.example.org")
+            self.assertEqual(connection.host, "primary.example.org")
+            guard.allowed_url("https://primary.example.org/work")
+            guard.allowed_url("https://chatgpt.com/backend-api/codex/responses")
+            self.assertEqual(guard.dynamic_source_hosts, {"primary.example.org"})
+            self.assertEqual(excluded, {"host": 0, "pdf": 0})
+            for url in ("https://unvisited.example.org/work", "https://sub.primary.example.org/work"):
+                with self.assertRaises(group_example.IsolationViolation):
+                    guard.allowed_url(url)
+
+    def test_all_public_reader_cannot_authorize_telegram_local_names_or_ip_literals(self):
+        guard = quality.QualityNetworkGuard([], all_public_sources=True)
+        module = self.fixture(("text/html", "utf-8", b"synthetic"))
+        with ExitStack() as stack:
+            excluded = quality.restrict_source_reader(module, guard.source_hosts, stack,
+                authorize_source=guard.authorize_source)
+            hosts = ("api.telegram.org", "t.me", "localhost", "archive.internal", "archive.local",
+                     "127.0.0.1", "93.184.216.34", "::1", "private@public.example.org")
+            for host in hosts:
+                with self.subTest(host=host), self.assertRaises(ValueError):
+                    module.PublicConnection(host)
+            self.assertEqual(excluded["host"], len(hosts))
+            self.assertEqual(guard.dynamic_source_hosts, set())
+            self.assertEqual(guard.HOSTS, {"chatgpt.com", "auth.openai.com"})
+
+    def test_dynamic_source_still_rejects_private_or_mixed_dns_answers(self):
+        for addresses in (("127.0.0.1",), ("93.184.216.34", "10.0.0.1")):
+            rows = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (host, 443)) for host in addresses]
+            with self.subTest(addresses=addresses), patch.object(socket, "getaddrinfo", return_value=rows):
+                guard = quality.QualityNetworkGuard([], all_public_sources=True)
+                module = self.fixture(("text/html", "utf-8", b"synthetic"))
+                with ExitStack() as stack:
+                    quality.restrict_source_reader(module, guard.source_hosts, stack,
+                        authorize_source=guard.authorize_source)
+                    module.PublicConnection("primary.example.org")
+                    with self.assertRaises(group_example.IsolationViolation):
+                        guard.real_getaddrinfo("primary.example.org", 443)
+                self.assertEqual(guard.denied, ["non_public_peer"])
+
+    def test_fixed_default_does_not_expand_hosts_even_with_authorizer_wired(self):
+        guard = quality.QualityNetworkGuard(["primary.example.org"])
+        module = self.fixture(("text/html", "utf-8", b"synthetic"))
+        with ExitStack() as stack:
+            quality.restrict_source_reader(module, guard.source_hosts, stack,
+                authorize_source=guard.authorize_source)
+            module.PublicConnection("primary.example.org")
+            with self.assertRaises(ValueError):
+                module.PublicConnection("different.example.org")
+        self.assertEqual(guard.dynamic_source_hosts, set())
+        self.assertNotIn("different.example.org", guard.HOSTS)
+
+    def test_real_reader_preserves_https_credential_and_port_checks(self):
+        path = Path(__file__).resolve().parents[2] / "gateway/plugins/platforms/telegram/psy_source_evidence.py"
+        spec = importlib.util.spec_from_file_location("quality_dynamic_reader", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        guard = quality.QualityNetworkGuard([], all_public_sources=True)
+        with ExitStack() as stack:
+            quality.restrict_source_reader(module, guard.source_hosts, stack,
+                authorize_source=guard.authorize_source)
+            for url in ("http://primary.example.org/work", "https://secret@primary.example.org/work",
+                        "https://primary.example.org:8443/work"):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    module.retrieve(url)
+        self.assertEqual(guard.dynamic_source_hosts, set())
+
 
 class BootstrapIsolationTests(unittest.TestCase):
     def test_real_transport_import_suppresses_only_startup_maintenance(self):
