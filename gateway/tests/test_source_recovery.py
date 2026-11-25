@@ -166,11 +166,52 @@ class SourceRecovery(unittest.TestCase):
 
     def test_current_source_notices_are_fixed_whole_sentences_and_bounded(self):
         notices = sources.source_requirements(["raw gap https://untrusted.example"],
-            {"required": [], "missing": []}, ["reported_gaps", "source_unreadable", "quote_not_found", "invalid_card"])
-        self.assertLessEqual(len(notices), 3)
-        self.assertTrue(all(notice in sources.SOURCE_REASONS.values() and notice.endswith(".") for notice in notices))
+            {"required": [], "missing": []})
+        self.assertEqual(notices, [sources.SOURCE_REASONS["reported_gaps"]])
+        self.assertTrue(all(notice.endswith(".") for notice in notices))
         self.assertNotIn("https://", " ".join(notices))
-        self.assertEqual(sources.source_requirements([], {}, ["source_unreadable"]), [])
+        self.assertEqual(sources.source_requirements([], {}), [])
+
+    def test_partial_footer_does_not_emit_objectless_current_diagnostics(self):
+        reasons = ["source_unreadable", "identity_unverified", "reported_gaps"]
+        gaps = ["A synthetic archive lookup log remains incomplete."]
+        result = sources._source_result("Подтвержденная часть ответа.", 1, usable=True, gaps=gaps,
+            coverage={"required": [], "covered": [], "missing": []}, reasons=reasons,
+            attempts=2, current_reasons=reasons)
+        quality.mark_partial_text(result)
+        self.assertEqual(result.task_status, "partial")
+        self.assertEqual(result.text, "Подтвержденная часть ответа.\n\n"
+                         "Материал пока частичный. При чтении источников остались содержательные пробелы.")
+        self.assertEqual(result.missing_requirements, [sources.SOURCE_REASONS["reported_gaps"]])
+        self.assertEqual(result.quality_metadata["source_gaps"], gaps)
+        self.assertEqual(result.quality_metadata["source_reason_codes"], sorted(reasons))
+        self.assertEqual(result.quality_metadata["source_current_reason_codes"], sorted(reasons))
+
+    def test_precise_translation_edit_preserves_other_text_and_partial_status(self):
+        before, after = "не в этом завершение анализа", "не в этом цель анализа"
+        opening = "Первый абзац и подтвержденная цитата остаются без изменения.\n\n"
+        closing = "\n\nПоследний абзац сохраняет границу проверки источников."
+        text = opening + 'Русский перевод цитаты: "' + before + '".' + closing
+        result = sources._source_result(text, 2, usable=True, gaps=["Synthetic source gap."],
+            coverage={"required": [], "covered": [], "missing": []},
+            reasons=["reported_gaps"], attempts=2, current_reasons=["reported_gaps"])
+        metadata = dict(result.quality_metadata)
+        missing = list(result.missing_requirements)
+        source = json.dumps({"claims": [{"support": "ce n'est pas là la fin de l'analyse",
+            "context": "Synthetic surrounding text contrasts an apparent conclusion with the intended aim."}]})
+        review = Mock(return_value=client.Result(json.dumps({"edits": [{"before": before, "after": after}]}), [], 0))
+        checked_result = sources._verify_draft(review, result, source)
+        self.assertIs(checked_result, result)
+        self.assertEqual(result.text, text.replace(before, after))
+        self.assertEqual(result.task_status, "partial")
+        self.assertEqual(result.missing_requirements, missing)
+        self.assertEqual(result.quality_metadata, metadata)
+        self.assertIn(source, review.call_args.args[0][0]["content"])
+        self.assertIn(text, review.call_args.args[0][1]["content"])
+        self.assertEqual(review.call_args.args[1], prompts.REVIEW)
+        self.assertIn("русских переводов цитат с support и context", prompts.REVIEW)
+        self.assertIn("авторские противопоставления", prompts.REVIEW)
+        self.assertIn("Не подставляй словарный эквивалент вопреки контексту", prompts.REVIEW)
 
     def test_source_gap_metadata_has_a_total_bound_and_keeps_partial_status(self):
         gaps = [str(i) + " проверяемый фрагмент" * 300 for i in range(40)]

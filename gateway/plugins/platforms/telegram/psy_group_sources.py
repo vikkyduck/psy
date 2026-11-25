@@ -59,12 +59,8 @@ def _gaps(values):
     return clean
 
 
-def source_requirements(gaps, coverage, current_reasons=None):
-    """Render current source limits from fixed diagnoses, never search-log prose.
-
-    Historical source_reason_codes do not prove a current failure. A saved result
-    without current codes receives only a generic gap and known missing authors.
-    """
+def source_requirements(gaps, coverage):
+    """Give a general source limit and known missing authors, never an objectless log."""
     if not gaps:
         return []
     known = {canonical for _, canonical in PUBLIC_AUTHORS}
@@ -72,17 +68,7 @@ def source_requirements(gaps, coverage, current_reasons=None):
     missing = [canonical for _, canonical in PUBLIC_AUTHORS
                if canonical in required and canonical in coverage.get("missing", ())]
     output = ["Не подтверждены первоисточники для авторов: " + ", ".join(missing) + "."] if missing else []
-    current = set(current_reasons or ()) & SOURCE_REASONS.keys()
-    priorities = ("reported_gaps", "source_unreadable", "no_primary_text", "identity_unverified",
-                  "quote_not_found", "locator_unverified", "support_unverified", "invalid_quote",
-                  "invalid_card", "uncited_url", "incomplete_response", "invalid_response", "no_candidates")
-    for reason in priorities:
-        if reason in current:
-            output.append(SOURCE_REASONS[reason])
-        if len(output) == 3:
-            break
-    if not output or not current:
-        output.append(SOURCE_REASONS["reported_gaps"])
+    output.append(SOURCE_REASONS["reported_gaps"])
     return output
 
 
@@ -90,7 +76,7 @@ def _source_result(text, searches, *, usable, gaps, coverage, reasons, attempts,
     gaps = _gaps(gaps)
     result = Result(text, [], searches, usable)
     result.task_status = "partial" if usable and gaps else "complete" if usable else "needs_source"
-    result.missing_requirements = source_requirements(gaps, coverage, current_reasons)
+    result.missing_requirements = source_requirements(gaps, coverage)
     result.quality_metadata = {
         "source_check_attempts": attempts,
         "source_reason_codes": sorted(set(reasons)),
