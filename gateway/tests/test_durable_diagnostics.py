@@ -1,6 +1,7 @@
 """Failure provenance, private snapshots and full history use synthetic data only."""
 import asyncio
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 from pathlib import Path
@@ -83,6 +84,67 @@ class DurableDiagnostics(unittest.TestCase):
         (snapshot / 'code/psy_example.py').write_text('tampered')
         with self.assertRaisesRegex(ValueError, 'verification failed'):
             observation.capture_runtime('fixture', profile=profile, code_dir=code, root=snapshot_root)
+
+    def nested_snapshot(self):
+        checkout = self.root / "checkout"
+        code = checkout / "plugins/platforms/telegram"
+        code.mkdir(parents=True)
+        (code / "psy_fixture.py").write_text("VALUE = 1\n")
+        (checkout / "agent").mkdir()
+        (checkout / "agent/reasoning_effort.py").write_text("MAX = 'max'\n")
+        image = checkout / "plugins/image_gen/provider"
+        image.mkdir(parents=True)
+        (image / "plugin.yaml").write_text("name: synthetic\n")
+        (image / "adapter.py").write_text("VALUE = 2\n")
+        profile = self.root / "profile"
+        profile.mkdir()
+        root = self.root / "snapshots"
+        def capture():
+            return observation.capture_runtime("fixture", profile=profile, code_dir=code, root=root)
+        result = capture()
+        return root, root / result["snapshot_id"], capture, result
+
+    def test_nested_snapshot_permissions_are_private_and_repaired_on_reuse(self):
+        root, snapshot, capture, result = self.nested_snapshot()
+        nested = snapshot / "runtime/plugins/image_gen/provider"
+        self.assertTrue((nested / "adapter.py").is_file())
+        for path in [root, snapshot, *snapshot.rglob("*")]:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+        for path in (root, snapshot, snapshot / "runtime", nested):
+            path.chmod(0o755)
+        (nested / "adapter.py").chmod(0o644)
+        self.assertEqual(capture(), result)
+        for path in [root, snapshot, *snapshot.rglob("*")]:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+
+    def test_reuse_rejects_symlink_without_changing_external_permissions(self):
+        root, snapshot, capture, _ = self.nested_snapshot()
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o755)
+        external = outside / "private.txt"
+        external.write_text("synthetic external file")
+        external.chmod(0o644)
+        (snapshot / "external-link").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "link or special"):
+            capture()
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o644)
+        (snapshot / "external-link").unlink()
+        os.link(external, snapshot / "external-hardlink")
+        with self.assertRaisesRegex(ValueError, "ownership or links"):
+            capture()
+        self.assertEqual(stat.S_IMODE(external.stat().st_mode), 0o644)
+
+    def test_snapshot_root_symlink_is_refused_without_chmod_target(self):
+        profile, code, outside = self.root / "profile", self.root / "code", self.root / "outside"
+        for path in (profile, code, outside):
+            path.mkdir(mode=0o755)
+        root = self.root / "snapshots"
+        root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(OSError):
+            observation.capture_runtime("fixture", profile=profile, code_dir=code, root=root)
+        self.assertEqual(stat.S_IMODE(outside.stat().st_mode), 0o755)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_concurrent_snapshot_creation_is_verified_and_idempotent(self):
         profile, code = self.root / 'profile', self.root / 'code'

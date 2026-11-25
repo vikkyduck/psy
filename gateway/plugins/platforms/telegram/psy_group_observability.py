@@ -45,6 +45,75 @@ def _environment():
         sort_keys=True).encode()
 
 
+def _private_directory(path, *, parent=None, create=False):
+    if create:
+        try:
+            os.mkdir(path, 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.geteuid():
+            raise ValueError("Runtime snapshot directory has a foreign owner")
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_private(folder, name, data):
+    parts = Path(name).parts
+    if not parts or Path(name).is_absolute() or any(part in (".", "..") for part in parts):
+        raise ValueError("Invalid runtime snapshot member")
+    parent = _private_directory(folder)
+    try:
+        for part in parts[:-1]:
+            child = _private_directory(part, parent=parent, create=True)
+            os.close(parent)
+            parent = child
+        fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=parent)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+    finally:
+        os.close(parent)
+
+
+def _private_tree(folder):
+    """Repair only owned inodes inside this opened tree, never links or foreign files."""
+    def visit(parent):
+        for name in os.listdir(parent):
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = _private_directory(name, parent=parent)
+                try:
+                    visit(child)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode):
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                try:
+                    current = os.fstat(fd)
+                    if not stat.S_ISREG(current.st_mode) or current.st_uid != os.geteuid() or current.st_nlink != 1:
+                        raise ValueError("Runtime snapshot file has unsafe ownership or links")
+                    if stat.S_IMODE(current.st_mode) != 0o600:
+                        os.fchmod(fd, 0o600)
+                finally:
+                    os.close(fd)
+            else:
+                raise ValueError("Runtime snapshot contains a link or special file")
+    root_fd = _private_directory(folder)
+    try:
+        visit(root_fd)
+    finally:
+        os.close(root_fd)
+
+
 def capture_runtime(model, *, profile=None, code_dir=None, root=None, policy=None, include_manifest=False):
     profile = Path(profile or os.environ.get("HERMES_HOME", "/home/hermes/.hermes"))
     code_dir = Path(code_dir or Path(__file__).parent)
@@ -92,24 +161,22 @@ def capture_runtime(model, *, profile=None, code_dir=None, root=None, policy=Non
     sums = {name: digest(value) for name, value in files.items()}
     manifest = json.dumps(sums, sort_keys=True, separators=(",", ":")).encode()
     ident = digest(manifest)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root_fd = _private_directory(root, create=True)
+    os.close(root_fd)
     target = root / ident
     if not target.exists():
         with tempfile.TemporaryDirectory(dir=root, prefix=".capture-") as temporary:
             folder = Path(temporary)
             for name, data in {**files, "manifest.json": manifest}.items():
-                path = folder / name
-                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as out:
-                    out.write(data)
-                    out.flush()
-                    os.fsync(out.fileno())
+                _write_private(folder, name, data)
+            _private_tree(folder)
             try:
                 os.rename(folder, target)
             except OSError as exc:
                 if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                     raise
+    _private_tree(target)
     # Verify even an existing snapshot. An ID is not evidence that its files still exist.
     if _read(target / "manifest.json") != manifest or any(
             digest(_read(target / name)) != expected for name, expected in sums.items()):
