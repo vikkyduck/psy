@@ -1,9 +1,14 @@
+import contextlib
+import io
+import json
 import os
+import pwd
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -238,6 +243,159 @@ class BackupAndRestore(unittest.TestCase):
             changed.write_bytes(b"old")
             entries = [live.Entry(same, b"x", "s"), live.Entry(changed, b"new", "c"), live.Entry(missing, b"m", "m")]
             self.assertEqual([(k, e.target.name) for k, e in live.plan(entries)], [("update", "changed"), ("new", "missing")])
+
+
+class DeploymentTransaction(unittest.TestCase):
+    """Inject host failures into main while keeping all bytes in a synthetic local host."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.code = self.root / "installed.py"
+        self.code.write_bytes(b"previous code")
+        self.record = self.root / "deployed"
+        self.previous = b"commit=previous\nbackup=/older/backup\n"
+        self.record.write_bytes(self.previous)
+        self.backups = self.root / "backups"
+        self.output = io.StringIO()
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        mocked = {
+            "BACKUPS": self.backups, "RECORD": self.record,
+            "release_sums": lambda: {}, "check_group_manifest": lambda sums: None,
+            "system_entries": lambda uid: [live.Entry(self.code, b"candidate code", "fixture.py")],
+            "gateway_entries": lambda sums: [], "check_instance": lambda: None,
+            "check_backup_config": lambda: None, "retired_dropins": lambda entries: ([], []),
+            "units_for": lambda path: {"hermes-gateway"}, "busy": lambda: [],
+            "snapshot_databases": lambda backup: [],
+            "check_root_dir": lambda path: self.assertTrue(Path(path).is_relative_to(self.root)),
+        }
+        for name, value in mocked.items():
+            self.stack.enter_context(patch.object(live, name, value))
+        self.stack.enter_context(patch.object(live.os, "geteuid", return_value=0))
+        self.stack.enter_context(patch.object(live.os, "fchown"))
+        self.stack.enter_context(patch.object(pwd, "getpwnam", return_value=SimpleNamespace(pw_uid=1)))
+        self.stack.enter_context(patch.object(live.signal, "signal"))
+        self.run = self.stack.enter_context(patch.object(live, "run", side_effect=self.fake_run))
+        self.restart = self.stack.enter_context(patch.object(live, "restart", return_value=[]))
+
+    @staticmethod
+    def fake_run(*cmd, **kwargs):
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def main(self, *arguments):
+        with patch.object(sys, "argv", ["update_live.py", *arguments]), patch.object(sys, "stdout", self.output):
+            try:
+                return live.main()
+            finally:
+                if isinstance(sys.stdout, live.Log) and sys.stdout.file:
+                    sys.stdout.file.close()
+
+    def backup_path(self):
+        return next(self.backups.iterdir())
+
+    def assert_previous(self):
+        self.assertEqual(self.code.read_bytes(), b"previous code")
+        self.assertEqual(self.record.read_bytes(), self.previous)
+
+    def test_preflight_timeout_restores_installed_bytes_and_deployment_record(self):
+        def run(*cmd, **kwargs):
+            if "preflight.py" in str(cmd):
+                self.assertEqual(self.code.read_bytes(), b"candidate code")
+                raise subprocess.TimeoutExpired(cmd, 120)
+            return self.fake_run(*cmd, **kwargs)
+        self.run.side_effect = run
+        with self.assertRaisesRegex(SystemExit, "^rolled back$"):
+            self.main("apply", "--commit", "candidate")
+        self.assert_previous()
+        self.restart.assert_called_once_with({"hermes-gateway"})
+
+    def test_restart_timeout_restores_files_before_restarting_previous_code(self):
+        def restart(units):
+            if self.restart.call_count == 1:
+                self.assertEqual(self.code.read_bytes(), b"candidate code")
+                raise subprocess.TimeoutExpired(["systemctl", "restart"], 120)
+            self.assert_previous()
+            return []
+        self.restart.side_effect = restart
+        with self.assertRaisesRegex(SystemExit, "^rolled back$"):
+            self.main("apply", "--commit", "candidate")
+        self.assert_previous()
+        self.assertEqual(self.restart.call_count, 2)
+
+    def fail_marker(self, *, after_replace, broken_log=False):
+        original = live.write_plain
+        class BrokenLog:
+            def __init__(self, handle):
+                self.handle = handle
+            def write(self, text):
+                raise OSError("injected log failure")
+            def close(self):
+                self.handle.close()
+        def write(path, data, uid, gid, mode):
+            if Path(path) == self.record and data.startswith(b"commit=candidate\n"):
+                self.assertEqual(self.code.read_bytes(), b"candidate code")
+                if after_replace:
+                    original(path, data, uid, gid, mode)
+                if broken_log:
+                    sys.stdout.file = BrokenLog(sys.stdout.file)
+                raise OSError("injected deployment marker failure")
+            return original(path, data, uid, gid, mode)
+        with patch.object(live, "write_plain", side_effect=write):
+            with self.assertRaisesRegex(SystemExit, "^rolled back$"):
+                self.main("apply", "--commit", "candidate")
+        self.assert_previous()
+        self.assertEqual(self.restart.call_count, 2)
+
+    def test_marker_write_failure_rolls_back_already_restarted_release(self):
+        self.fail_marker(after_replace=False)
+
+    def test_marker_failure_after_replace_restores_saved_predecessor(self):
+        self.fail_marker(after_replace=True)
+
+    def test_marker_and_log_failure_do_not_prevent_rollback(self):
+        self.fail_marker(after_replace=False, broken_log=True)
+
+    def test_manual_rollback_returns_success_and_restores_exact_previous_marker(self):
+        self.assertIsNone(self.main("apply", "--commit", "candidate"))
+        backup = self.backup_path()
+        marker = self.record.read_text()
+        self.assertIn("commit=candidate\n", marker)
+        self.assertIn(f"backup={backup}\n", marker)
+        index = json.loads((backup / "backup.json").read_text())
+        saved = next(item for item in index["saved"] if item["target"] == str(self.record))
+        self.assertEqual((backup / saved["copy"]).read_bytes(), self.previous)
+        self.assertIsNone(self.main("rollback", str(backup)))
+        self.assert_previous()
+        self.assertIn(f"Restored {backup}.", self.output.getvalue())
+
+    def test_first_managed_release_rollback_restores_absent_marker(self):
+        self.record.unlink()
+        self.main("apply", "--commit", "candidate")
+        self.assertTrue(self.record.exists())
+        self.assertIsNone(self.main("rollback", str(self.backup_path())))
+        self.assertEqual(self.code.read_bytes(), b"previous code")
+        self.assertFalse(self.record.exists())
+
+    def test_legacy_backup_reports_unknown_commit_instead_of_retaining_reverted_commit(self):
+        backup = live.Backup("legacy")
+        backup.keep([self.code])  # Historical backups did not include /etc/psy/deployed.
+        backup.note({"hermes-gateway"}, False)
+        self.code.write_bytes(b"candidate code")
+        self.record.write_text(f"commit=candidate\nbackup={backup.root}\n")
+        self.assertIsNone(self.main("rollback", str(backup.root)))
+        self.assertEqual(self.code.read_bytes(), b"previous code")
+        self.assertEqual(self.record.read_text(), f"commit=unknown\nrestored_from={backup.root}\n")
+        self.assertIn("restored commit is unknown", self.output.getvalue())
+
+    def test_failure_during_rollback_is_reported_without_claiming_success(self):
+        self.restart.side_effect = subprocess.TimeoutExpired(["systemctl", "restart"], 120)
+        with self.assertRaisesRegex(SystemExit, "^rollback incomplete:"):
+            self.main("apply", "--commit", "candidate")
+        self.assert_previous()
+        self.assertEqual(self.restart.call_count, 2)
+        self.assertNotIn("Updated to", self.output.getvalue())
 
 
 if __name__ == "__main__":

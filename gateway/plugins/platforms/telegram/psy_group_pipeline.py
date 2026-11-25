@@ -7,6 +7,7 @@ if __package__:
     from .psy_group_continuation import _complete
     from .psy_group_lecture import _lecture
     from .psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
+    from .psy_group_quality import annotate, contract_for, finish_task, mark_partial_text, recheck_edited_task
     from .psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from .psy_source_evidence import public_topic
 else:
@@ -14,6 +15,7 @@ else:
     from psy_group_continuation import _complete
     from psy_group_lecture import _lecture
     from psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
+    from psy_group_quality import annotate, contract_for, finish_task, mark_partial_text, recheck_edited_task
     from psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from psy_source_evidence import public_topic
 
@@ -31,8 +33,17 @@ def _admit_long(checkpoints, call=None):
 
 def _compose(client, turns, research, model, question, *, checkpoints=None):
     call, continuation_call = _job_calls(client, model, checkpoints)
+    result = _compose_task(call, continuation_call, turns, research, model, question, checkpoints)
+    audit = getattr(call, "audit", None)
+    if callable(audit):
+        result.quality_metadata.update(audit())
+    return mark_partial_text(result)
+
+
+def _compose_task(call, continuation_call, turns, research, model, question, checkpoints):
     write_prose = partial(_complete, partial(call, prose=True), model=model,
                           continuation_call=continuation_call if checkpoints is not None else None)
+    contract = contract_for(question)
     dispatch = SYSTEM + DISPATCH
     if research:
         _admit_long(checkpoints, call)
@@ -61,6 +72,14 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
         # instruction as public prose. The distinct call also bypasses old drafts.
         initial = call(turns, dispatch + "\nВерни полный ответ или полную служебную инструкцию с корректным JSON.",
                        prose=not research)
+    # Explicit long manuscript requirements are not optional model routing advice.
+    # A completed first answer saying "part one" must not bypass the lecture path.
+    if contract["kind"] == "lecture" and (contract["minutes"] or 0) >= 30:
+        task = dict(task) if isinstance(task, dict) else {}
+        task["minutes"] = contract["minutes"]
+        if not task.get("public_topic") and not contract["local_only"]:
+            topic = public_topic(question)
+            task["public_topic"] = topic
     if not isinstance(task, dict):
         if research:
             raise ModelIssue("unavailable", "research_dispatch")
@@ -69,22 +88,27 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
         result = write_prose(turns, SYSTEM, initial=initial)
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
-        return result
+        return finish_task(call, write_prose, turns, SYSTEM, result, contract)
 
     # Dispatch is already checkpointed. A parked job can resume at this point.
     _admit_long(checkpoints, call)
-    minutes = task.get("minutes")
+    contract = contract_for(question, task)
+    minutes = contract["minutes"] if not contract["outline_only"] else None
     long_form = type(minutes) is int and minutes >= 30
-    wants_sources = bool(task.get("public_topic")) or research
+    wants_sources = (bool(task.get("public_topic")) or research) and not contract["local_only"]
     topic = public_topic(question) if wants_sources else ""
     sources = None
     if topic.strip():
         sources = _primary_sources(call, topic.strip(), read_main=long_form or task.get("read_main") is True)
         if not sources.complete:
-            return sources
+            return annotate(sources, contract, status=getattr(sources, "task_status", "unknown")
+                            if getattr(sources, "task_status", "unknown") != "unknown" else "needs_source",
+                            review="source_unavailable")
     elif wants_sources:
-        return Result("Для проверки источников начните сообщение со строки 'Публичная тема: название работы или предмет поиска'. "
-                      "Только текст этой строки будет использован для внешнего поиска.", [], 0)
+        return annotate(Result("Для проверки источников начните сообщение со строки \"Публичная тема: название работы или предмет поиска\". "
+                               "Только текст этой строки будет использован для внешнего поиска.", [], 0), contract,
+                        status="needs_clarification", missing=["Не задана безопасная публичная тема поиска."],
+                        review="public_topic_missing")
 
     if sources:
         # Source evidence is untrusted data, never privileged instructions.
@@ -96,11 +120,29 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
                            + ("\n" + ATTRIBUTION if sources else ""))
         if not result.complete and "[Продолжение не завершено." not in result.text:
             result.text += CUT_NOTE
+    result = finish_task(call, write_prose, turns, SYSTEM + ("\n" + ATTRIBUTION if sources else ""),
+                         result, contract)
     if sources:
+        previous_status = result.task_status
+        previous_missing = result.missing_requirements
+        previous_metadata = result.quality_metadata
+        previous_text = result.text
         try:
             result = _verify_draft(call, result, sources.text)
         except ModelIssue as exc:
             result = _recover_verified(call, result, sources, exc)
+        result.task_status = previous_status if result.complete else "partial"
+        result.missing_requirements = list(dict.fromkeys([*previous_missing, *getattr(result, "missing_requirements", [])]))
+        result.quality_metadata = {**previous_metadata, **getattr(result, "quality_metadata", {}),
+                                   **getattr(sources, "quality_metadata", {})}
+        if getattr(sources, "task_status", "unknown") == "partial":
+            result.task_status = "partial"
+            result.missing_requirements = list(dict.fromkeys([*result.missing_requirements,
+                                                              *sources.missing_requirements]))
+        if not result.complete and not result.missing_requirements:
+            result.missing_requirements = ["Проверка созданного материала по источникам не завершена."]
+        if result.text != previous_text:
+            result = recheck_edited_task(call, turns, result, contract)
         result.searches = sources.searches
     elif wants_sources:
         result.text += "\n\nПоиск первоисточников не выполнялся. Для внешней сверки начните сообщение со строки Публичная тема: название работы или предмет поиска."

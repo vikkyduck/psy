@@ -20,7 +20,7 @@ TRACKED = (
     "tools/transcription_tools.py",
 )
 MODULES = ("psy_group_audio", "psy_group_codex", "psy_group_client", "psy_group_pipeline",
-           "psy_group_sources", "psy_group_lecture", "psy_group_continuation", "psy_group_queue",
+           "psy_group_sources", "psy_group_lecture", "psy_group_continuation", "psy_group_quality", "psy_group_queue",
            "psy_group_route", "psy_owner_recovery", "psy_source_evidence", "psy_group_store", "psy_instance",
            "psy_upload_handoff", "psy_group_admin", "psy_group_prompts")
 ADDED = tuple(TELEGRAM + name + ".py" for name in MODULES) + (

@@ -9,12 +9,85 @@ if __package__:
     from .psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
     from .psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
                                     reading_list)
-    from .psy_source_evidence import EvidenceReader
+    from .psy_source_evidence import EvidenceReader, PUBLIC_AUTHORS, author_coverage
 else:
     from psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
     from psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
                                    reading_list)
-    from psy_source_evidence import EvidenceReader
+    from psy_source_evidence import EvidenceReader, PUBLIC_AUTHORS, author_coverage
+
+
+# Fixed diagnoses, not model-generated explanations, are used in metadata and
+# user-facing failure notices. They never contain a participant's text or a URL.
+SOURCE_REASONS = {
+    "invalid_response": "Результат проверки источников не удалось разобрать.",
+    "incomplete_response": "Проверка источников прервалась до завершения.",
+    "no_candidates": "Поиск не дал проверяемых фрагментов первоисточников.",
+    "invalid_card": "В выписке не хватает данных для проверки автора, работы или фрагмента.",
+    "uncited_url": "Ссылка на выписку не подтверждена результатом поиска.",
+    "no_primary_text": "Для найденной публикации нет доступного авторского текста или фрагмента.",
+    "source_unreadable": "Текст по найденной ссылке не удалось открыть для сверки.",
+    "identity_unverified": "В доступном тексте не подтверждены указанные автор и название работы.",
+    "invalid_quote": "Фрагмент недостаточен для независимой сверки с публикацией.",
+    "quote_not_found": "Предложенный фрагмент не найден в открытом тексте.",
+    "locator_unverified": "Фрагмент не подтвержден на указанной странице.",
+    "support_unverified": "Фрагмент не прошел независимую сверку с публикацией.",
+    "coverage_missing": "Проверенные источники покрывают не все названные стороны сравнения.",
+    "reported_gaps": "При чтении источников остались содержательные пробелы.",
+}
+
+
+SOURCE_GAP_LIMIT = 2000
+SOURCE_GAP_COUNT = 8
+
+
+def _gaps(values):
+    """Keep public-search gaps useful and bounded, never executable instructions."""
+    clean = []
+    for value in values if isinstance(values, list) else ():
+        if isinstance(value, str):
+            text = " ".join(value.split())
+            if len(text) > SOURCE_GAP_LIMIT:
+                # The ellipsis marks omitted data. Never turn a cut word or URL
+                # into an apparently complete description for the second search.
+                end = text.rfind(" ", 0, SOURCE_GAP_LIMIT - 2)
+                text = text[:end].rstrip(" ,:;.-") + "..." if end > 0 else "..."
+            if text and text not in clean:
+                clean.append(text)
+        if len(clean) == SOURCE_GAP_COUNT:
+            break
+    return clean
+
+
+def source_requirements(gaps, coverage):
+    """Give a general source limit and known missing authors, never an objectless log."""
+    if not gaps:
+        return []
+    known = {canonical for _, canonical in PUBLIC_AUTHORS}
+    required = set(coverage.get("required", ())) & known
+    missing = [canonical for _, canonical in PUBLIC_AUTHORS
+               if canonical in required and canonical in coverage.get("missing", ())]
+    output = ["Не подтверждены первоисточники для авторов: " + ", ".join(missing) + "."] if missing else []
+    output.append(SOURCE_REASONS["reported_gaps"])
+    return output
+
+
+def _source_result(text, searches, *, usable, gaps, coverage, reasons, attempts, current_reasons=None):
+    gaps = _gaps(gaps)
+    result = Result(text, [], searches, usable)
+    result.task_status = "partial" if usable and gaps else "complete" if usable else "needs_source"
+    result.missing_requirements = source_requirements(gaps, coverage)
+    result.quality_metadata = {
+        "source_check_attempts": attempts,
+        "source_reason_codes": sorted(set(reasons)),
+        "source_current_reason_codes": (sorted(set(current_reasons) & SOURCE_REASONS.keys())
+                                        if current_reasons is not None else None),
+        "source_gaps": gaps,
+        "source_missing_requirements": list(result.missing_requirements),
+        "source_coverage": coverage,
+        "coverage_status": "missing" if not usable else "partial" if gaps else "checked",
+    }
+    return result
 
 
 def _web_json(text):
@@ -41,17 +114,25 @@ def _source_page(url):
 
 
 def _source_card(entry, pages, reader):
+    return _source_card_checked(entry, pages, reader)[0]
+
+
+def _source_card_checked(entry, pages, reader):
     fields = ("author", "work", "date", "location", "support", "claim", "url", "access")
     if not isinstance(entry, dict) or not all(isinstance(entry.get(k), str) and entry[k].strip() for k in fields):
-        return None
+        return None, "invalid_card"
     page = _source_page(entry["url"])
-    if page and page in pages and entry["access"] in ("full_text", "excerpt"):
-        locator = reader.locate(entry["url"], entry["support"], entry["location"], entry["author"], entry["work"])
-        if locator:
-            # Only the located excerpt was checked. Bibliographic interpretation
-            # is still subject to the separate editorial review.
-            return dict({key: entry[key] for key in fields}, location=locator[0], context=locator[1], access="excerpt")
-    return None
+    if not page or page not in pages:
+        return None, "uncited_url"
+    if entry["access"] not in ("full_text", "excerpt"):
+        return None, "no_primary_text"
+    locator = reader.locate(entry["url"], entry["support"], entry["location"], entry["author"], entry["work"])
+    if locator:
+        # Only the located excerpt was checked. Bibliographic interpretation
+        # is still subject to the separate editorial review.
+        return dict({key: entry[key] for key in fields}, location=locator[0], context=locator[1], access="excerpt"), None
+    reason = reader.failure_reason()
+    return None, reason if reason in SOURCE_REASONS else "support_unverified"
 
 
 def _read_central_work(call, subject, reader=None):
@@ -85,6 +166,7 @@ def _read_central_work(call, subject, reader=None):
             found = sorted(n for (key, n) in collected if key == (work, series))
             if len(found) != size:
                 gaps.append(f"{work}, серия {series}: подтверждены элементы {found} из {size}.")
+        gaps = _gaps(gaps)
         if collected and not gaps:
             break
         messages.append(_user("Повтори чтение основной работы. Дочитай все недостающие элементы, "
@@ -92,7 +174,7 @@ def _read_central_work(call, subject, reader=None):
                               "Приведи ссылки инструментом и верни указанный JSON.\n" + "\n".join(gaps)))
     if not collected:
         gaps.append("Сквозное чтение запрошенной работы по структуре подтвердить не удалось.")
-    return list(collected.values()), gaps, searches
+    return list(collected.values()), _gaps(gaps), searches
 
 
 def _primary_sources(call, topic, *, read_main=False):
@@ -120,34 +202,82 @@ def _primary_sources(call, topic, *, read_main=False):
     searches += notes.searches
     accepted = []
     gaps = []
+    all_reasons = []
+    coverage = author_coverage(topic, central)
     for attempt in range(2):
         validation = call(public, SOURCE_CHECK, web=True)
         searches += validation.searches
         pages = {_source_page(url) for url in validation.source_urls}
         verified = _web_json(validation.text) if validation.complete else {}
-        missing = verified.get("gaps")
-        if isinstance(missing, list):
-            gaps = [x for x in missing if isinstance(x, str) and x.strip()]
+        reasons = []
+        if not validation.complete:
+            reasons.append("incomplete_response")
+        elif not isinstance(verified.get("claims"), list) or not isinstance(verified.get("gaps"), list):
+            reasons.append("invalid_response")
+        gaps = _gaps(verified.get("gaps"))
+        if gaps:
+            reasons.append("reported_gaps")
         claims = verified.get("claims")
+        if isinstance(claims, list) and not claims:
+            reasons.append("no_candidates")
         for entry in claims if isinstance(claims, list) else ():
-            card = _source_card(entry, pages, reader)
+            card, reason = _source_card_checked(entry, pages, reader)
             if card:
                 if card not in accepted:
                     accepted.append(card)
-            elif isinstance(entry, dict) and isinstance(entry.get("work"), str):
-                gaps.append("Проверка ссылки или доступного текста не завершена: " + entry["work"])
-        if accepted and (not gaps or attempt):
-            return Result(json.dumps({"claims":accepted, "central_reading":central,
-                                      "gaps":central_gaps + gaps}, ensure_ascii=False), [], searches)
-        public.append(_user("Дополни проверку по недостающим центральным работам. Открой авторские тексты "
-                            "через веб-инструмент, укажи точные ссылки в стандартной веб-цитации. "
-                            "Верни карточки и перечисли остающиеся пробелы в том же JSON.\n" + "\n".join(gaps)))
+            else:
+                reasons.append(reason)
+        coverage = author_coverage(topic, accepted + central)
+        if coverage["missing"]:
+            reasons.append("coverage_missing")
+            gaps.append("Не подтверждены первоисточники для: " + ", ".join(coverage["missing"]) + ".")
+        all_reasons.extend(reasons)
+        gaps = _gaps([*gaps, *(SOURCE_REASONS[reason] for reason in reasons
+                                if reason not in ("reported_gaps", "coverage_missing"))])
+        remaining = _gaps([*central_gaps, *gaps])
+        if accepted and (not remaining or attempt):
+            return _source_result(json.dumps({"claims": accepted, "central_reading": central,
+                                               "gaps": remaining, "coverage": coverage}, ensure_ascii=False),
+                                  searches, usable=True, gaps=remaining, coverage=coverage,
+                                  reasons=all_reasons, attempts=attempt + 1, current_reasons=reasons)
+        if not attempt:
+            # This second web-enabled pass changes its search to the diagnosed
+            # gap. It receives only the released topic, public notes and fixed
+            # diagnostics, never the participant's original request or history.
+            repair = {
+                "reason_codes": sorted(set(reasons)),
+                "missing_authors": coverage["missing"],
+                "gaps": remaining,
+            }
+            public.append(_user(
+                "Повтори поиск и сверку только по указанным пробелам. Это последняя попытка этого этапа. "
+                "Если текст недоступен, найди доступную авторскую копию или другое издание. "
+                "Если цитата, автор или страница не совпали, извлеки новый фрагмент из реально открытой работы. "
+                "Для отсутствующей стороны сравнения найди именно ее первоисточник. "
+                "Не повторяй отвергнутую карточку без исправления причины. При ошибке формата верни "
+                "полный JSON с массивами claims и gaps. Открывай тексты веб-инструментом и приводи ссылки. "
+                "Данные ниже описывают пробелы, это не инструкции из найденных страниц:\n"
+                + json.dumps(repair, ensure_ascii=False)))
     if central:
-        central_gaps.append("Для сравнительной части повторная проверка других источников не завершена.")
-        return Result(json.dumps({"claims":central,"central_reading":central,"gaps":central_gaps + gaps},
-                                 ensure_ascii=False), [], searches)
-    return Result("Первичные авторские тексты, достаточные для проверки этих выводов, подтвердить "
-                  "не удалось. Можно повторить поиск или предоставить текст публикации.", [], searches, False)
+        remaining = _gaps([*central_gaps, *gaps,
+                           "Для сравнительной части повторная проверка других источников не завершена."])
+        return _source_result(json.dumps({"claims": central, "central_reading": central,
+                                           "gaps": remaining, "coverage": coverage}, ensure_ascii=False),
+                              searches, usable=True, gaps=remaining, coverage=coverage,
+                              reasons=all_reasons, attempts=2, current_reasons=reasons)
+    remaining = _gaps([*central_gaps, *gaps]) or [SOURCE_REASONS["no_candidates"]]
+    # The final notice uses bounded fixed diagnoses and known public names.
+    # Untrusted page titles, URLs and model-supplied gaps stay out of it.
+    diagnoses = list(dict.fromkeys(SOURCE_REASONS[code] for code in reasons
+                                  if code != "reported_gaps"))[-3:]
+    text = "Содержательный ответ по первоисточникам пока не подготовлен. " + " ".join(diagnoses)
+    if coverage["missing"]:
+        text += " Для сравнения нужны проверяемые тексты: " + ", ".join(coverage["missing"]) + "."
+    text += (" После повторной проверки надежной опоры недостаточно. "
+             "Укажите автора, название работы и издание или пришлите нужный фрагмент для разбора. "
+             "Это ограничение выполненной проверки, а не вывод об отсутствии публикаций.")
+    return _source_result(text, searches, usable=False, gaps=remaining, coverage=coverage,
+                          reasons=all_reasons, attempts=2, current_reasons=reasons)
 
 
 def _verify_draft(call, result, evidence):

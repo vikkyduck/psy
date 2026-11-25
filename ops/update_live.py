@@ -610,8 +610,11 @@ class Log:
 
     def write(self, text):
         if self.file:
-            self.file.write(text)
-            self.file.flush()
+            try:
+                self.file.write(text)
+                self.file.flush()
+            except OSError:
+                pass  # A full log disk must not prevent the rollback it would report.
         try:
             self.stream.write(text)
             self.stream.flush()
@@ -665,6 +668,14 @@ def roll_back_to(backup):
     for timer in backup.index.get("enabled") or ():
         run("systemctl", "disable", "--now", timer, check=False)
     backup.restore()
+    # New backups include the exact predecessor marker (or its absence). Older backups
+    # do not: never leave the just-reverted commit advertised as the installed one.
+    recorded = {item["target"] for item in backup.index["saved"]} | set(backup.index["created"])
+    if str(RECORD) not in recorded:
+        record = read_plain(RECORD)
+        write_plain(RECORD, f"commit=unknown\nrestored_from={backup.root}\n".encode(), 0, 0,
+                    stat.S_IMODE(record[1].st_mode) if record else 0o644)
+        print("Previous deployment record was not saved in this backup; restored commit is unknown.")
     if backup.index.get("reload"):
         run("systemctl", "daemon-reload", check=False)
     units = set(backup.index.get("units") or ())
@@ -690,8 +701,14 @@ def main():
         if latest.get("backup") != str(Path(opts.backup).resolve()) and not opts.force:
             sys.exit(f"{opts.backup} is not the backup of the current update ({latest.get('backup', 'none recorded')}); "
                      "roll back the newer updates first, or pass --force")
-        still = roll_back_to(Backup(root=Path(opts.backup).resolve()))
-        sys.exit(f"still not running: {', '.join(still)}" if still else f"Restored {opts.backup}.")
+        try:
+            still = roll_back_to(Backup(root=Path(opts.backup).resolve()))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"rollback incomplete: {exc}; inspect {opts.backup}")
+        if still:
+            sys.exit(f"still not running: {', '.join(still)}")
+        print(f"Restored {opts.backup}.")
+        return
     import pwd
     try:
         sums = release_sums()
@@ -700,7 +717,7 @@ def main():
         check_instance()
         check_backup_config()
         todo = plan(entries)
-    except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, KeyError, subprocess.SubprocessError) as exc:
         sys.exit(f"refused: {exc}")
     retire, kept = retired_dropins(entries)
     for kind, entry in todo:
@@ -732,17 +749,22 @@ def main():
         backup = Backup(commit[:12])
         sys.stdout.file = os.fdopen(os.open(backup.root / "apply.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND
                                             | os.O_NOFOLLOW, 0o600), "a", encoding="utf-8")
-        backup.keep(targets)
+        # Keep the deployment marker in the same transaction as the installed bytes.
+        # This also records an absent predecessor on a host's first managed update.
+        backup.keep(targets + [RECORD])
         backup.note(units, reload_units)
         for copy in snapshot_databases(backup):
             print(f"  database copy {copy}")
-    except (ValueError, OSError, subprocess.CalledProcessError) as exc:
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
         sys.exit(f"refused before changing anything: {exc}")
     print(f"Previous files: {backup.root} (put back by hand with: python3 ops/update_live.py rollback {backup.root})")
 
     def roll_back(reason):
         print(f"FAILED: {reason}\nRestoring the previous files from {backup.root}")
-        still = roll_back_to(backup)
+        try:
+            still = roll_back_to(backup)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            sys.exit(f"rollback incomplete: {exc}; inspect {backup.root}")
         sys.exit("rolled back" + (f"; still not running: {', '.join(still)}" if still else ""))
 
     try:
@@ -772,13 +794,13 @@ def main():
             run("systemctl", "enable", "--now", timer)
             print(f"  enabled {timer}")
         failed = restart(units)
-    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        if failed:
+            roll_back("not running after restart: " + ", ".join(failed))
+        record = read_plain(RECORD)
+        write_plain(RECORD, f"commit={commit}\nupdated_at={backup.root.name[:16]}\nchanges={len(targets)}\nbackup={backup.root}\n".encode(),
+                    0, 0, stat.S_IMODE(record[1].st_mode) if record else 0o644)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         roll_back(str(exc))
-    if failed:
-        roll_back("not running after restart: " + ", ".join(failed))
-    record = read_plain(RECORD)
-    write_plain(RECORD, f"commit={commit}\nupdated_at={backup.root.name[:16]}\nchanges={len(targets)}\nbackup={backup.root}\n".encode(),
-                0, 0, stat.S_IMODE(record[1].st_mode) if record else 0o644)
     print(f"Updated to {commit[:12]}: {len(targets)} change(s), restarted {', '.join(u for u in SERVICES if u in units) or 'nothing'}. "
           f"Previous files: {backup.root}")
 

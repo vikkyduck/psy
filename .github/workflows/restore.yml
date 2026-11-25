@@ -30,7 +30,7 @@ jobs:
           PSY_TEST_GATEWAY: ${{ runner.temp }}/hermes
         run: |
           python3 -B -m unittest discover -s tests/reliability -p 'test_*_release.py' -v
-          python3 -B -m unittest discover -s tests/isolated -p 'test_fixture_guards.py' -v
+          python3 -B -m unittest discover -s tests/isolated -p 'test_*guards.py' -v
           node --check tests/isolated/upload_ui_example.cjs
       - name: Test Codex renewal across the gateway, monitor and Hermes
         run: |

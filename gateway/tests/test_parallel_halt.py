@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from psy_modules import psy_group_client as codex, psy_group_codex as model
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from psy_modules import psy_group_quality as quality
 
 
 class Memory:
@@ -72,6 +73,9 @@ class ParallelHalt(unittest.TestCase):
             if "Проверь содержание раздела" in instructions:
                 calls["review"] += 1
                 return model.Result('{"missing":""}', [], 0)
+            if instructions == quality._REVIEW:
+                calls["task-review"] += 1
+                return model.Result('{"complete":true,"missing":[]}', [], 0)
             self.fail("unexpected stage")
 
         saved = Memory()
@@ -80,11 +84,13 @@ class ParallelHalt(unittest.TestCase):
         self.assertEqual(parked.exception.issue.kind, "busy")
         # Section 3 may or may not have been picked up before the 429. Nothing later starts.
         self.assertEqual((calls[1], calls[2], calls[4], calls[5], calls[6], calls["review"]), (1, 1, 0, 0, 0, 0))
+        self.assertEqual(calls["task-review"], 0)
 
         busy = False
         result = self.run_lecture(stream, saved)
         self.assertTrue(result.complete)
-        self.assertEqual(calls, Counter({1: 1, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1, "review": 6}))
+        self.assertEqual(result.task_status, "complete")
+        self.assertEqual(calls, Counter({1: 1, 2: 2, 3: 1, 4: 1, 5: 1, 6: 1, "review": 6, "task-review": 1}))
         for index in range(1, 7):
             self.assertIn(f"chapter {index} text.", result.text)
 
@@ -127,6 +133,7 @@ class ParallelHalt(unittest.TestCase):
 
         result = self.run_lecture(stream, None)
         self.assertFalse(result.complete)
+        self.assertEqual(result.task_status, "partial")
         self.assertIn("[Этот раздел не сформирован.]", result.text)
 
 

@@ -253,9 +253,33 @@ class OwnerAlerts(unittest.TestCase):
 
     def test_inactive_gateway_is_observed_without_gateway_import(self):
         props = lambda name, *_: {'ActiveState': 'failed' if name=='hermes-gateway' else 'active', 'Result':'success','NRestarts':'0'}
-        with patch.object(alerts, 'properties', side_effect=props), patch.object(alerts, 'group_status', return_value=[]), patch.object(alerts.socket, 'create_connection', side_effect=OSError), patch.dict(alerts.os.environ, {'PSY_PUBLIC_URL':'https://example.invalid'}):
-            problems, _ = alerts.collect({}, 100)
-        self.assertIn('service:hermes-gateway', problems)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            fixtures = {
+                '/var/lib/psy-healthcheck/state.json': '{"last_restart":0}',
+                '/var/lib/psy-upload-health/state.json': '{"healthy":true,"last_restart":0}',
+                '/proc/uptime': '1000 0\n',
+                '/proc/meminfo': 'MemAvailable: 524288 kB\n',
+                '/proc/pressure/memory': 'some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n',
+            }
+            paths = {}
+            for name, content in fixtures.items():
+                target = root / name.lstrip('/')
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content)
+                paths[name] = target
+            # A test run on the actual host must not touch its health snapshots,
+            # backup timestamp or /proc. Unknown new reads fail this fixture.
+            with patch.object(alerts, 'Path', side_effect=lambda name: paths[str(name)]), \
+                    patch.object(alerts, 'BACKUP_SUCCESS', root / 'absent-backup-success'), \
+                    patch.object(alerts, 'HOME', root / 'home'), \
+                    patch.object(alerts, 'properties', side_effect=props), \
+                    patch.object(alerts, 'group_status', return_value=[]), \
+                    patch.object(alerts.socket, 'create_connection', side_effect=OSError), \
+                    patch.dict(alerts.os.environ, {'PSY_PUBLIC_URL':'https://example.invalid'}):
+                problems, _ = alerts.collect({}, 100)
+        self.assertEqual(problems['service:hermes-gateway'],
+                         'Служба hermes-gateway остановлена или не смогла запуститься.')
 
     def test_remote_outage_alert_waits_for_three_probes_and_recovers(self):
         state = {}

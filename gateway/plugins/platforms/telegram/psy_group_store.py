@@ -25,7 +25,7 @@ AUTH_WAITS = ("signin", "access_wait")
 # Several worker threads and the operator CLI share one file. A writer waits for the
 # lock instead of failing a job after a short contention spike.
 BUSY_SECONDS = 30
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
             CREATE TABLE IF NOT EXISTS instance_binding (
@@ -74,6 +74,12 @@ _SCHEMA = """
               id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, topic INTEGER NOT NULL,
               prompt TEXT NOT NULL, answer TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS member_turns ON turns(uid,topic,id);
+            CREATE TABLE IF NOT EXISTS turn_results (
+              turn_id INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+              task_status TEXT NOT NULL, generation_complete INTEGER,
+              missing_requirements TEXT NOT NULL, metadata TEXT NOT NULL,
+              recorded_at REAL NOT NULL, delivery_status TEXT NOT NULL DEFAULT 'pending',
+              confirmed_at REAL);
             CREATE TABLE IF NOT EXISTS turn_sources (
               turn_id INTEGER PRIMARY KEY, doc_id INTEGER);
             CREATE INDEX IF NOT EXISTS source_turns ON turn_sources(doc_id,turn_id);
@@ -369,12 +375,63 @@ def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT, bef
     return turns
 
 
-def remember(uid, topic, question, answer, *, source_id=None, message_id=None, root=ROOT, request_key=None):
+RESULT_STATUSES = frozenset(("unknown", "complete", "partial", "needs_source", "needs_clarification"))
+
+
+def _remember_result(con, turn_id, details):
+    if details is None:
+        return
+    status = details.get("task_status", "unknown")
+    generated = details.get("generation_complete")
+    missing = details.get("missing_requirements", [])
+    metadata = details.get("quality_metadata", {})
+    if (status not in RESULT_STATUSES or generated is not None and type(generated) is not bool
+            or not isinstance(missing, list) or not all(isinstance(x, str) for x in missing)
+            or not isinstance(metadata, dict)):
+        raise ValueError("Invalid group result status")
+    encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    if len(encoded.encode()) > 128 * 1024:
+        raise ValueError("Group result metadata too large")
+    # A replay must never overwrite the original provenance or erase confirmation.
+    con.execute("""INSERT OR IGNORE INTO turn_results
+                   (turn_id,task_status,generation_complete,missing_requirements,metadata,recorded_at)
+                   VALUES(?,?,?,?,?,?)""",
+                (turn_id, status, generated, json.dumps(missing, ensure_ascii=False), encoded, time.time()))
+
+
+def result_details(uid, topic, turn_id, *, root=ROOT):
+    """Read quality and delivery independently, only in the owning member/topic scope."""
+    with database(root) as con:
+        row = con.execute("""SELECT r.task_status,r.generation_complete,r.missing_requirements,
+                              r.metadata,r.recorded_at,r.delivery_status,r.confirmed_at
+                              FROM turns t LEFT JOIN turn_results r ON r.turn_id=t.id
+                              WHERE t.id=? AND t.uid=? AND t.topic=?""", (turn_id, uid, topic)).fetchone()
+    if row is None:
+        return None
+    if row[0] is None:
+        return {"task_status": "unknown", "generation_complete": None, "missing_requirements": [],
+                "quality_metadata": {}, "recorded_at": None, "delivery_status": "unknown", "confirmed_at": None}
+    return {"task_status": row[0], "generation_complete": None if row[1] is None else bool(row[1]),
+            "missing_requirements": json.loads(row[2]), "quality_metadata": json.loads(row[3]),
+            "recorded_at": row[4], "delivery_status": row[5], "confirmed_at": row[6]}
+
+
+def confirm_result_delivery(uid, topic, turn_id, *, root=ROOT):
+    """Telegram receipts confirm transport acceptance, not reading or task completeness."""
+    with database(root) as con:
+        con.execute("""UPDATE turn_results SET delivery_status='confirmed',confirmed_at=coalesce(confirmed_at,?)
+                       WHERE turn_id=? AND EXISTS(SELECT 1 FROM turns WHERE id=? AND uid=? AND topic=?)""",
+                    (time.time(), turn_id, turn_id, uid, topic))
+
+
+def remember(uid, topic, question, answer, *, source_id=None, message_id=None, root=ROOT, request_key=None,
+             result_details=None):
     with database(root) as con:
         if request_key is not None:
             con.execute("BEGIN IMMEDIATE")
             saved = _previous_write(con, request_key, uid, topic, "turn")
             if saved is not None:
+                _remember_result(con, saved, result_details)
                 return saved
         row = con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
                           (uid, topic, question[:5000], answer))
@@ -384,6 +441,7 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         con.execute("INSERT INTO turn_sources(turn_id,doc_id) VALUES (?,?)", (turn_id, source_id))
         _bind(con, uid, topic, message_id, source_id, turn_id)
         _record_write(con, request_key, topic, "turn", turn_id)
+        _remember_result(con, turn_id, result_details)
         return turn_id
 
 

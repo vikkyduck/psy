@@ -33,6 +33,10 @@ class Result:
     source_urls: tuple = ()
     # Set on a fragment kept from a cut-off stream: seconds it ran without visible progress.
     silent: float = field(default=None, compare=False, repr=False)
+    # Transport completion is not proof that the participant's task was fulfilled.
+    task_status: str = "unknown"
+    missing_requirements: list = field(default_factory=list)
+    quality_metadata: dict = field(default_factory=dict)
 
     @property
     def searched(self):
@@ -465,10 +469,45 @@ def _job_calls(client, model, checkpoints):
     With checkpoints, `call` replays completed stages, saves final prose while it streams and,
     after a retryable refusal, halts the sibling stages (`call.halt`) and defers the job.
     `continuation_call` finds one continuation block by its chain digest or legacy prompt."""
+    stages = {}
+    audit_lock = threading.Lock()
+
+    def record_stage(key, metadata, *, replay=False):
+        with audit_lock:
+            ident = key if key is not None else "direct:" + str(len(stages))
+            stages[ident] = {**metadata, "replayed": replay}
+
+    def audit():
+        # No prompts, answers, URLs, member identifiers or credentials. These
+        # observations survive only with the private answer, not public logs.
+        with audit_lock:
+            values = list(stages.values())
+        efforts = {}
+        for item in values:
+            effort = item.get("effort", "unknown")
+            efforts[effort] = efforts.get(effort, 0) + 1
+        completions = [x.get("generation_complete") for x in values]
+        complete = (False if any(x is False for x in completions) else
+                    True if completions and all(x is True for x in completions) else None)
+        generated = [x["generated_at"] for x in values if type(x.get("generated_at")) in (int, float)]
+        return {"model_requested": model, "generation_audit": {
+            "stages": len(values), "replayed_stages": sum(x.get("replayed", False) for x in values),
+            "effort_counts": efforts,
+            "fallback_stages": sum(x.get("fallback_used", False) for x in values),
+            "prompt_hashes": sorted({x["prompt_sha256"] for x in values if x.get("prompt_sha256")}),
+            "unknown_stages": sum(not x.get("generated_at") for x in values),
+            "generation_complete": complete,
+            "first_generated_at": min(generated) if generated else None,
+            "last_generated_at": max(generated) if generated else None,
+        }}
+
     def cached(key):
         saved = checkpoints.get(key)
         if saved is not None:
-            return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]))
+            metadata = saved.get("generation_metadata", {})
+            record_stage(key, metadata, replay=True)
+            return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]),
+                          quality_metadata={"generation": metadata})
 
     halt = _Halt()
 
@@ -483,7 +522,8 @@ def _job_calls(client, model, checkpoints):
 
         def save(result):
             checkpoints.put(key, {"text": result.text, "searches": result.searches,
-                                  "complete": result.complete, "source_urls": list(result.source_urls)})
+                                  "complete": result.complete, "source_urls": list(result.source_urls),
+                                  "generation_metadata": result.quality_metadata.get("generation", {})})
 
         saved_prefix = False
         def save_prefix(text):
@@ -541,6 +581,12 @@ def _job_calls(client, model, checkpoints):
         if not result.complete:
             # A fragment kept from a cut-off stream: a source check asks again with a new prompt.
             silent_cut(result.silent)
+        metadata = {"model_requested": model, "effort": effort, "deep": call.deep,
+                    "web": web, "prose": prose, "fallback_used": bool(cuts),
+                    "generation_complete": result.complete, "generated_at": time.time(),
+                    "prompt_sha256": hashlib.sha256(instructions.encode()).hexdigest()}
+        result.quality_metadata["generation"] = metadata
+        record_stage(key, metadata)
         if checkpoints is not None and (result.complete or (prose and result.text and not _dispatch_marker(result.text, complete=False))):
             save(result)
         return result
@@ -558,6 +604,7 @@ def _job_calls(client, model, checkpoints):
         return call(messages, instructions, prose=True, key=key), False
 
     call.halt = halt
+    call.audit = audit
     # Set by the pipeline once the job turns out long (_admit_long): later stages think deep.
     call.deep = False
     return call, continuation_call
