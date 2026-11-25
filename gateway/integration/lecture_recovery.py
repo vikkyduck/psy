@@ -55,9 +55,10 @@ def telegram_types():
 class TestEndpoints:
     """Only raw model responses, browser approval and Telegram recipients are simulated."""
 
-    def __init__(self, group, prompts, token_url):
+    def __init__(self, group, prompts, quality, token_url):
         self.group = group
         self.prompts = prompts
+        self.quality = quality
         self.token_url = token_url
         now = int(time.time())
         self.old_access = synthetic_token(now + 86400)
@@ -68,6 +69,7 @@ class TestEndpoints:
         self.private_messages = []
         self.refreshes = 0
         self.proofs = 0
+        self.task_reviews = []
 
     def stream(self, client, headers, messages, web, model, *, instructions, **kwargs):
         if instructions == "Ответь только числом.":
@@ -89,6 +91,10 @@ class TestEndpoints:
             text = f"Chapter {chapter} saved intact. " * 90
         elif "Проверь содержание раздела" in instructions:
             text = '{"missing":""}'
+        elif instructions == self.quality._REVIEW:
+            assert headers["Authorization"] == "Bearer " + self.new_access
+            self.task_reviews.append(json.dumps(messages, ensure_ascii=False))
+            text = '{"complete":true,"missing":[]}'
         else:
             raise AssertionError("Unexpected writing stage")
         return self.group.Result(text, [], 0)
@@ -112,6 +118,7 @@ async def exercise(home, patches):
     from hermes_cli import auth, auth_codex, config, psy_codex_policy as policy, psy_codex_incident as incident
     from psy_modules import psy_group_codex as group, psy_group_queue as queue, psy_group_store as store
     from psy_modules import psy_group_client as codex, psy_group_pipeline as pipeline, psy_group_prompts as prompts
+    from psy_modules import psy_group_quality as quality
     from psy_modules import psy_owner_recovery as owner, psy_group_route as route
 
     assert auth._auth_file_path().parent.resolve() == home
@@ -119,7 +126,7 @@ async def exercise(home, patches):
     assert global_store is None or global_store.resolve().is_relative_to(home)
     assert (route.OWNER, route.GROUP, route.BOT) == (OWNER, GROUP, BOT)
     patches.enter_context(patch.object(policy, "MARKERS", home))
-    endpoints = TestEndpoints(group, prompts, auth_codex.CODEX_OAUTH_TOKEN_URL)
+    endpoints = TestEndpoints(group, prompts, quality, auth_codex.CODEX_OAUTH_TOKEN_URL)
     primary = dict(id="main", priority=0, source="manual:device_code", auth_type="oauth",
                    access_token=endpoints.old_access, refresh_token="fixture-grant")
     store_path = home / "group"
@@ -164,6 +171,7 @@ async def exercise(home, patches):
     await queue.run_job(app, asyncio.Event(), *store.claim_next())
     assert endpoints.chapters == Counter({1: 1, 2: 1, 3: 1})
     assert not endpoints.documents
+    assert not endpoints.task_reviews
     assert store.state(UPDATE) == "queued" and store.claim_next() is None
     assert incident.snapshot()["reason"] == "revoked"
     assert endpoints.refreshes == 1
@@ -192,8 +200,17 @@ async def exercise(home, patches):
     await asyncio.wait_for(app.adapter._psy_group_task, 10)
 
     assert endpoints.chapters == Counter({1: 1, 2: 1, 3: 1, 4: 1})
+    assert len(endpoints.task_reviews) == 1
+    assert all(f"Chapter {i} saved intact." in endpoints.task_reviews[0] for i in range(1, 5))
     assert len(endpoints.documents) == 1
     assert all(f"Chapter {i} saved intact." in endpoints.documents[0] for i in range(1, 5))
+    with store.database() as con:
+        turns = con.execute("SELECT id FROM turns WHERE uid=? AND topic=?", (MEMBER, 0)).fetchall()
+    assert len(turns) == 1
+    details = store.result_details(MEMBER, 0, turns[0][0])
+    assert details["task_status"] == "complete" and details["missing_requirements"] == []
+    assert details["quality_metadata"]["completion_review"] == "passed"
+    assert details["delivery_status"] == "confirmed"
     assert store.state(UPDATE) is None and store.claim_next() is None
     assert endpoints.refreshes == 1
     notice.assert_awaited_once()
@@ -217,7 +234,8 @@ def main():
         pkg.__path__ = [str(checkout / "plugins/platforms/telegram")]
         patches.enter_context(patch.dict(sys.modules, {"psy_modules": pkg, **telegram_types()}))
         asyncio.run(exercise(home, patches))
-    print("Passed: three chapters saved, one owner alert, model proof, chapter four resumed, one document")
+    print("Passed: three chapters saved, one owner alert, model proof, chapter four resumed, "
+          "all chapters reviewed, one document")
 
 
 if __name__ == "__main__":
