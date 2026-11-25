@@ -20,7 +20,7 @@
     "plugins/platforms/telegram/psy_group_context.py": "8f3e631085df5848ceaa8986009dcc40343a1bc887eeb6da66f62b562faa4aa3",
     "plugins/platforms/telegram/psy_group_continuation.py": "c8d87ef97d6200904833cefc35e58d1a98923569d1864a3939938e2fd596ec3c",
     "plugins/platforms/telegram/psy_group_lecture.py": "547e929b9b4a1bf55c8354fb7d542d1c42774ecede759ec9d8e6c6f3d4026cb5",
-    "plugins/platforms/telegram/psy_group_observability.py": "b6d30a87116ab195486440a290e93ddea1f6cd9823c55737630e1a99b56da39d",
+    "plugins/platforms/telegram/psy_group_observability.py": "2ae39f571274bdc3415060438ccda6b00d7c62c347368a3b174dd438425d1b4c",
     "plugins/platforms/telegram/psy_group_pipeline.py": "4c3cf3a4d115003ed80a77df86d6041dcb337730a6391a84223994a92e8f609a",
     "plugins/platforms/telegram/psy_group_prompts.py": "3e89a7daab908edc0a4d59af6ac269f84c44616003d72eb7b37979f73d5c697b",
     "plugins/platforms/telegram/psy_group_quality.py": "bb4b7f7943e2b60d34b014828ece77426bfbe183d1ad703f45e1b58f5c39c3ba",
