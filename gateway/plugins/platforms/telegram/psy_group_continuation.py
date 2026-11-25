@@ -1,5 +1,4 @@
-"""Continuation stitching: keep a long text locally and resend only its tail when the model stops at
-its output ceiling, joining the parts without repeats."""
+"""Continue at provider output limits without discarding earlier answer context."""
 import hashlib
 
 if __package__:
@@ -10,6 +9,8 @@ else:
     from psy_group_prompts import CONTINUE as _CONTINUE
 
 
+# Retained for compatibility with old fixtures and cache metadata. It no longer
+# limits what the model sees. Provider context limits must remain explicit.
 CONTINUATION_TAIL_CHARS = 2048
 
 
@@ -31,19 +32,17 @@ def _overlap(tail, text):
 
 def _complete(call, turns, instructions, *, initial=None, continuation_call=None,
               model=None, previous_chapter=None):
-    """Keep the full text locally. Each continuation sees only the current prose tail."""
+    """Retain every prior output block in the next request, with no answer-length cap."""
     if previous_chapter is not None:
         # For a supplement the last turn is the missing obligation from editorial review.
         full_chapter = {"role": "assistant", "content": previous_chapter}
-        tail = previous_chapter[-CONTINUATION_TAIL_CHARS:]
-        first_turns = [*turns[:-1], {"role": "assistant", "content": tail}, turns[-1]]
-        old_base = [*turns[:-1], full_chapter, turns[-1]]
+        tail = previous_chapter
+        first_turns = old_base = [*turns[:-1], full_chapter, turns[-1]]
     else:
         tail = ""
         first_turns = old_base = turns
 
-    # The compact prompt can recur at different positions or after different chapters.
-    # Bind each durable block to the original stage and to all preceding local output.
+    # Bind each durable block to the original stage and every preceding output block.
     if continuation_call is not None:
         chain = hashlib.sha256(_stage_key(model, old_base, instructions).encode())
     look_up_legacy = True
@@ -57,12 +56,27 @@ def _complete(call, turns, instructions, *, initial=None, continuation_call=None
         part = call(first_turns, instructions)
 
     pieces = [part.text]
-    separator = "\n" if tail else ""
+    parts = [part]
     seen = {hashlib.sha256(part.text.strip().encode()).digest()}
+
+    def assembled(complete, *, reason=None, stage=None, note=""):
+        metadata = {}
+        for item in parts:
+            metadata.update(getattr(item, "quality_metadata", {}))
+        metadata.update(continuation_parts=len(parts), continuation_context="full_output")
+        return Result("".join(pieces) + note, [image for item in parts for image in item.images],
+                      sum(item.searches for item in parts), complete,
+                      tuple(dict.fromkeys(url for item in parts for url in item.source_urls)),
+                      quality_metadata=metadata,
+                      stop_reason=reason or getattr(parts[-1], "stop_reason", "unknown"),
+                      stop_stage=stage or getattr(parts[-1], "stop_stage", None),
+                      model_actual=getattr(parts[-1], "model_actual", None))
+
     while not part.complete:
-        # Limit each operand before concatenating. Only local assembly uses full pieces.
-        tail = (tail + separator + pieces[-1][-CONTINUATION_TAIL_CHARS:])[-CONTINUATION_TAIL_CHARS:]
-        continuation = [*turns, {"role": "assistant", "content": tail}, _user(_CONTINUE)]
+        if getattr(part, "stop_reason", None) == "provider_refusal":
+            return assembled(False)
+        tail = "".join(pieces)
+        continuation = [*old_base, {"role": "assistant", "content": tail}, _user(_CONTINUE)]
         legacy_hit = False
         try:
             if continuation_call is None:
@@ -79,25 +93,29 @@ def _complete(call, turns, instructions, *, initial=None, continuation_call=None
                                                      legacy_prompt if look_up_legacy else None)
                 look_up_legacy = legacy_hit
         except ModelIssue as exc:
-            prior = "".join(pieces)
             if exc.stage == "stream_empty":
-                return Result(prior, [], 0, False)
+                return assembled(False, reason=exc.stop_reason, stage=exc.stage)
             if exc.kind not in ("timeout", "context", "connection", "busy", "quota", "signin", "access_wait"):
                 raise
-            return Result(prior + "\n\n[Продолжение не завершено. " + exc.public() + "]", [], 0, False)
+            return assembled(False, reason=exc.stop_reason, stage=exc.stage,
+                             note="\n\n[Продолжение не завершено. " + exc.public() + "]")
 
+        parts.append(part)
         text = part.text
         stripped = text.strip()
         signature = hashlib.sha256(stripped.encode()).digest()
         if not stripped or signature in seen or stripped in tail:
-            return Result("".join(pieces), [], 0, False)
+            return assembled(False, reason="continuation_no_progress", stage="continuation")
         seen.add(signature)
         overlap = _overlap(tail, text)
-        separator = "\n"
+        # A provider limit can split a word, number or code token. The model sees
+        # the full prefix and must supply the exact continuation, including whitespace.
+        # Historical blocks used an inserted newline, so preserve that on replay only.
+        separator = "\n" if legacy_hit else ""
         if not legacy_hit and overlap >= 32:
             separator = ""
             text = text[overlap:]
             if not text.strip():
-                return Result("".join(pieces), [], 0, False)
+                return assembled(False, reason="continuation_no_progress", stage="continuation")
         pieces.extend((separator, text))
-    return Result("".join(pieces), [], 0, True)
+    return assembled(True)

@@ -78,6 +78,11 @@ class TestEndpoints:
             text = "42"
         elif self.prompts.DISPATCH in instructions:
             text = 'PSY_TASK {"minutes":60}'
+        elif instructions.startswith(self.quality._EXTRACT):
+            text = json.dumps(dict(task="write lecture", audience=None, topics=[], examples=[], format=None,
+                                   deliverables=[], constraints=[], obligations=["Complete lecture"], continuation=False,
+                                   superseded_requirements=[], kind="lecture", minutes=60,
+                                   outline_only=False, limited_scope=False, local_only=False))
         elif "Сейчас нужен внутренний редакционный" in instructions:
             plan = [{"title": f"Chapter {i}", "brief": "argument", "minutes": 15, "activity_minutes": 0}
                     for i in range(1, 5)]
@@ -141,7 +146,9 @@ async def exercise(home, patches):
                               reply_document=endpoints.receive_document, reply_text=notice)
 
     def compose(turns, *, research, model, question, checkpoints, **kwargs):
-        return pipeline._compose(None, turns, research, model, question, checkpoints=checkpoints)
+        return pipeline._compose(None, turns, research, model, question, checkpoints=checkpoints,
+                                 context_scope=kwargs.get("context_scope"), context_state=kwargs.get("context_state"),
+                                 input_budget_tokens=100000)
 
     def oauth_client(**kwargs):
         return httpx.Client(transport=httpx.MockTransport(endpoints.refuse_renewal))

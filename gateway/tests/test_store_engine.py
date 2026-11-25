@@ -69,6 +69,44 @@ class StoreEngine(unittest.TestCase):
             self.assertEqual(store._hermes_home(), Path("/home/hermes/.hermes"))
         self.assertEqual(store.ROOT.parts[-2:], ("vault", "group-psy"))
 
+    def test_history_retains_all_exchanges_and_full_text_in_original_message_order(self):
+        prompt = "x" * 3500 + " final requirement"
+        answer = "y" * 4500 + " final result"
+        # Completion order differs from incoming order, as it can after retries.
+        for mid in reversed(range(1, 12)):
+            store.remember(7, 3, prompt + str(mid), answer + str(mid), source_id=None,
+                           message_id=mid, root=self.root)
+        history = store.history(7, 3, source_id=None, before_message_id=11, root=self.root)
+        self.assertEqual(len(history), 20)
+        self.assertEqual(history[0], {"role": "user", "content": prompt + "1"})
+        self.assertEqual(history[-1], {"role": "assistant", "content": answer + "10"})
+        self.assertEqual(store.history(8, 3, source_id=None, root=self.root), [])
+        self.assertEqual(store.history(7, 4, source_id=None, root=self.root), [])
+        self.assertEqual(store.history(7, 3, source_id=99, root=self.root), [])
+
+    def test_compacted_context_is_scoped_and_future_state_cannot_enter_an_older_job(self):
+        first = {"summary": "first synthetic state"}
+        latest = {"summary": "latest synthetic state"}
+        store.save_context(7, 3, None, first, message_id=10, root=self.root)
+        store.save_context(7, 3, None, latest, message_id=20, root=self.root)
+        store.save_context(7, 3, None, first, message_id=15, root=self.root)
+        self.assertEqual(store.get_context(7, 3, None, before_message_id=21, root=self.root), latest)
+        self.assertIsNone(store.get_context(7, 3, None, before_message_id=20, root=self.root))
+        self.assertIsNone(store.get_context(7, 3, None, before_message_id=19, root=self.root))
+        for uid, topic, source in ((8, 3, None), (7, 4, None), (7, 3, 1)):
+            self.assertIsNone(store.get_context(uid, topic, source, root=self.root))
+
+    def test_deleted_document_cannot_leave_context_for_a_reused_id(self):
+        ident = store.archive(7, 3, "first.txt", "text", b"original", root=self.root)
+        store.save_context(7, 3, ident, {"summary": "private old material"}, message_id=10, root=self.root)
+        self.assertFalse(store.forget(8, 3, ident, root=self.root))
+        self.assertIsNotNone(store.get_context(7, 3, ident, root=self.root))
+        self.assertTrue(store.forget(7, 3, ident, root=self.root))
+        self.assertIsNone(store.get_context(7, 3, ident, root=self.root))
+        reused = store.archive(7, 3, "second.txt", "text", b"new", root=self.root)
+        self.assertEqual(reused, ident)
+        self.assertIsNone(store.get_context(7, 3, reused, root=self.root))
+
 
 if __name__ == "__main__":
     unittest.main()

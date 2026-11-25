@@ -22,6 +22,13 @@ def event(chat, uid, text="", *, typ=None, **fields):
 
 
 class TestGuard(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = store.database
+        self.enterContext(patch.object(store, "database", lambda root=store.ROOT:
+                          database(Path(directory.name) if root == store.ROOT else root)))
+
     async def test_matrix_and_commands(self):
         self.assertFalse(await route.intercept(None,event(route.OWNER,route.OWNER,"/model")))
         for uid in (route.OWNER, 42):

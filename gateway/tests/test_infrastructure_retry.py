@@ -11,6 +11,8 @@ import test_delivery_resume as harness
 from test_delivery_resume import queue, route, store
 from psy_modules import psy_group_client as codex, psy_group_codex as model
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from psy_modules import psy_group_quality as quality
+from task_contract_fixture import contract_json
 
 LOCKED = sqlite3.OperationalError("database is locked")
 
@@ -80,11 +82,15 @@ class InfrastructureRetry(unittest.IsolatedAsyncioTestCase):
 
         def stream(*args, instructions, on_progress=None, **kwargs):
             nonlocal dispatches
+            if quality._EXTRACT in instructions:
+                return model.Result(contract_json("write"), [], 0)
+            if quality._REVIEW in instructions:
+                return model.Result('{"complete":true,"missing":[]}', [], 0)
             if prompts.DISPATCH in instructions:
                 dispatches += 1
                 return model.Result("Первая часть.", [], 0, False)
             on_progress()
-            return model.Result("Вторая часть.", [], 0)
+            return model.Result("\nВторая часть.", [], 0)
 
         def run_model(turns, **opts):
             return pipeline._compose(None, turns, False, "fixture", opts["question"], checkpoints=opts["checkpoints"])

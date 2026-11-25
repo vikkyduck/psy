@@ -14,6 +14,14 @@ else:
     from psy_group_prompts import ATTRIBUTION, SYSTEM
 
 
+def _refused(result, phase, section=None):
+    if getattr(result, "stop_reason", None) != "provider_refusal":
+        return False
+    result.task_status = "refused"
+    result.quality_metadata.update(lecture_refusal_phase=phase, lecture_refusal_section=section)
+    return True
+
+
 def _lecture(call, turns, minutes, *, write_prose=None):
     # A real manuscript needs an explicit division of labour, with usable
     # examples and cross-references assigned once before parallel drafting.
@@ -33,6 +41,8 @@ def _lecture(call, turns, minutes, *, write_prose=None):
     plan = None
     for attempt in range(2):
         response = call(turns, planning)
+        if _refused(response, "planning"):
+            return response
         parsed = _json_value(response.text) if response.complete else None
         if _valid_plan(parsed, minutes):
             plan = parsed
@@ -60,6 +70,8 @@ def _lecture(call, turns, minutes, *, write_prose=None):
 Различай работу самого автора и позднейшие интерпретации.
 Не утверждай, что материал занимает заказанное время, лишь на основании таймкодов плана."""
         result = write_prose(draft_turns, instruction)
+        if _refused(result, "writing", index + 1):
+            return result
         if not result.complete:
             return result
         # Review the actual manuscript in the context of the original request.
@@ -72,6 +84,8 @@ def _lecture(call, turns, minutes, *, write_prose=None):
 Если раздел закончен по существу, верни строго JSON {{"missing":""}}. Если конкретное обязательство
 по плану пропущено или лишь объявлено, верни {{"missing":"что именно требуется развернуть"}}.
 Не придумывай пожеланий сверх запроса. Не суди по длине и не выводи длительность чтения.""")
+            if _refused(review, "review", index + 1):
+                return review
             verdict = _json_value(review.text) if review.complete else None
             if not isinstance(verdict, dict) or not isinstance(verdict.get("missing"), str):
                 raise ModelIssue("unavailable", "lecture_review")
@@ -81,6 +95,8 @@ def _lecture(call, turns, minutes, *, write_prose=None):
                     "Напиши только недостающий фрагмент в форме речи преподавателя. "
                     "Дополнение должно читаться сразу после готового текста, без повтора и служебных отметок. "
                     "Вопрос для раскрытия:\n" + missing)], SYSTEM + "\n" + ATTRIBUTION, previous_chapter=result.text)
+                if _refused(supplement, "supplement", index + 1):
+                    return supplement
                 addition = supplement.text.strip()
                 if not addition or addition in result.text:
                     raise ModelIssue("unavailable", "lecture_supplement")
@@ -104,6 +120,8 @@ def _lecture(call, turns, minutes, *, write_prose=None):
             parts.append(None)
             missing.append("Раздел не сформирован: " + sections[len(parts) - 1]["title"])
         else:
+            if getattr(result, "stop_reason", None) == "provider_refusal":
+                return result
             parts.append(result.text)
             complete &= result.complete
             if not result.complete:

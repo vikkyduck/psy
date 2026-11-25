@@ -19,6 +19,7 @@ import argparse
 from contextlib import ExitStack
 import hashlib
 import importlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -48,7 +49,93 @@ SYNTHETIC_MATERIAL = """Учебный материал, полностью вы
 данных, предлагать альтернативы и выбирать следующий способ проверки.
 Не приписывай участникам диагнозы, биографии и несуществующие реплики."""
 
+
+def synthetic_exchange(question, answer):
+    return [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+
+
+def memory_history(*, expanded=False):
+    """Identical, fixed participant input for both variants, never real history."""
+    history = synthetic_exchange(
+        "Учебный вымышленный проект: подготовить внутреннюю памятку. Бюджет 120000 рублей, "
+        "срок шесть недель. В команде редактор, аналитик и дизайнер. Итог оформляй таблицей "
+        "с колонками Этап, Ответственный, Срок.",
+        "Зафиксирован учебный проект памятки с указанными ресурсами и форматом.")
+    history += synthetic_exchange(
+        "Исправление к этому проекту: бюджет теперь 90000 рублей, срок четыре недели. "
+        "Дизайнера исключаем. В итоговой таблице замени колонку Срок на Критерий приемки. "
+        "Остальные условия сохраняются.",
+        "Актуальные ограничения обновлены. Редактор и аналитик остаются в команде.")
+    filler = ("This is a synthetic discussion note, not a new requirement. We distinguished a planned "
+              "activity from a verified result, kept assumptions visible, and treated examples as examples. "
+              "No dates, budgets, roles, table columns or deadlines were changed by this note. "
+              "A test can check an observable condition without proving every future outcome. "
+              "Previous explicit corrections remain the participant's current instructions. ")
+    filler += "Synthetic row labels without project requirements: " + " ".join(f"{index:03d}" for index in range(256))
+    for number in range(1, 9):
+        history += synthetic_exchange(
+            f"Уточнение {number}: объясни на одном учебном примере разницу между действием и проверяемым результатом. "
+            "Условия проекта не меняй.",
+            (f"Пример {number}: написать черновик - действие, согласованный текст - проверяемый результат. "
+             + (filler if expanded else "Условия проекта сохранены.")))
+    return history
+
 CASES = {
+    "ordinary_multipart": {
+        "question": "Реши полностью учебную задачу без внешних источников. Проданы 80 наборов по 120 рублей. "
+                    "Переменные затраты 45 рублей на набор, постоянные затраты 3000 рублей. "
+                    "Посчитай выручку, переменные затраты, общие затраты и прибыль. Затем найди минимальное "
+                    "целое число наборов для безубыточности. Покажи формулы, объясни допущение о постоянной "
+                    "цене и затратах, напиши функцию Python profit(units), а после нее два проверочных assert "
+                    "для 40 и 80 наборов. Последнее предложение: что произойдет с прибылью при продаже 39 наборов.",
+        "review_checks": ["Выручка 9600, переменные затраты 3600, общие затраты 6600, прибыль 3000 рублей.",
+                          "Безубыточность 40 наборов. profit(40)=0, profit(80)=3000, profit(39)=-75.",
+                          "Есть формулы, допущение, исполнимая функция и два требуемых assert, выполнено последнее предложение."],
+    },
+    "project_plan": {
+        "question": "Подготовь законченный рабочий план учебного вымышленного проекта переноса внутренней "
+                    "базы знаний за четыре недели. Работают редактор и инженер, у каждого не более 12 часов "
+                    "в неделю. В базе 60 одинаковых по трудоемкости статей. На инвентаризацию одной статьи "
+                    "редактору нужно 10 минут, на правку 20 минут. Инженеру нужно 8 часов на настройку, "
+                    "2 часа на перенос каждой партии из 20 статей и 6 часов на финальную проверку. "
+                    "Настройка предшествует переносу, статьи исправляются до переноса, итоговая проверка "
+                    "идет после всех трех партий. Без веба и выдуманных условий. Дай план по неделям, "
+                    "нагрузку каждого по неделям и всего, зависимости, четыре риска с действиями, критерии "
+                    "приемки и готовый текст короткого сообщения команде о запуске. Проверь реализуемость "
+                    "плана в заданной доступности и явно покажи расчеты.",
+        "review_checks": ["Редактор: 10 часов инвентаризации и 20 часов правки, всего 30 часов.",
+                          "Инженер: 8+6+6=20 часов, ни у кого не больше 12 часов в отдельную неделю.",
+                          "Порядок настройки, правки партий, переноса и проверки соблюден. Все 60 статей охвачены.",
+                          "Есть четыре предметных риска с действиями, критерии приемки и готовое сообщение команде."],
+    },
+    "memory_update8": {
+        "history": memory_history(),
+        "question": "Собери итоговую компактную таблицу плана памятки по действующим условиям этой переписки. "
+                    "Перед таблицей укажи актуальные бюджет, срок и состав команды. Условия заново не спрашивай, "
+                    "внешние источники не нужны.",
+        "review_checks": ["После восьми обменов сохранены бюджет 90000 рублей, срок четыре недели, редактор и аналитик.",
+                          "В итоговой таблице колонки Этап, Ответственный, Критерий приемки.",
+                          "Дизайнер, бюджет 120000, срок шесть недель и колонка Срок не возвращаются как действующие."],
+    },
+    "memory_cancel_topic": {
+        "history": memory_history() + synthetic_exchange(
+            "Задачу памятки закрываем. Все ее ограничения и требование отвечать таблицей отменяю для следующих тем.",
+            "Задача закрыта, ее условия не относятся к новым темам."),
+        "question": "Новая тема. Объясни школьнику, почему в десятичной записи 0,5 равно 1/2. "
+                    "Нужен один связный абзац из трех предложений с бытовым примером, без таблицы и без источников.",
+        "review_checks": ["Один абзац из трех предложений, корректное объяснение 5/10=1/2 и бытовой пример.",
+                          "Нет таблицы и переноса бюджета, команды, сроков или памятки из закрытого проекта."],
+    },
+    "memory_compacted": {
+        "history": memory_history(expanded=True),
+        "question": "Назови только действующие бюджет, срок, роли и названия колонок итоговой таблицы проекта памятки. "
+                    "Ничего не меняй и не спрашивай заново. Без внешних источников.",
+        "context_input_budget_tokens": 4096,
+        "review_checks": ["Точные действующие условия: 90000 рублей, четыре недели, редактор и аналитик.",
+                          "Колонки Этап, Ответственный, Критерий приемки. Прежние значения не восстановлены.",
+                          "Технический допуск отдельно: у кандидата context_audit.compacted_messages > 0. "
+                          "Это стресс сжатия при тестовом бюджете 4096, а не проверка реального размера окна."],
+    },
     "short": {
         "question": "Объясни разницу между наблюдением и интерпретацией на одном вымышленном примере. "
                     "Ответ из трех предложений, без внешних источников.",
@@ -247,7 +334,9 @@ def recovery_manifest(case, variant, module_dir, *, model=None, historical_attem
             "input_sha256": hashlib.sha256(encoded).hexdigest(),
             "source_sha256": module_hashes(Path(module_dir)), "model_requested": model,
             "historical_attempts": historical_attempts or [], "resumed_from": resumed_from,
-            "source_policy": source_policy}
+            "source_policy": source_policy,
+            "context_policy": {"synthetic_history_messages": len(CASES[case].get("history", [])),
+                               "test_input_budget_tokens": CASES[case].get("context_input_budget_tokens")}}
 
 
 def read_private_file(path, *, limit):
@@ -279,9 +368,10 @@ def validate_recovery_database(path):
     allowed = {"instance_binding", "model_retries", "auth_recoveries", "model_attempts", "requests",
                "schedule", "source_events", "turn_order", "job_progress", "checkpoints", "write_receipts",
                "delivery_parts", "completed_updates", "documents", "turns", "turn_results", "turn_sources",
-               "message_sources", "current_sources"}
+               "message_sources", "current_sources", "request_audit", "request_audit_events",
+               "conversation_context"}
     nonempty = {"instance_binding", "model_retries", "model_attempts", "requests", "schedule",
-                "job_progress", "checkpoints"}
+                "job_progress", "checkpoints", "request_audit", "request_audit_events"}
     with sqlite3.connect(str(path)) as connection:
         connection.execute("PRAGMA trusted_schema=OFF")
         connection.execute("PRAGMA query_only=ON")
@@ -312,6 +402,18 @@ def validate_recovery_database(path):
         if "instance_binding" in tables and connection.execute("SELECT * FROM instance_binding").fetchall() not in (
                 [], [(1, group_example.BOT, group_example.GROUP)]):
             raise ValueError("recovery is bound to another instance")
+        if "request_audit" in tables:
+            for key, uid, topic, message_id, provenance, turn_id in connection.execute(
+                    "SELECT request_key,uid,topic,message_id,provenance,turn_id FROM request_audit"):
+                if ((key, uid, topic, message_id, turn_id) !=
+                        ("update:" + str(group_example.UPDATE), group_example.MEMBER, 1, group_example.INCOMING, None)):
+                    raise ValueError("recovery audit is not the synthetic composition job")
+                json.loads(provenance)
+        if "request_audit_events" in tables:
+            for key, details in connection.execute("SELECT request_key,details FROM request_audit_events"):
+                if key != "update:" + str(group_example.UPDATE):
+                    raise ValueError("recovery audit event belongs to another request")
+                json.loads(details)
         count = 0
         for key, value in connection.execute("SELECT key,value FROM checkpoints"):
             if not (key.startswith("model:") or key.startswith("prose:")):
@@ -333,6 +435,9 @@ def restore_recovery(args, fixture, output):
     expected = recovery_manifest(args.case, args.variant, args.module_dir)
     if any(manifest.get(key) != expected[key] for key in ("format", "case", "variant", "input_sha256", "source_sha256")):
         raise ValueError("recovery provenance does not match the selected case and source version")
+    if (("context_policy" in manifest or CASES[args.case].get("history"))
+            and manifest.get("context_policy") != expected["context_policy"]):
+        raise ValueError("recovery context policy does not match the selected case")
     database = read_private_file(path / "group.sqlite3", limit=64 * 1024 * 1024)
     if not database.startswith(b"SQLite format 3\0"):
         raise ValueError("recovery is not SQLite")
@@ -375,11 +480,25 @@ def claim_after_wait(store, fixture, *, sleep=None):
         return
 
 
+def composition_options(codex, case):
+    """Exercise context only when supported, without patching legacy model behavior."""
+    parameters = inspect.signature(codex.respond).parameters
+    options = {}
+    if "context_scope" in parameters:
+        options["context_scope"] = {"uid": group_example.MEMBER, "topic": 1, "source_id": None}
+        if "context_input_budget_tokens" in case:
+            if "input_budget_tokens" not in parameters:
+                raise ValueError("candidate does not expose the isolated context budget")
+            options["input_budget_tokens"] = case["context_input_budget_tokens"]
+    return options
+
+
 def compose_with_retries(codex, store, fixture, checkpoints, case, model, attempts, history, snapshot):
+    options = composition_options(codex, case)
     for attempt in range(1, attempts + 1):
         try:
             return codex.respond(case_turns(case), research=False, draw=False,
-                                 model=model, question=case["question"], checkpoints=checkpoints)
+                                 model=model, question=case["question"], checkpoints=checkpoints, **options)
         except codex.ModelIssue as error:
             record = {"attempt": attempt, "kind": error.kind, "stage": error.stage,
                       "retryable": bool(error.retryable), "failed_at": time.time()}
@@ -410,10 +529,33 @@ def selected_modules(directory):
 
 
 def case_turns(case):
+    history = []
+    for message in case.get("history", []):
+        if message.get("role") not in ("user", "assistant") or not isinstance(message.get("content"), str):
+            raise ValueError("case history must contain fixed user/assistant text")
+        history.append({"role": message["role"], "content": message["content"]})
     content = [{"type": "input_text", "text": case["question"]}]
     if case.get("material"):
         content.append({"type": "input_text", "text": "Материал: Synthetic teaching case.txt\n" + case["material"]})
-    return [{"role": "user", "content": content}]
+    return [*history, {"role": "user", "content": content}]
+
+
+def blind_review(case, text):
+    """Full common input and answer, without implementation/version/expected result."""
+    history = ""
+    if case.get("history"):
+        history = "Предшествующий синтетический диалог\n" + "\n\n".join(
+            ("Участник: " if message["role"] == "user" else "Ассистент: ") + message["content"]
+            for message in case["history"]) + "\n\n"
+    return (history + "Задание\n" + case["question"] + "\n\n" +
+            ("Учебный материал: Synthetic teaching case.txt\n" + case["material"] + "\n\n" if case.get("material") else "") +
+            "Ответ\n" + text + "\n")
+
+
+def safe_quality_metadata(result):
+    """The private compacted conversation is neither a grade nor technical metadata."""
+    return {key: value for key, value in getattr(result, "quality_metadata", {}).items()
+            if key != "context_state"}
 
 
 def fixture_job(store, fixture, *, resumed=False):
@@ -444,6 +586,10 @@ def evaluate(args, fixture, guard):
     evidence = importlib.import_module(package + ".psy_source_evidence")
     store = importlib.import_module(package + ".psy_group_store")
     codex = importlib.import_module(package + ".psy_group_codex")
+    tokenizer = None
+    if (args.module_dir / "psy_group_context.py").is_file():
+        context = importlib.import_module(package + ".psy_group_context")
+        tokenizer = context.prepare_tokenizer()
     import hermes_cli.config as config
     model = config.load_config_readonly()["model"]
     if model.get("provider") != "openai-codex":
@@ -474,6 +620,7 @@ def evaluate(args, fixture, guard):
         raise group_example.IsolationViolation("unexpected network attempt during composition")
     hashes = module_hashes(args.module_dir)
     metadata = {"case": args.case, "variant": args.variant, "real_codex": True,
+                "tokenizer": tokenizer,
                 "provider": model["provider"], "model_requested": model["default"],
                 "composition_only": True, "delivery_tested": False, "real_telegram_requests": 0,
                 "synthetic_inputs_only": True, "temporary_database_verified": True,
@@ -489,7 +636,10 @@ def evaluate(args, fixture, guard):
                 "generation_complete": generation_complete(result),
                 "task_status": getattr(result, "task_status", "unknown"),
                 "missing_requirements": getattr(result, "missing_requirements", []),
-                "quality_metadata": getattr(result, "quality_metadata", {}),
+                "quality_metadata": safe_quality_metadata(result),
+                "history_messages": len(case.get("history", [])),
+                "context_options": composition_options(codex, case),
+                "context_test_budget_only": case.get("context_input_budget_tokens"),
                 "characters": len(result.text), "word_count": len(result.text.split()),
                 "source_sha256": hashes, "retry_history": args.retry_history,
                 "resumed_from": args.resumed_from}
@@ -517,7 +667,7 @@ def main():
     actual_home = Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes")).resolve()
     repository = Path(__file__).resolve().parents[2]
     output = private_output(args.output_root, (actual_home, args.checkout, args.module_dir, repository))
-    for name in ("review", "keys", "recovery"):
+    for name in ("review", "keys", "recovery", "grading"):
         destination = output / name
         destination.mkdir(mode=0o700, exist_ok=True)
         private_output(destination, (actual_home, args.checkout, args.module_dir, repository))
@@ -562,10 +712,13 @@ def main():
             metadata["storage_audit"] = audit
             metadata["dependency_environment"] = str(environment.resolve())
         case = CASES[args.case]
-        review = ("Задание\n" + case["question"] + "\n\n" +
-                  ("Учебный материал: Synthetic teaching case.txt\n" + case["material"] + "\n\n" if case.get("material") else "") +
-                  "Ответ\n" + text + "\n")
+        review = blind_review(case, text)
         write_private(output / "review" / (label + ".txt"), review)
+        grading = {"label": label, "checks": case.get("review_checks", []),
+                   "dimensions": ["выполнение задания", "точность", "глубина", "связность", "язык", "границы интерпретации"],
+                   "blockers": ["выдуманная цитата или атрибуция", "частичный результат выдан за полный"],
+                   "status": "not_reviewed"}
+        write_private(output / "grading" / (label + ".json"), json.dumps(grading, ensure_ascii=False, indent=2) + "\n")
         metadata.update(label=label, status="generated", started_at=started,
                         elapsed_seconds=round(time.time() - started, 2))
         write_private(output / "keys" / (label + ".json"), json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")

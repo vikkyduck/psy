@@ -367,6 +367,57 @@ class QualityOutputTests(unittest.TestCase):
         result.quality_metadata["generation_audit"]["generation_complete"] = None
         self.assertIsNone(quality.generation_complete(result))
 
+    def test_history_inputs_are_complete_fixed_and_do_not_contain_grading_answers(self):
+        case = quality.CASES["memory_update8"]
+        turns = quality.case_turns(case)
+        self.assertEqual(len(turns), 21)
+        self.assertEqual(turns[:-1], case["history"])
+        self.assertIn("90000", turns[2]["content"])
+        self.assertEqual(sum(item["role"] == "user" for item in turns[4:-1]), 8)
+        self.assertNotIn("review_checks", json.dumps(turns))
+        self.assertNotIn(case["review_checks"][0], json.dumps(turns, ensure_ascii=False))
+        turns[0]["content"] = "mutated local copy"
+        self.assertNotEqual(case["history"][0]["content"], "mutated local copy")
+
+    def test_baseline_and_candidate_get_identical_input_but_only_candidate_context_options(self):
+        def baseline(turns, *, research=False, draw=False, model=None, question=None, checkpoints=None):
+            pass
+        def candidate(turns, *, research=False, draw=False, model=None, question=None, checkpoints=None,
+                      context_scope=None, input_budget_tokens=None):
+            pass
+        case = quality.CASES["memory_compacted"]
+        self.assertEqual(quality.composition_options(SimpleNamespace(respond=baseline), case), {})
+        options = quality.composition_options(SimpleNamespace(respond=candidate), case)
+        self.assertEqual(options["input_budget_tokens"], 4096)
+        self.assertEqual(options["context_scope"]["uid"], group_example.MEMBER)
+        self.assertEqual(quality.case_turns(case), quality.case_turns(case))
+        self.assertNotIn("input_budget_tokens", quality.composition_options(
+            SimpleNamespace(respond=candidate), quality.CASES["memory_update8"]))
+
+    def test_candidate_must_expose_test_budget_instead_of_silently_skipping_compaction(self):
+        def candidate(turns, *, context_scope=None):
+            pass
+        with self.assertRaisesRegex(ValueError, "isolated context budget"):
+            quality.composition_options(SimpleNamespace(respond=candidate), quality.CASES["memory_compacted"])
+
+    def test_blind_review_contains_history_without_version_or_expected_answer(self):
+        case = quality.CASES["memory_cancel_topic"]
+        review = quality.blind_review(case, "Synthetic answer")
+        self.assertIn(case["history"][2]["content"], review)
+        self.assertIn(case["question"], review)
+        self.assertIn("Synthetic answer", review)
+        self.assertNotIn(case["review_checks"][0], review)
+        self.assertNotIn("candidate", review)
+        self.assertNotIn("baseline", review)
+
+    def test_context_plaintext_is_removed_from_metadata_without_mutating_result(self):
+        result = SimpleNamespace(quality_metadata={"context_state": {"memory": "private synthetic text"},
+                                                  "context_audit": {"compacted_messages": 20}})
+        safe = quality.safe_quality_metadata(result)
+        self.assertNotIn("private synthetic text", json.dumps(safe))
+        self.assertEqual(safe["context_audit"], {"compacted_messages": 20})
+        self.assertIn("context_state", result.quality_metadata)
+
     def test_temporary_job_is_claimed_before_deep_admission(self):
         path = Path(__file__).resolve().parents[2] / "gateway/plugins/platforms/telegram/psy_group_store.py"
         spec = importlib.util.spec_from_file_location("quality_fixture_store", path)
@@ -442,6 +493,13 @@ class RecoveryTests(unittest.TestCase):
         with sqlite3.connect(snapshot / "group.sqlite3") as connection:
             connection.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,1,'synthetic','synthetic')",
                                (group_example.MEMBER,))
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_with_foreign_audit_owner_or_request_is_rejected(self):
+        snapshot = self.snapshot()
+        with sqlite3.connect(snapshot / "group.sqlite3") as connection:
+            connection.execute("UPDATE request_audit SET topic=99")
         with self.assertRaises(ValueError):
             self.restore()
 

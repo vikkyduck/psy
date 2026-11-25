@@ -1,6 +1,7 @@
 import json, unittest, time
 from unittest.mock import patch, Mock
 from contextlib import nullcontext
+from task_contract_fixture import contract_json
 from psy_modules import psy_group_client as codex, psy_group_codex as m
 
 
@@ -11,14 +12,22 @@ class Incident(unittest.TestCase):
     def test_model_decides_even_when_included_window_is_full(self):
         import sys
         from types import ModuleType
-        response=Mock(status_code=200)
-        response.iter_lines.return_value=[
-            'data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"ok"}]}}',
-            'data: {"type":"response.completed"}']
         client=Mock()
         client.get.return_value.json.return_value={"rate_limit":{"allowed":False,"secondary_window":{"used_percent":100}},
                                                   "credits":{"has_credits":True}}
-        client.stream.return_value=nullcontext(response)
+        def stream(*args, **kwargs):
+            instructions = kwargs["json"]["instructions"]
+            if "До написания ответа составь внутреннюю карту" in instructions:
+                text = contract_json("test")
+            elif "Проверь выполнение исходного заказа" in instructions:
+                text = '{"complete":true,"missing":[]}'
+            else:
+                text = "ok"
+            event = {"type": "response.completed", "response": {"output": [
+                {"type": "message", "content": [{"type": "output_text", "text": text}]}]}}
+            response=Mock(status_code=200, iter_lines=lambda: ["data: " + json.dumps(event)])
+            return nullcontext(response)
+        client.stream.side_effect=stream
         from unittest.mock import MagicMock
         httpx=MagicMock()
         httpx.Client.return_value=nullcontext(client)
@@ -32,7 +41,7 @@ class Incident(unittest.TestCase):
             self.assertEqual(m._respond([{"role":"user","content":"test"}],research=False,draw=False,model="test").text,"ok")
         client.get.assert_not_called()
         self.assertEqual(client.stream.call_args.args,("POST",m.ENDPOINT+"/responses"))
-        self.assertEqual(client.stream.call_count,1)
+        self.assertEqual(client.stream.call_count,3)
 
     def test_stream_and_http_quota(self):
         for status in (200,429):

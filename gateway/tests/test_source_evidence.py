@@ -10,7 +10,9 @@ from unittest.mock import patch
 from psy_modules import psy_group_client as codex, psy_group_codex as model
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 from psy_modules import psy_group_sources as sources
+from psy_modules import psy_group_quality as quality
 from psy_modules import psy_source_evidence as evidence
+from task_contract_fixture import contract_json
 
 
 URL = "https://archive.example/actual"
@@ -50,6 +52,10 @@ class Evidence(unittest.TestCase):
     def test_single_turn_model_topic_never_escapes(self):
         question = "Сравни случай Условный Маркер Сосна с вытеснением у Фрейда"
         def stream(client, headers, turns, web, model_id, *, instructions, **kw):
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json(question), [], 0)
+            if instructions == quality._REVIEW:
+                return model.Result('{"complete":true,"missing":[]}', [], 0)
             if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"public_topic":"Условный Маркер Сосна, вытеснение"}', [], 0)
             return model.Result("Ответ", [], 0)
@@ -75,7 +81,10 @@ class Evidence(unittest.TestCase):
 
     def test_unknown_requested_research_asks_for_release_instead_of_inventing_sources(self):
         question = "Разбери Условный Маркер"
-        stream = lambda *args,**kwargs: model.Result('PSY_TASK {"public_topic":"Условный Маркер"}', [], 0)
+        def stream(*args, instructions, **kwargs):
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json(question), [], 0)
+            return model.Result('PSY_TASK {"public_topic":"Условный Маркер"}', [], 0)
         with (patch.object(codex,"_transport",nullcontext),patch.object(codex,"_stream",stream),
               patch.object(codex,"_connection",return_value=("fixture",{}, "fixture-generation")),
               patch.object(pipeline,"_primary_sources") as search):

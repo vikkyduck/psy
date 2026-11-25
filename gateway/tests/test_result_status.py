@@ -141,7 +141,7 @@ class ResultRoute(unittest.IsolatedAsyncioTestCase):
 
 
 class GenerationAudit(unittest.TestCase):
-    def test_silent_cut_fallback_persists_across_resume_and_audit_replay(self):
+    def test_silent_cut_retries_at_maximum_and_retains_attempt_audit(self):
         for silent in (client.SILENT_CUT_SECONDS - 1, client.SILENT_CUT_SECONDS,
                        client.SILENT_CUT_SECONDS + 1):
             with self.subTest(silent=silent), tempfile.TemporaryDirectory() as directory:
@@ -150,8 +150,8 @@ class GenerationAudit(unittest.TestCase):
                 self.assertEqual(store.claim_next(root=root)[0], 55)
                 cp = store.Checkpoints(55, root=root)
                 turns = [client._user("private synthetic manuscript")]
-                first_key = client._stage_key("fixture", turns, "first section", prose=False)
-                second_key = client._stage_key("fixture", turns, "second section", prose=False)
+                first_key = client._stage_key("gpt-6.1-sol", turns, "first section", prose=False)
+                second_key = client._stage_key("gpt-6.1-sol", turns, "second section", prose=False)
                 interruption = client.ModelIssue("timeout", "stream")
                 interruption.silent = silent
                 seen = []
@@ -165,7 +165,7 @@ class GenerationAudit(unittest.TestCase):
                 with patch.object(client, "_transport", nullcontext), \
                         patch.object(client, "_authenticated_request", side_effect=lambda invoke: invoke("", {})), \
                         patch.object(client, "_stream", side_effect=stream):
-                    call, _ = client._job_calls(None, "fixture", cp)
+                    call, _ = client._job_calls(None, "gpt-6.1-sol", cp)
                     call.deep = True
                     first = call(turns, "first section")
                     with self.assertRaises(client._ResumeModelJob) as deferred:
@@ -180,15 +180,15 @@ class GenerationAudit(unittest.TestCase):
                                             ("second section", client.DEEP_EFFORT)])
                     self.assertIsNone(cp.get(second_key))
                     original = cp.get(first_key)
-                    fallback = silent >= client.SILENT_CUT_SECONDS
-                    expected_mark = {"silent_cuts": 1} if fallback else None
+                    fallback = False
+                    expected_mark = None
                     self.assertEqual(cp.get(client.EFFORT_MARK), expected_mark)
 
-                    # A new job instance reads the persisted mark and reuses completed work.
+                    # Resume reuses work and failure evidence without reducing effort.
                     store.recover(root=root)
                     self.assertEqual(store.claim_next(root=root)[0], 55)
                     cp = store.Checkpoints(55, root=root)
-                    resumed, _ = client._job_calls(None, "fixture", cp)
+                    resumed, _ = client._job_calls(None, "gpt-6.1-sol", cp)
                     resumed.deep = True
                     self.assertEqual(resumed(turns, "first section").text, first.text)
                     second = resumed(turns, "second section")
@@ -207,7 +207,7 @@ class GenerationAudit(unittest.TestCase):
                 self.assertEqual(audit["stages"], 2)
                 self.assertEqual(audit["replayed_stages"], 1)
                 self.assertTrue(audit["generation_complete"])
-                replay, _ = client._job_calls(None, "fixture", store.Checkpoints(55, root=root))
+                replay, _ = client._job_calls(None, "gpt-6.1-sol", store.Checkpoints(55, root=root))
                 replay.deep = True
                 with patch.object(client, "_authenticated_request", side_effect=AssertionError("network forbidden")):
                     self.assertEqual(replay(turns, "first section").quality_metadata,
@@ -215,7 +215,12 @@ class GenerationAudit(unittest.TestCase):
                     self.assertEqual(replay(turns, "second section").quality_metadata,
                                      second.quality_metadata)
                 replayed_audit = replay.audit()["generation_audit"]
-                self.assertEqual(replayed_audit, dict(audit, replayed_stages=2))
+                self.assertEqual(replayed_audit["replayed_stages"], 2)
+                self.assertEqual(replayed_audit["failed_attempts"], audit["failed_attempts"])
+                self.assertEqual(len(replayed_audit["failed_attempts"]), 1)
+                self.assertEqual(replayed_audit["failed_attempts"][0]["stop_reason"], "timeout")
+                for before, after in zip(audit["stage_records"], replayed_audit["stage_records"]):
+                    self.assertEqual(after, dict(before, replayed=True))
                 self.assertNotIn("private synthetic manuscript", str(replayed_audit))
                 self.assertNotIn("saved first section", str(replayed_audit))
 
@@ -233,7 +238,7 @@ class GenerationAudit(unittest.TestCase):
         with patch.object(client, "_authenticated_request", side_effect=AssertionError("network forbidden")):
             call(turns, "instruction")
         audit = call.audit()
-        self.assertEqual(audit["generation_audit"]["effort_counts"], {client.QUICK_EFFORT: 1})
+        self.assertEqual(audit["generation_audit"]["effort_counts"], {client._maximum_effort("fixture"): 1})
         self.assertEqual(audit["generation_audit"]["replayed_stages"], 1)
         original_time = next(iter(cp.values()))["generation_metadata"]["generated_at"]
         self.assertEqual(audit["generation_audit"]["first_generated_at"], original_time)

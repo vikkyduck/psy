@@ -1,5 +1,6 @@
-"""Recover a pre-upgrade, unfinished chapter supplement from only its v1 request hashes."""
+"""Recover old v1 continuation blocks independently of changed task-extraction prompts."""
 from contextlib import nullcontext
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 from psy_modules import psy_group_lecture as lecture, psy_group_pipeline as pipeline
 from psy_modules import psy_group_prompts as prompts, psy_group_quality as quality
+from psy_modules import psy_group_continuation as continuation
 
 
 MODEL = "fixture"
@@ -73,7 +75,7 @@ def v1_lecture(checkpoints, turns, parts):
 
 
 class LegacyContinuation(unittest.TestCase):
-    def test_recovers_each_v1_supplement_without_resending_the_chapter(self):
+    def test_recovers_each_v1_supplement_with_full_context_for_new_work(self):
         question = "Write a lecture"
         turns = [codex._user(question)]
         parts = [f"Supplement {i}|" + str(i) * 3600 + f"|end {i}." for i in range(1, 5)]
@@ -97,18 +99,21 @@ class LegacyContinuation(unittest.TestCase):
             with patch.object(codex, "_transport", nullcontext), \
                     patch.object(codex, "_authenticated_request", side_effect=lambda send: send("fixture", {})), \
                     patch.object(codex, "_stream", side_effect=endpoint):
-                result = pipeline._compose(None, turns, False, MODEL, question,
-                                           checkpoints=store.Checkpoints(17, root=root))
+                call, continue_call = codex._job_calls(None, MODEL, store.Checkpoints(17, root=root))
+                write = partial(continuation._complete, partial(call, prose=True), model=MODEL,
+                                continuation_call=continue_call)
+                result = lecture._lecture(call, turns, 30, write_prose=write)
+                result = quality.finish_task(call, write, turns, prompts.SYSTEM, result, quality.contract_for(question))
 
         self.assertTrue(result.complete)
         self.assertEqual(result.task_status, "complete")
-        self.assertIn(CHAPTER + "\n\n" + "\n".join(parts + ["A new ending."]), result.text)
+        self.assertIn(CHAPTER + "\n\n" + "\n".join(parts) + "A new ending.", result.text)
         self.assertEqual(len(sent), 1)
         self.assertIn("|end 4.", str(sent[0]))
-        self.assertNotIn("chapter-start|", str(sent[0]))
-        self.assertNotIn("Supplement 1|", str(sent[0]))
-        # The bounded continuation keeps its old window. A separate semantic
-        # check intentionally sees the completed manuscript, not another draft.
+        self.assertIn("chapter-start|", str(sent[0]))
+        self.assertIn("Supplement 1|", str(sent[0]))
+        # Historical blocks preserve their original joins. New continuation and
+        # the separate semantic review both see the complete available text.
         self.assertEqual(len(task_reviews), 1)
         self.assertIn(CHAPTER, str(task_reviews[0]))
         self.assertIn("Supplement 1|", str(task_reviews[0]))

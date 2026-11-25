@@ -25,9 +25,21 @@ AUTH_WAITS = ("signin", "access_wait")
 # Several worker threads and the operator CLI share one file. A writer waits for the
 # lock instead of failing a job after a short contention spike.
 BUSY_SECONDS = 30
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
+            CREATE TABLE IF NOT EXISTS request_audit (
+              request_key TEXT PRIMARY KEY, uid INTEGER NOT NULL, topic INTEGER NOT NULL,
+              message_id INTEGER, started REAL NOT NULL, updated REAL NOT NULL,
+              state TEXT NOT NULL, provenance TEXT NOT NULL, turn_id INTEGER);
+            CREATE TABLE IF NOT EXISTS request_audit_events (
+              id INTEGER PRIMARY KEY, request_key TEXT NOT NULL REFERENCES request_audit(request_key),
+              recorded REAL NOT NULL, event TEXT NOT NULL, details TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS audit_events_request ON request_audit_events(request_key,id);
+            CREATE TABLE IF NOT EXISTS conversation_context (
+              uid INTEGER NOT NULL, topic INTEGER NOT NULL, source_key INTEGER NOT NULL,
+              before_message_id INTEGER NOT NULL, state TEXT NOT NULL,
+              PRIMARY KEY(uid,topic,source_key));
             CREATE TABLE IF NOT EXISTS instance_binding (
               singleton INTEGER PRIMARY KEY CHECK(singleton=1), bot INTEGER NOT NULL, chat INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS model_retries (
@@ -286,6 +298,8 @@ def forget(uid, topic, ident, *, root=ROOT, request_key=None):
             con.execute(f"UPDATE {table} SET doc_id=NULL WHERE uid=? AND topic=? AND doc_id=?", (uid, topic, ident))
         con.execute("""UPDATE turn_sources SET doc_id=? WHERE doc_id=? AND turn_id IN
                        (SELECT id FROM turns WHERE uid=? AND topic=?)""", (-ident, ident, uid, topic))
+        con.execute("DELETE FROM conversation_context WHERE uid=? AND topic=? AND source_key=?",
+                    (uid, topic, ident))
         _record_write(con, request_key, topic, "deletion", ident)
     try:
         # Drop the deleted bytes from the -wal file too. A busy reader only postpones this.
@@ -366,16 +380,85 @@ def history(uid, topic, *, source_id=Ellipsis, exclude_turn=None, root=ROOT, bef
             query += """ AND t.id IS NOT ? AND EXISTS (SELECT 1 FROM turn_sources s
                          WHERE s.turn_id=t.id AND s.doc_id IS ?)"""
             args += (exclude_turn, source_id)
-        rows = con.execute(query + f" ORDER BY {_TURN_ORIGIN} DESC,t.id DESC LIMIT 6", args).fetchall()
+        rows = con.execute(query + f" ORDER BY {_TURN_ORIGIN},t.id", args).fetchall()
     turns = []
-    for i, (prompt, answer) in enumerate(reversed(rows)):
-        turns.append({"role": "user", "content": prompt[:3000]})
-        latest_source_answer = source_id not in (None, Ellipsis) and exclude_turn is None and i == len(rows)-1
-        turns.append({"role": "assistant", "content": answer if latest_source_answer else answer[:4000]})
+    for prompt, answer in rows:
+        turns.append({"role": "user", "content": prompt})
+        turns.append({"role": "assistant", "content": answer})
     return turns
 
 
-RESULT_STATUSES = frozenset(("unknown", "complete", "partial", "needs_source", "needs_clarification"))
+RESULT_STATUSES = frozenset(("unknown", "complete", "partial", "needs_source", "needs_clarification", "refused", "failed"))
+
+
+def get_context(uid, topic, source_id, *, before_message_id=None, root=ROOT):
+    with database(root) as con:
+        row = con.execute("""SELECT state,before_message_id FROM conversation_context
+                              WHERE uid=? AND topic=? AND source_key=?""",
+                          (uid, topic, source_id or 0)).fetchone()
+    if row is None or (before_message_id is not None and row[1] >= before_message_id):
+        return None
+    return json.loads(row[0])
+
+
+def save_context(uid, topic, source_id, state, *, message_id, root=ROOT):
+    if not state or type(message_id) is not int:
+        return
+    with database(root) as con:
+        con.execute("""INSERT INTO conversation_context VALUES(?,?,?,?,?)
+                       ON CONFLICT(uid,topic,source_key) DO UPDATE SET
+                       before_message_id=excluded.before_message_id,state=excluded.state
+                       WHERE excluded.before_message_id>=conversation_context.before_message_id""",
+                    (uid, topic, source_id or 0, message_id,
+                     json.dumps(state, ensure_ascii=False, allow_nan=False)))
+
+
+def audit_start(key, uid, topic, message_id, provenance=None, *, root=ROOT):
+    """No foreign key to the queue: terminal errors outlive request/checkpoint cleanup."""
+    now = time.time()
+    with database(root) as con:
+        con.execute("""INSERT OR IGNORE INTO request_audit
+                       VALUES(?,?,?,?,?,?,'started',?,NULL)""",
+                    (key, uid, topic, message_id, now, now,
+                     json.dumps(provenance or {}, ensure_ascii=False, allow_nan=False)))
+        row = con.execute("SELECT uid,topic,message_id FROM request_audit WHERE request_key=?", (key,)).fetchone()
+        if row != (uid, topic, message_id):
+            raise ValueError("Audit owner mismatch")
+
+
+def audit_event(key, event, details=None, *, state=None, turn_id=None, root=ROOT):
+    now = time.time()
+    encoded = json.dumps(details or {}, ensure_ascii=False, allow_nan=False)
+    with database(root) as con:
+        con.execute("INSERT INTO request_audit_events(request_key,recorded,event,details) VALUES(?,?,?,?)",
+                    (key, now, event, encoded))
+        con.execute("""UPDATE request_audit SET updated=?,state=coalesce(?,state),
+                       turn_id=coalesce(?,turn_id) WHERE request_key=?""", (now, state, turn_id, key))
+
+
+def _queue_audit(con, ident, event, state, details=None):
+    key = "update:" + str(ident)
+    if con.execute("SELECT 1 FROM request_audit WHERE request_key=?", (key,)).fetchone():
+        now = time.time()
+        con.execute("INSERT INTO request_audit_events(request_key,recorded,event,details) VALUES(?,?,?,?)",
+                    (key, now, event, json.dumps(details or {}, allow_nan=False)))
+        con.execute("UPDATE request_audit SET state=?,updated=? WHERE request_key=?", (state, now, key))
+
+
+def explain_request(key, *, uid=None, topic=None, root=ROOT):
+    """Operator diagnostics, optionally limited to the authenticated participant and topic."""
+    with database(root) as con:
+        row = con.execute("""SELECT state,started,updated,provenance,turn_id FROM request_audit
+                              WHERE request_key=? AND (? IS NULL OR uid=?) AND (? IS NULL OR topic=?)""",
+                          (key, uid, uid, topic, topic)).fetchone()
+        if row is None:
+            return None
+        events = con.execute("SELECT recorded,event,details FROM request_audit_events WHERE request_key=? ORDER BY id",
+                             (key,)).fetchall()
+    return {"request_key": key, "state": row[0], "started": row[1], "updated": row[2],
+            "provenance": json.loads(row[3]), "turn_id": row[4],
+            "events": [{"at": stamp, "event": event, "details": json.loads(data)}
+                       for stamp, event, data in events]}
 
 
 def _remember_result(con, turn_id, details):
@@ -390,8 +473,6 @@ def _remember_result(con, turn_id, details):
             or not isinstance(metadata, dict)):
         raise ValueError("Invalid group result status")
     encoded = json.dumps(metadata, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
-    if len(encoded.encode()) > 128 * 1024:
-        raise ValueError("Group result metadata too large")
     # A replay must never overwrite the original provenance or erase confirmation.
     con.execute("""INSERT OR IGNORE INTO turn_results
                    (turn_id,task_status,generation_complete,missing_requirements,metadata,recorded_at)
@@ -434,7 +515,7 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
                 _remember_result(con, saved, result_details)
                 return saved
         row = con.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,?,?,?)",
-                          (uid, topic, question[:5000], answer))
+                          (uid, topic, question, answer))
         turn_id = row.lastrowid
         if type(message_id) is int and message_id > 0:
             con.execute("INSERT INTO turn_order VALUES (?,?)", (turn_id, message_id))
@@ -445,10 +526,33 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         return turn_id
 
 
+def recorded_turn(uid, topic, request_key, *, root=ROOT):
+    """Read an idempotent turn only through its owning queued request and scope."""
+    with database(root) as con:
+        turn_id = _previous_write(con, request_key, uid, topic, "turn")
+        if turn_id is None:
+            return None
+        row = con.execute("""SELECT t.id,t.prompt,t.answer,s.doc_id FROM turns t
+                              LEFT JOIN turn_sources s ON s.turn_id=t.id
+                              WHERE t.id=? AND t.uid=? AND t.topic=?""", (turn_id, uid, topic)).fetchone()
+        if row is None:
+            raise ValueError("Recorded group turn mismatch")
+        return row
+
+
 # Job outcomes shared by the route, the queue and the model pipelines. They live here because
 # every group module already imports the store, and the store imports none of them.
 class DeliveryUncertain(Exception):
     """A Telegram send may have reached the group without a receipt. It is never repeated."""
+
+    def __init__(self, reason="unknown", stage="unknown", error_class=None):
+        super().__init__("Delivery outcome is uncertain")
+        self.audit = {"reason": reason, "stage": stage}
+        if error_class in {"TimedOut", "NetworkError", "Forbidden", "BadRequest", "InvalidToken",
+                           "ChatMigrated", "Conflict", "OperationalError", "OSError", "TimeoutError"}:
+            self.audit["error_class"] = error_class
+        elif error_class is not None:
+            self.audit["error_class"] = "other"
 
 
 class GroupJobParked(Exception):
@@ -548,6 +652,18 @@ def pending(uid, ident, payload, *, root=ROOT):
         # Concurrency is bounded only by the workers that claim them.
         con.execute("INSERT INTO requests(id,uid,body,state) VALUES(?,?,?,'queued')",(ident,uid,payload))
         _schedule_request(con, ident, payload)
+        topic, mid = con.execute("SELECT topic,message_id FROM schedule WHERE request_id=?", (ident,)).fetchone()
+        # Bind full Telegram updates now. Opaque legacy payloads are bound only
+        # when their actual restored message is available, never from guessed scope.
+        try:
+            sender = json.loads(payload).get("message", {}).get("from", {})
+            trustworthy = type(mid) is int and mid > 0 and sender.get("id") == uid
+        except (ValueError, TypeError, AttributeError):
+            trustworthy = False
+        if trustworthy:
+            now = time.time()
+            con.execute("INSERT OR IGNORE INTO request_audit VALUES(?,?,?,?,?,?,'queued','{}',NULL)",
+                        ("update:" + str(ident), uid, topic, mid, now, now))
         return "queued"
 
 
@@ -760,15 +876,31 @@ def retry_delivery(ident, part, retry_at, *, root=ROOT, park=False):
         _finish_attempt(con, ident, part, "retry", None, retry_at, park=park)
 
 
-def settle(ident, success, *, root=ROOT):
+def settle(ident, success, *, root=ROOT, diagnostic=None):
     with database(root) as con:
         if success:
+            key = "update:" + str(ident)
+            audit_state = con.execute("SELECT state FROM request_audit WHERE request_key=?", (key,)).fetchone()
+            if audit_state:
+                terminal = ("failed", "finished", "refused", "operator_confirmed", "dropped", "needs_clarification")
+                final_state = audit_state[0] if audit_state[0] in terminal else "finished"
+                if audit_state[0] not in terminal:
+                    _queue_audit(con, ident, "action_completed", final_state)
+                parts = con.execute("SELECT state,message_id FROM delivery_parts WHERE request_id=?",
+                                    (ident,)).fetchall()
+                confirmed = sum(state == "confirmed" and type(mid) is int and mid > 0 for state, mid in parts)
+                # A replayed single error/command bypasses process_group. Retain its
+                # receipts before the request deletion cascades to delivery_parts.
+                _queue_audit(con, ident, "queue_completed", final_state,
+                             {"confirmed_parts": confirmed, "pending_parts": len(parts) - confirmed,
+                              "delivery_confirmed": bool(parts) and confirmed == len(parts)})
             con.execute("""INSERT OR REPLACE INTO completed_updates(id,completed_at)
                            SELECT id,? FROM requests WHERE id=?""", (time.time(), ident))
             con.execute("DELETE FROM requests WHERE id=?", (ident,))
         else:
             # Keep the request text for an operator requeue, and the answer if there is one.
             con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
+            _queue_audit(con, ident, "delivery_uncertain", "uncertain", diagnostic or {})
             if con.execute("SELECT 1 FROM checkpoints WHERE request_id=? AND key=?", (ident, ANSWER)).fetchone():
                 _drop_stages(con, ident)
 
@@ -777,10 +909,13 @@ def fail(ident, *, root=ROOT):
     """After an unexpected error was reported, keep the request and its checkpoints for the operator."""
     with database(root) as con:
         con.execute("UPDATE requests SET state='failed' WHERE id=? AND state IN ('running','sending')", (ident,))
+        _queue_audit(con, ident, "operator_required", "failed")
 
 
 def recover(*, root=ROOT):
     with database(root) as con:
+        for ident, state in con.execute("SELECT id,state FROM requests WHERE state IN ('running','sending')").fetchall():
+            _queue_audit(con, ident, "process_recovery", "queued" if state == "running" else "uncertain")
         con.execute("UPDATE requests SET state='queued' WHERE state='running'")
         con.execute("UPDATE requests SET state='uncertain' WHERE state='sending'")
         return con.execute("SELECT count(*) FROM requests WHERE state='queued'").fetchone()[0]
@@ -819,6 +954,12 @@ def resolve(ident, action, *, root=ROOT, now=None):
                    "drop": ("uncertain", "failed", "queued")}[action]
         if current not in allowed:
             raise ValueError(f"A {current} request cannot be marked {action}")
+        _queue_audit(con, ident, "operator_resolution", "queued" if action == "requeue" else
+                     "operator_confirmed" if action == "delivered" else "dropped", {"action": action})
+        if action == "delivered":
+            con.execute("""UPDATE turn_results SET delivery_status='operator_confirmed',confirmed_at=?
+                           WHERE turn_id=(SELECT turn_id FROM request_audit WHERE request_key=?)""",
+                        (time.time(), "update:" + str(ident)))
         if action == "requeue":
             if not body:
                 raise ValueError("The request text was not kept, so it cannot run again")

@@ -41,10 +41,112 @@ INCOMING = 8801
 FIXTURE_TOKEN = str(BOT) + ':ISOLATED_NOT_A_VALID_TELEGRAM_TOKEN'
 READONLY_GIT_QUERIES = []
 VERSION_STATUS_METADATA_STUB = []
+SYNTHETIC_SOUL = 'Synthetic acceptance profile. No personal instructions or conversation data.\n'
 
 
 class IsolationViolation(RuntimeError):
     pass
+
+
+def initialize_transport_without_startup(dependencies):
+    """Load the real transport with only entry-point maintenance suppressed."""
+    if 'hermes_bootstrap' in sys.modules or 'agent.process_bootstrap' in sys.modules:
+        raise IsolationViolation('bootstrap loaded before isolated initialization')
+    recovery = importlib.import_module('hermes_cli._early_recovery')
+    launch = importlib.import_module('hermes_cli.venv_sync')
+    environments = importlib.import_module('pm.environments')
+    with ExitStack() as stack:
+        suppressed = {}
+        for module, name, result in ((recovery, 'restore_interrupted_pull', False),
+                                     (launch, 'prepare_launch', None),
+                                     (recovery, 'recover_if_needed', False),
+                                     (environments, 'activate_dependencies', None)):
+            suppressed[name] = stack.enter_context(patch.object(module, name, return_value=result))
+        stack.enter_context(patch.dict(os.environ, {'HERMES_DISABLE_LAZY_INSTALLS': '1'}))
+        transport = importlib.import_module('agent.process_bootstrap')
+        if not callable(getattr(transport, 'enable_happy_eyeballs_on_client', None)):
+            raise IsolationViolation('real transport helper unavailable')
+        if str(dependencies) not in sys.path:
+            raise IsolationViolation('selected dependency path was displaced')
+        counts = {name: function.call_count for name, function in suppressed.items()}
+    return {'mode': 'real transport with entry-point maintenance suppressed', 'suppressed_calls': counts}
+
+
+def fixture_runtime_capture(route, fixture, model, patches):
+    """Keep real auth/config reads, but snapshot only an explicit synthetic profile."""
+    fixture = fixture.resolve()
+    profile = fixture / 'synthetic-profile'
+    profile.mkdir(mode=0o700)
+    configured = {'model': {'provider': model['provider'], 'default': model['default']}}
+    for name, value in (('config.yaml', json.dumps(configured, ensure_ascii=False) + '\n'),
+                        ('SOUL.md', SYNTHETIC_SOUL)):
+        descriptor = os.open(profile / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as output:
+            output.write(value)
+    capture = route.capture_runtime
+    def synthetic_capture(selected_model, **options):
+        root = Path(options.get('root') or fixture / 'runtime-snapshots').resolve()
+        if not root.is_relative_to(fixture):
+            raise IsolationViolation('runtime snapshot outside isolated fixture')
+        if 'profile' in options and Path(options['profile']).resolve() != profile:
+            raise IsolationViolation('runtime snapshot requested a non-synthetic profile')
+        return capture(selected_model, **{**options, 'profile': profile, 'root': root})
+    patches.enter_context(patch.object(route, 'capture_runtime', synthetic_capture))
+    return profile
+
+
+def durable_acceptance(store, fixture, profile, *, expected_effort=None):
+    """Read only the fixture after queue cleanup, then expose content-free evidence."""
+    key = 'update:' + str(UPDATE)
+    report = store.explain_request(key, uid=MEMBER, topic=0)
+    assert report is not None and report['state'] == 'finished', 'durable request explanation missing'
+    assert store.explain_request(key, uid=OTHER_MEMBER, topic=0) is None
+    assert store.explain_request(key, uid=MEMBER, topic=1) is None
+    saved = store.result_details(MEMBER, 0, report['turn_id'])
+    assert saved is not None and saved['delivery_status'] == 'confirmed', 'durable delivery receipt missing'
+    events = {item['event']: item['details'] for item in report['events']}
+    assert 'result_saved' in events and 'delivery_confirmed' in events and 'queue_completed' in events
+    receipt = events['queue_completed']
+    assert receipt['delivery_confirmed'] and receipt['confirmed_parts'] > 0 and receipt['pending_parts'] == 0
+    with store.database() as database:
+        assert database.execute('SELECT count(*) FROM requests WHERE id=?', (UPDATE,)).fetchone()[0] == 0
+        assert database.execute('SELECT count(*) FROM checkpoints WHERE request_id=?', (UPDATE,)).fetchone()[0] == 0
+    generation = saved['quality_metadata'].get('generation_audit', {})
+    if expected_effort is not None:
+        assert saved['task_status'] == 'complete', 'task was not accepted as complete'
+        assert saved['generation_complete'] is True, 'API completion was not retained'
+        efforts = generation.get('effort_counts', {})
+        assert set(efforts) == {expected_effort} and efforts[expected_effort] > 0, 'generation did not use maximum effort'
+        assert generation.get('fallback_stages') == 0
+        assert generation.get('effort_policy') == 'maximum_supported_no_downgrade'
+        audited = events['result_saved']
+        assert audited['task_status'] == 'complete' and audited['generation_complete'] is True
+        assert audited['metadata']['generation_audit']['effort_counts'] == efforts
+    # Verify every captured profile without reading the real profile for comparison.
+    root = fixture / 'runtime-snapshots'
+    snapshots = sorted(root.iterdir())
+    assert snapshots, 'runtime snapshot missing'
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    for snapshot in snapshots:
+        assert re.fullmatch('[0-9a-f]{64}', snapshot.name)
+        assert snapshot.is_dir() and not snapshot.is_symlink() and snapshot.resolve().is_relative_to(fixture)
+        for path in (snapshot, *snapshot.rglob('*')):
+            assert not path.is_symlink() and not path.stat().st_mode & 0o077, 'snapshot is not private'
+        manifest = json.loads((snapshot / 'manifest.json').read_text())
+        for name in ('config.yaml', 'SOUL.md'):
+            body = (snapshot / 'profile' / name).read_bytes()
+            assert body == (profile / name).read_bytes(), 'snapshot contains a non-synthetic profile'
+            assert manifest['profile/' + name] == hashlib.sha256(body).hexdigest()
+    runtime = saved['quality_metadata']['runtime']
+    assert runtime['snapshot_verified'] is True and (root / runtime['snapshot_id']).is_dir()
+    assert SYNTHETIC_SOUL.strip() not in json.dumps(report), 'profile text entered technical diagnostics'
+    return {'durable_diagnostics_after_cleanup': True, 'durable_task_status': saved['task_status'],
+            'durable_generation_complete': saved['generation_complete'],
+            'durable_maximum_effort_verified': expected_effort is not None,
+            'generation_effort': expected_effort, 'durable_delivery_status': saved['delivery_status'],
+            'durable_confirmed_parts': receipt['confirmed_parts'],
+            'runtime_snapshot_private': True, 'runtime_snapshot_count': len(snapshots),
+            'synthetic_profile_only': True}
 
 
 class Receiver:
@@ -359,6 +461,7 @@ async def example(args, fixture, receiver, guard):
     if model.get('provider') != 'openai-codex':
         raise IsolationViolation('the configured provider is not openai-codex')
     with ExitStack() as patches:
+        profile = fixture_runtime_capture(route, fixture, model, patches)
         for module in (instance, route, queue):
             for name, value in [('BOT', BOT), ('GROUP', GROUP), ('OWNER', OWNER)]:
                 if hasattr(module, name):
@@ -429,6 +532,11 @@ async def example(args, fixture, receiver, guard):
                 db_path = Path(db.execute('PRAGMA database_list').fetchone()[2]).resolve()
             assert complete == 1 and pending == 0 and bound == 1
             assert db_path.is_relative_to(fixture)
+            expected_effort = None
+            if not args.stub_model:
+                from plugins.platforms.telegram.psy_group_client import _maximum_effort
+                expected_effort = _maximum_effort(model['default'])
+            durable = durable_acceptance(store, fixture, profile, expected_effort=expected_effort)
             await route.intercept(app, update)
             await finish_group_task(10)
             assert len(receiver.messages) == 1, 'duplicate update produced a second answer'
@@ -454,7 +562,7 @@ async def example(args, fixture, receiver, guard):
                     'codex_http_requests': guard.codex_http, 'group_model_invocations': len(model_calls),
                     'readonly_git_metadata_queries': len(READONLY_GIT_QUERIES),
                     'version_status_metadata_stub': bool(VERSION_STATUS_METADATA_STUB),
-                    'external_hosts': sorted(set(guard.external_http)), 'source_sha256': sources}
+                    'external_hosts': sorted(set(guard.external_http)), 'source_sha256': sources, **durable}
         finally:
             app.running = False
             for name in ('_psy_group_task', '_psy_group_ticker', '_psy_owner_watcher'):
@@ -501,7 +609,9 @@ def main():
         sys.path.insert(1, str(dependencies))
         with Receiver() as receiver:
             with NetworkGuard(receiver.port, allow_model=not args.stub_model) as guard:
+                bootstrap = initialize_transport_without_startup(dependencies)
                 result = asyncio.run(example(args, fixture, receiver, guard))
+                result['bootstrap'] = bootstrap
         print(json.dumps(result, ensure_ascii=False))
 
 

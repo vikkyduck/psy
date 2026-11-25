@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Install a hash-pinned tokenizer without changing the managed Hermes environment.
+
+Run as root on Linux with --python pointing to root-owned CPython 3.12.
+Use --runtime-python and --runtime-user for a different Hermes ABI.
+That interpreter is executed only as its unprivileged service user.
+The Hermes environment is never changed.
+Only PyPI wheels and OpenAI's public o200k ranks are fetched. Activation is an
+atomic current symlink, after an offline probe. Existing releases are retained.
+"""
+import argparse
+import ast
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import urllib.request
+import zipfile
+
+BASE = Path('/opt/psy-context-tokenizer')
+SCRIPT = Path(__file__).resolve()
+LOCK = SCRIPT.parent / 'context-tokenizer/requirements.lock.txt'
+RANK_URL = 'https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken'
+PACKAGES = ('tiktoken', 'regex', 'requests', 'charset-normalizer', 'idna', 'urllib3', 'certifi')
+PROBE = r'''
+import hashlib, importlib.metadata, inspect, json, os, pathlib, re, sys, sysconfig
+def no_network(event, args):
+    if event.startswith('socket.'):
+        raise RuntimeError('Offline tokenizer probe attempted network access')
+sys.addaudithook(no_network)
+sys.path.insert(0, sys.argv[1])
+import tiktoken
+from tiktoken_ext.openai_public import o200k_base
+encoding = tiktoken.get_encoding('o200k_base')
+text = 'Проверка точного подсчета токенов. English text 123.'
+assert encoding.decode(encoding.encode(text)) == text
+resource = 'https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken'
+key = hashlib.sha1(resource.encode()).hexdigest()
+rank = pathlib.Path(os.environ['TIKTOKEN_CACHE_DIR']) / key
+sha = hashlib.sha256(rank.read_bytes()).hexdigest()
+expected = re.search(r'expected_hash=["\x27]([0-9a-f]{64})["\x27]', inspect.getsource(o200k_base))
+assert expected and sha == expected.group(1), 'Rank SHA256 mismatch'
+packages = {name: importlib.metadata.version(name) for name in sys.argv[2:]}
+print(json.dumps({'python': {'implementation': sys.implementation.name,
+    'major': sys.version_info.major, 'minor': sys.version_info.minor,
+    'version': sys.version.split()[0],
+    'soabi': sysconfig.get_config_var('SOABI')}, 'packages': packages,
+    'encoding': {'name': 'o200k_base', 'cache_key': key, 'sha256': sha}}))
+'''
+PYTHON_ID = """import json,sys,sysconfig
+print(json.dumps({'implementation':sys.implementation.name,'major':sys.version_info.major,
+'minor':sys.version_info.minor,'version':sys.version.split()[0],
+'soabi':sysconfig.get_config_var('SOABI')}))"""
+
+
+def clean_env(cache=None):
+    env = {'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/nonexistent',
+           'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1',
+           'PIP_CONFIG_FILE': '/dev/null'}
+    if cache is not None:
+        env['TIKTOKEN_CACHE_DIR'] = str(cache)
+    return env
+
+
+def run(command, *, cache=None, capture=False):
+    result = subprocess.run([str(part) for part in command], check=True,
+                            env=clean_env(cache), text=True, timeout=300,
+                            stdout=subprocess.PIPE if capture else None)
+    return result.stdout if capture else None
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def secure_directory(path):
+    """Never write through an untrusted directory or replace a foreign install."""
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    for candidate in (path, *path.parents):
+        details = candidate.lstat()
+        if not stat.S_ISDIR(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o022:
+            raise RuntimeError('Tokenizer directory must be root-owned and not writable by others: ' + str(candidate))
+
+
+def pinned_versions(lock):
+    versions = dict(re.findall(r'^([a-z0-9-]+)==([^\s\\]+)', lock.read_text(), re.M))
+    if set(versions) != set(PACKAGES):
+        raise RuntimeError('Unexpected tokenizer dependency set')
+    return versions
+
+
+def target_path(release, identity):
+    return release / 'venv/lib' / f"python{identity['major']}.{identity['minor']}" / 'site-packages'
+
+
+def runtime_command(python, runtime):
+    if runtime is None:
+        return [str(python)]
+    # Never execute a service-user-owned interpreter with root privileges.
+    return ['/usr/sbin/runuser', '-u', runtime['user'], '--', str(runtime['python'])]
+
+
+def probe(release, identity, runtime):
+    python = release / 'build-venv/bin/python'
+    return json.loads(run([*runtime_command(python, runtime), '-I', '-c', PROBE,
+                           target_path(release, identity), *PACKAGES],
+                          cache=release / 'cache', capture=True))
+
+
+def cross_flags(identity):
+    version = f"{identity['major']}{identity['minor']}"
+    return ['--python-version', version, '--implementation', 'cp', '--abi', 'cp' + version,
+            '--platform', 'manylinux_2_28_' + platform.machine()]
+
+
+def rank_spec(wheels):
+    selected = list(wheels.glob('tiktoken-*.whl'))
+    if len(selected) != 1:
+        raise RuntimeError('Expected exactly one verified tiktoken wheel')
+    with zipfile.ZipFile(selected[0]) as archive:
+        tree = ast.parse(archive.read('tiktoken_ext/openai_public.py'))
+    constructor = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'o200k_base')
+    for node in ast.walk(constructor):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == 'load_tiktoken_bpe':
+            url = ast.literal_eval(node.args[0])
+            expected = next(ast.literal_eval(arg.value) for arg in node.keywords if arg.arg == 'expected_hash')
+            if url != RANK_URL or not re.fullmatch('[0-9a-f]{64}', expected):
+                raise RuntimeError('Unexpected rank source in verified tokenizer wheel')
+            return {'name': 'o200k_base', 'cache_key': hashlib.sha1(url.encode()).hexdigest(), 'sha256': expected}
+    raise RuntimeError('No pinned o200k rank source in tokenizer wheel')
+
+
+def warm_cache(release):
+    expected = rank_spec(release / 'wheels')
+    with urllib.request.urlopen(RANK_URL, timeout=30) as response:
+        data = response.read(8 * 1024 * 1024 + 1)
+    if len(data) > 8 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != expected['sha256']:
+        raise RuntimeError('Downloaded tokenizer ranks failed SHA256 verification')
+    (release / 'cache' / expected['cache_key']).write_bytes(data)
+    return expected
+
+
+def verify(release, lock, identity, runtime=None):
+    manifest = json.loads((release / 'manifest.json').read_text())
+    if manifest['installer_sha256'] != sha256(SCRIPT):
+        raise RuntimeError('Tokenizer installer version does not match release')
+    if manifest['lock_sha256'] != sha256(lock) or sha256(release / 'requirements.lock.txt') != sha256(lock):
+        raise RuntimeError('Tokenizer lock does not match installed release')
+    if manifest['python'] != identity or manifest['packages'] != pinned_versions(lock):
+        raise RuntimeError('Tokenizer interpreter or dependencies do not match')
+    for wheel in manifest['wheels']:
+        if Path(wheel['filename']).name != wheel['filename'] or sha256(release / 'wheels' / wheel['filename']) != wheel['sha256']:
+            raise RuntimeError('Installed tokenizer wheel archive failed integrity check')
+    expected = rank_spec(release / 'wheels')
+    if manifest['encoding'] != expected or sha256(release / 'cache' / expected['cache_key']) != expected['sha256']:
+        raise RuntimeError('Tokenizer rank cache does not match its pinned wheel')
+    actual = probe(release, identity, runtime)
+    if any(actual[field] != manifest[field] for field in ('python', 'packages', 'encoding')):
+        raise RuntimeError('Offline tokenizer verification failed')
+    return manifest
+
+
+def build(release, lock, python, identity, runtime=None):
+    # This is the final immutable path. Moving a completed venv breaks shebangs.
+    (release / 'wheels').mkdir()
+    (release / 'cache').mkdir()
+    shutil.copyfile(lock, release / 'requirements.lock.txt')
+    run([python, '-I', '-m', 'venv', '--copies', release / 'build-venv'])
+    pip = [release / 'build-venv/bin/python', '-I', '-m', 'pip', '--isolated', '--disable-pip-version-check']
+    run([*pip, 'download', *cross_flags(identity), '--no-cache-dir', '--only-binary=:all:', '--require-hashes',
+         '--index-url', 'https://pypi.org/simple', '-r', release / 'requirements.lock.txt',
+         '--dest', release / 'wheels'])
+    run([*pip, 'install', *cross_flags(identity), '--target', target_path(release, identity),
+         '--no-compile', '--no-index', '--no-cache-dir', '--only-binary=:all:',
+         '--require-hashes', '--find-links', release / 'wheels',
+         '-r', release / 'requirements.lock.txt'])
+    expected = warm_cache(release)
+    manifest = probe(release, identity, runtime)
+    if manifest['encoding'] != expected:
+        raise RuntimeError('Runtime rank identity differs from pinned tokenizer wheel')
+    if manifest['python'] != identity or manifest['packages'] != pinned_versions(lock):
+        raise RuntimeError('Installed versions differ from pinned tokenizer configuration')
+    manifest.update(schema=2, installation="cross_target", installer_sha256=sha256(SCRIPT), lock_sha256=sha256(lock), wheels=[
+        {'filename': item.name, 'sha256': sha256(item)}
+        for item in sorted((release / 'wheels').glob('*.whl'))])
+    if len(manifest['wheels']) != len(PACKAGES):
+        raise RuntimeError('Incomplete tokenizer wheel set')
+    # Public immutable data only. The gateway user must not mutate imported code.
+    for path in release.rglob('*'):
+        if not path.is_symlink():
+            path.chmod(0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644)
+    path = release / 'manifest.json'
+    with path.open('x', encoding='utf-8') as output:
+        json.dump(manifest, output, ensure_ascii=False, sort_keys=True, indent=2)
+        output.write('\n')
+        output.flush()
+        os.fsync(output.fileno())
+    path.chmod(0o644)
+    verify(release, lock, identity, runtime)
+
+
+def publish(base, release):
+    current = base / 'current'
+    if current.exists() and not current.is_symlink():
+        raise RuntimeError('Refusing to replace a non-symlink current installation')
+    temporary = base / ('.current-' + str(os.getpid()))
+    try:
+        temporary.symlink_to(release.relative_to(base), target_is_directory=True)
+        os.replace(temporary, current)
+        descriptor = os.open(base, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def install(base, lock, python, identity, runtime=None):
+    """Lock held by main. An incomplete build never changes current."""
+    digest = hashlib.sha256(SCRIPT.read_bytes() + lock.read_bytes() + json.dumps(identity, sort_keys=True).encode()
+                            + platform.machine().encode()).hexdigest()
+    release = base / 'releases' / (digest + f"-py{identity['major']}{identity['minor']}")
+    if release.exists() and not (release / 'manifest.json').exists():
+        # Resume a killed, unpublished build without touching the active release.
+        if (base / 'current').resolve() == release.resolve():
+            raise RuntimeError('Active tokenizer release is incomplete')
+        secure_directory(release)
+        shutil.rmtree(release)
+    if release.exists():
+        verify(release, lock, identity, runtime)
+    else:
+        release.mkdir(mode=0o755)
+        try:
+            build(release, lock, python, identity, runtime)
+        except BaseException:
+            shutil.rmtree(release)
+            raise
+    publish(base, release)
+    return release
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--python', required=True, help='Trusted root-owned Python 3.12 for pip, never the user-owned runtime')
+    parser.add_argument('--runtime-python', help='Actual Hermes Python, executed only as --runtime-user')
+    parser.add_argument('--runtime-user', help='Unprivileged Hermes account for ABI query and offline smoke')
+    args = parser.parse_args()
+    if os.geteuid() != 0 or platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'aarch64'):
+        parser.error('Requires root on Linux x86_64/aarch64')
+    python = Path(args.python).resolve(strict=True)
+    details = python.stat()
+    if not stat.S_ISREG(details.st_mode) or details.st_uid != 0 or details.st_mode & 0o022:
+        parser.error('Interpreter must be a root-owned executable, not writable by others')
+    secure_directory(python.parent)
+    identity = json.loads(run([python, '-I', '-c', PYTHON_ID], capture=True))
+    if identity['implementation'] != 'cpython' or (identity['major'], identity['minor']) != (3, 12):
+        parser.error('--python must be trusted CPython 3.12 for the isolated pip build environment')
+    runtime = None
+    if bool(args.runtime_python) != bool(args.runtime_user):
+        parser.error('--runtime-python and --runtime-user must be supplied together')
+    if args.runtime_user:
+        account = pwd.getpwnam(args.runtime_user)
+        if account.pw_uid == 0:
+            parser.error('Runtime user must be unprivileged')
+        runtime_python = Path(args.runtime_python).resolve(strict=True)
+        if not runtime_python.is_file():
+            parser.error('Runtime interpreter must be an existing file')
+        runtime = {'user': args.runtime_user, 'python': runtime_python}
+        identity = json.loads(run([*runtime_command(python, runtime), '-I', '-c', PYTHON_ID], capture=True))
+    if identity['implementation'] != 'cpython' or (identity['major'], identity['minor']) not in ((3, 12), (3, 14)):
+        parser.error('Pinned wheels support CPython 3.12 and 3.14')
+    expected_abi = f"cpython-{identity['major']}{identity['minor']}-{platform.machine()}-linux-gnu"
+    if identity['soabi'] != expected_abi:
+        parser.error('Runtime ABI is not supported by the pinned production wheels')
+    os.umask(0o022)
+    secure_directory(BASE)
+    secure_directory(BASE / 'releases')
+    lock_path = BASE / '.install.lock'
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        release = install(BASE, LOCK, python, identity, runtime)
+    print(json.dumps({'installed': str(release), 'current': str(BASE / 'current'),
+                      'manifest': str(BASE / 'current/manifest.json')}))
+
+
+if __name__ == '__main__':
+    main()

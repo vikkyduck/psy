@@ -18,7 +18,8 @@ EXPECTED = {
         "psy_group_store.py", "psy_group_codex.py", "psy_group_audio.py", "psy_group_queue.py",
         "psy_owner_recovery.py", "psy_upload_handoff.py", "psy_group_admin.py", "psy_group_prompts.py",
         "psy_group_client.py", "psy_group_pipeline.py", "psy_group_sources.py", "psy_group_lecture.py",
-        "psy_group_continuation.py", "psy_group_quality.py")),
+        "psy_group_continuation.py", "psy_group_quality.py", "psy_group_context.py",
+        "psy_group_observability.py")),
 }
 # gateway/apply.py SHARED: root-owned code outside the checkout that the gateway loads by explicit
 # path. Manifest key -> the file checked.

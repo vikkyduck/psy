@@ -1,4 +1,4 @@
-"""Count manuscript characters in actual Codex request payloads, without network access."""
+"""Verify complete continuation context in actual Codex payloads without network access."""
 import json
 import re
 import sys
@@ -15,7 +15,6 @@ from psy_modules import psy_group_quality as quality
 
 
 BLOCK_SIZE = 1024
-WINDOW_BUDGET = 2048
 # A different private-use Unicode character for each block. Static inputs cannot
 # accidentally match. Inter-block newlines count as part of the manuscript.
 PROSE = re.compile(r"[\ue000-\ue0ff]+(?:\n[\ue000-\ue0ff]+)*")
@@ -59,6 +58,11 @@ class LectureEndpoint:
         complete = True
         if prompts.DISPATCH in instruction:
             text = 'PSY_TASK {"minutes":30,"public_topic":"Synthetic"}'
+        elif instruction.startswith(quality._EXTRACT):
+            text = encode(dict(task=QUESTION, audience=None, topics=[], examples=[], format=None,
+                               deliverables=[], constraints=[], obligations=[QUESTION], continuation=False,
+                               superseded_requirements=[], kind="lecture", minutes=30,
+                               outline_only=False, limited_scope=False, local_only=False))
         elif "Сейчас нужен внутренний редакционный" in instruction:
             plan = {"title": PLAN_TITLE, "sections": [{"title": "Теория", "brief": "Тезис",
                     "minutes": 30, "activity_minutes": 0}]}
@@ -125,14 +129,13 @@ def encode(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-class ContinuationCost(unittest.TestCase):
-    def test_lecture_keeps_the_full_manuscript_but_resends_only_its_tail(self):
-        totals = []
-        for count in (64, 128):
+class ContinuationContext(unittest.TestCase):
+    def test_lecture_keeps_the_full_manuscript_and_all_prior_context(self):
+        for count in (16, 32):
             with self.subTest(block_count=count):
                 endpoint = LectureEndpoint(count)
                 result = endpoint.compose()
-                manuscript = "\n".join(endpoint.blocks)
+                manuscript = "".join(endpoint.blocks)
                 self.assertTrue(result.complete)
                 self.assertEqual(result.task_status, "complete")
                 self.assertEqual(list(prose_fragments(result.text)), [manuscript])
@@ -141,37 +144,27 @@ class ContinuationCost(unittest.TestCase):
                 self.assertEqual(endpoint.task_reviews, [manuscript])
                 self.assertEqual(len(endpoint.contexts), count)
                 self.assertEqual(endpoint.contexts[0], [])
-                total = 0
                 for index, context in enumerate(endpoint.contexts[1:], start=1):
                     self.assertEqual(len(context), 1)
-                    tail = context[0]
-                    self.assertTrue(tail.endswith(endpoint.blocks[index - 1]))
-                    prior_end = index * (BLOCK_SIZE + 1) - 1
-                    self.assertEqual(manuscript[prior_end - len(tail):prior_end], tail)
-                    self.assertLessEqual(len(tail), WINDOW_BUDGET)
-                    total += len(tail)
+                    self.assertEqual(context[0], "".join(endpoint.blocks[:index]))
                 for inputs in endpoint.inputs:
                     for expected in (QUESTION, PLAN_TITLE, SOURCE):
                         self.assertIn(expected, inputs)
-                totals.append(total)
-        if len(totals) == 2:
-            self.assertLess(totals[1], 2.1 * totals[0])
 
-    def test_supplement_does_not_repeat_its_parent_chapter_or_earlier_additions(self):
+    def test_supplement_sees_parent_chapter_and_all_earlier_additions(self):
         endpoint = SupplementEndpoint()
         result = endpoint.compose()
         self.assertTrue(result.complete)
         self.assertEqual(list(prose_fragments(result.text)),
-                         ["\n".join(endpoint.blocks), "\n".join(endpoint.additions)])
+                         ["".join(endpoint.blocks), "".join(endpoint.additions)])
         self.assertEqual(len(endpoint.supplement_contexts), len(endpoint.additions))
         for index, parts in enumerate(endpoint.supplement_contexts):
             for expected in (QUESTION, PLAN_TITLE, SOURCE, "Сопоставить два случая."):
                 self.assertIn(expected, endpoint.supplement_inputs[index])
             sent = "".join(parts)
-            self.assertNotIn(endpoint.blocks[0], sent)
-            self.assertLessEqual(sum(map(len, parts)), WINDOW_BUDGET)
+            self.assertIn("".join(endpoint.blocks), sent)
             if index:
-                self.assertIn(endpoint.additions[index - 1], sent)
+                self.assertIn("".join(endpoint.additions[:index]), sent)
             else:
                 self.assertIn(endpoint.blocks[-1], sent)
 
@@ -199,10 +192,10 @@ class ContinuationCost(unittest.TestCase):
             result = resumed.compose(store.Checkpoints(12, root=root))
 
         self.assertTrue(result.complete)
-        self.assertEqual(list(prose_fragments(result.text)), ["\n".join(interrupted.blocks)])
+        self.assertEqual(list(prose_fragments(result.text)), ["".join(interrupted.blocks)])
         self.assertEqual(len(interrupted.contexts), 7)
         self.assertEqual(len(resumed.contexts), 5)
         self.assertIn(resumed.blocks[6], "".join(resumed.contexts[0]))
-        self.assertNotIn(resumed.blocks[0], "".join(resumed.contexts[0]))
-        for fragments in resumed.contexts:
-            self.assertLessEqual(sum(map(len, fragments)), WINDOW_BUDGET)
+        self.assertIn(resumed.blocks[0], "".join(resumed.contexts[0]))
+        for index, fragments in enumerate(resumed.contexts, start=7):
+            self.assertEqual("".join(fragments), "".join(resumed.blocks[:index]))
