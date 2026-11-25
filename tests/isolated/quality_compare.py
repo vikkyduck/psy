@@ -26,6 +26,8 @@ from pathlib import Path
 import re
 import secrets
 import socket
+import sqlite3
+import stat
 import sys
 import tempfile
 import time
@@ -213,6 +215,165 @@ def write_private(path, value):
         output.write(value)
 
 
+def module_hashes(directory):
+    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(directory.glob("psy_*.py")) if not path.is_symlink()}
+
+
+def recovery_manifest(case, variant, module_dir, *, model=None, historical_attempts=None, resumed_from=None):
+    """Public helper for packaging an operator's atomic synthetic SQLite backup."""
+    encoded = json.dumps(case_turns(CASES[case]), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode("utf-8")
+    return {"format": 1, "case": case, "variant": variant,
+            "input_sha256": hashlib.sha256(encoded).hexdigest(),
+            "source_sha256": module_hashes(Path(module_dir)), "model_requested": model,
+            "historical_attempts": historical_attempts or [], "resumed_from": resumed_from}
+
+
+def read_private_file(path, *, limit):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_size > limit):
+            raise ValueError("recovery input must be a bounded private owned regular file")
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("recovery input exceeded its size limit")
+    return data
+
+
+def write_private_bytes(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+
+
+def fixture_payload():
+    return {"message": {"message_id": group_example.INCOMING,
+                        "is_topic_message": True, "message_thread_id": 1}}
+
+
+def validate_recovery_database(path):
+    """Inspect only the copied fixture database, never open external SQLite."""
+    allowed = {"instance_binding", "model_retries", "auth_recoveries", "model_attempts", "requests",
+               "schedule", "source_events", "turn_order", "job_progress", "checkpoints", "write_receipts",
+               "delivery_parts", "completed_updates", "documents", "turns", "turn_results", "turn_sources",
+               "message_sources", "current_sources"}
+    nonempty = {"instance_binding", "model_retries", "model_attempts", "requests", "schedule",
+                "job_progress", "checkpoints"}
+    with sqlite3.connect(str(path)) as connection:
+        connection.execute("PRAGMA trusted_schema=OFF")
+        connection.execute("PRAGMA query_only=ON")
+        if connection.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError("recovery database integrity failed")
+        schema = connection.execute("SELECT type,name,sql FROM sqlite_master").fetchall()
+        tables = {name for kind, name, _ in schema if kind == "table"}
+        if (not {"requests", "schedule", "checkpoints"}.issubset(tables) or tables - allowed
+                or any(kind not in ("table", "index") or "VIRTUAL TABLE" in (sql or "").upper()
+                       for kind, _, sql in schema)):
+            raise ValueError("recovery database schema is outside the synthetic fixture")
+        for table in tables:
+            if table not in nonempty and connection.execute(f'SELECT 1 FROM "{table}" LIMIT 1').fetchone():
+                raise ValueError("recovery contains non-composition data")
+            columns = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
+            for column, expected in (("uid", group_example.MEMBER), ("request_id", group_example.UPDATE)):
+                if column in columns and connection.execute(
+                        f'SELECT 1 FROM "{table}" WHERE "{column}" IS NULL OR "{column}"!=? LIMIT 1',
+                        (expected,)).fetchone():
+                    raise ValueError("recovery contains another participant or request")
+        requests = connection.execute("SELECT id,uid,body,state FROM requests").fetchall()
+        if (len(requests) != 1 or requests[0][:2] != (group_example.UPDATE, group_example.MEMBER)
+                or json.loads(requests[0][2]) != fixture_payload() or requests[0][3] not in ("queued", "running")):
+            raise ValueError("recovery request is not the synthetic composition job")
+        if connection.execute("SELECT request_id,topic,message_id,reply_id FROM schedule").fetchall() != [
+                (group_example.UPDATE, 1, group_example.INCOMING, None)]:
+            raise ValueError("recovery schedule is not synthetic")
+        if "instance_binding" in tables and connection.execute("SELECT * FROM instance_binding").fetchall() not in (
+                [], [(1, group_example.BOT, group_example.GROUP)]):
+            raise ValueError("recovery is bound to another instance")
+        count = 0
+        for key, value in connection.execute("SELECT key,value FROM checkpoints"):
+            if not (key.startswith("model:") or key.startswith("prose:")):
+                raise ValueError("recovery contains non-model checkpoints")
+            json.loads(value)
+            count += 1
+    return count
+
+
+def restore_recovery(args, fixture, output):
+    recovery_root = private_output(output / "recovery", ())
+    path = private_output(args.resume_state, ())
+    if path.parent != recovery_root:
+        raise ValueError("resume-state must be a direct private child of output-root/recovery")
+    if any((path / name).exists() for name in ("group.sqlite3-wal", "group.sqlite3-shm")):
+        raise ValueError("recovery must be an atomic SQLite backup without WAL sidecars")
+    manifest_bytes = read_private_file(path / "manifest.json", limit=1024 * 1024)
+    manifest = json.loads(manifest_bytes)
+    expected = recovery_manifest(args.case, args.variant, args.module_dir)
+    if any(manifest.get(key) != expected[key] for key in ("format", "case", "variant", "input_sha256", "source_sha256")):
+        raise ValueError("recovery provenance does not match the selected case and source version")
+    database = read_private_file(path / "group.sqlite3", limit=64 * 1024 * 1024)
+    if not database.startswith(b"SQLite format 3\0"):
+        raise ValueError("recovery is not SQLite")
+    copied = fixture / "group.sqlite3"
+    write_private_bytes(copied, database)
+    count = validate_recovery_database(copied)
+    return {"snapshot": str(path), "database_sha256": hashlib.sha256(database).hexdigest(),
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(), "checkpoint_count": count,
+            "manifest": manifest}
+
+
+def export_recovery(store, fixture, output, label, args, model, history, provenance):
+    """SQLite backup stays inside fixture, then only bytes leave the audit scope."""
+    destination = output / "recovery" / (label + "-attempt-" + str(len(history)))
+    destination.mkdir(mode=0o700)
+    temporary = fixture / ("snapshot-" + secrets.token_hex(6) + ".sqlite3")
+    with store.database() as source, sqlite3.connect(str(temporary)) as target:
+        source.backup(target)
+    temporary.chmod(0o600)
+    validate_recovery_database(temporary)
+    write_private_bytes(destination / "group.sqlite3", temporary.read_bytes())
+    manifest = recovery_manifest(args.case, args.variant, args.module_dir, model=model,
+                                 historical_attempts=history, resumed_from=provenance)
+    write_private(destination / "manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    temporary.unlink()
+    return str(destination)
+
+
+def claim_after_wait(store, fixture, *, sleep=None):
+    sleep = time.sleep if sleep is None else sleep
+    while True:
+        delay = store.next_retry_delay(root=fixture)
+        if delay is not None and delay > 0:
+            sleep(min(delay, 30))
+            continue
+        claimed = store.claim_next(root=fixture)
+        if claimed is None or claimed[0] != group_example.UPDATE:
+            raise group_example.IsolationViolation("synthetic retry could not be claimed")
+        return
+
+
+def compose_with_retries(codex, store, fixture, checkpoints, case, model, attempts, history, snapshot):
+    for attempt in range(1, attempts + 1):
+        try:
+            return codex.respond(case_turns(case), research=False, draw=False,
+                                 model=model, question=case["question"], checkpoints=checkpoints)
+        except codex.ModelIssue as error:
+            record = {"attempt": attempt, "kind": error.kind, "stage": error.stage,
+                      "retryable": bool(error.retryable), "failed_at": time.time()}
+            if error.retryable:
+                store.wait_for_model(group_example.UPDATE, error.kind, error.reset, root=fixture)
+                record["retry_delay_seconds"] = store.next_retry_delay(root=fixture)
+            history.append(record)
+            record["snapshot"] = snapshot()
+            print(json.dumps({"status": "model_retry" if error.retryable and attempt < attempts else "model_stopped",
+                              "attempt": attempt, "kind": error.kind, "stage": error.stage}), flush=True)
+            if not error.retryable or attempt == attempts:
+                raise
+            claim_after_wait(store, fixture)
+
+
 def selected_modules(directory):
     required = ("psy_group_codex.py", "psy_group_client.py", "psy_group_store.py", "psy_source_evidence.py")
     if directory.is_symlink() or not directory.is_dir():
@@ -234,10 +395,12 @@ def case_turns(case):
     return [{"role": "user", "content": content}]
 
 
-def fixture_job(store, fixture):
-    store.pending(group_example.MEMBER, group_example.UPDATE, json.dumps({"message": {
-        "message_id": group_example.INCOMING, "is_topic_message": True,
-        "message_thread_id": 1}}), root=fixture)
+def fixture_job(store, fixture, *, resumed=False):
+    if resumed:
+        if store.state(group_example.UPDATE, root=fixture) == "queued":
+            claim_after_wait(store, fixture)
+        return store.Checkpoints(group_example.UPDATE, root=fixture)
+    store.pending(group_example.MEMBER, group_example.UPDATE, json.dumps(fixture_payload()), root=fixture)
     claimed = store.claim_next(root=fixture)
     if claimed is None or claimed[0] != group_example.UPDATE:
         raise group_example.IsolationViolation("synthetic job could not be claimed")
@@ -265,15 +428,19 @@ def evaluate(args, fixture, guard):
     if model.get("provider") != "openai-codex":
         raise group_example.IsolationViolation("configured provider is not openai-codex")
     case = CASES[args.case]
-    checkpoints = fixture_job(store, fixture)
+    if args.resumed_from and args.resumed_from["manifest"].get("model_requested") not in (None, model["default"]):
+        raise ValueError("recovery model does not match the selected configured model")
+    checkpoints = fixture_job(store, fixture, resumed=bool(args.resumed_from))
     with ExitStack() as stack:
         # Defaults bound at import time cannot accidentally touch the actual vault.
         original_database = store.database
         stack.enter_context(patch.object(store, "ROOT", fixture))
         stack.enter_context(patch.object(store, "database", lambda *_args, **_kw: original_database(fixture)))
         exclusions = restrict_source_reader(evidence, guard.source_hosts, stack, allow_pdf=args.allow_pdf)
-        result = codex.respond(case_turns(case), research=False, draw=False,
-                               model=model["default"], question=case["question"], checkpoints=checkpoints)
+        snapshot = lambda: export_recovery(store, fixture, args.output_root, args.label, args,
+                                           model["default"], args.retry_history, args.resumed_from)
+        result = compose_with_retries(codex, store, fixture, checkpoints, case, model["default"],
+                                      args.max_attempts, args.retry_history, snapshot)
         with store.database() as connection:
             database_path = Path(connection.execute("PRAGMA database_list").fetchone()[2]).resolve()
             if not database_path.is_relative_to(fixture):
@@ -282,8 +449,7 @@ def evaluate(args, fixture, guard):
         raise AssertionError("no actual Codex HTTP request observed")
     if guard.denied:
         raise group_example.IsolationViolation("unexpected network attempt during composition")
-    hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-              for path in sorted(args.module_dir.glob("psy_*.py")) if not path.is_symlink()}
+    hashes = module_hashes(args.module_dir)
     metadata = {"case": args.case, "variant": args.variant, "real_codex": True,
                 "provider": model["provider"], "model_requested": model["default"],
                 "composition_only": True, "delivery_tested": False, "real_telegram_requests": 0,
@@ -298,7 +464,8 @@ def evaluate(args, fixture, guard):
                 "missing_requirements": getattr(result, "missing_requirements", []),
                 "quality_metadata": getattr(result, "quality_metadata", {}),
                 "characters": len(result.text), "word_count": len(result.text.split()),
-                "source_sha256": hashes}
+                "source_sha256": hashes, "retry_history": args.retry_history,
+                "resumed_from": args.resumed_from}
     return result.text, metadata
 
 
@@ -311,6 +478,8 @@ def main():
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--source-host", action="append", default=[])
     parser.add_argument("--allow-pdf", action="store_true", help="use the exact production sandboxed PDF decoder")
+    parser.add_argument("--max-attempts", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--resume-state", type=Path, help="private synthetic snapshot below output-root/recovery")
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     sys.dont_write_bytecode = True
@@ -319,11 +488,13 @@ def main():
     actual_home = Path(os.environ.get("HERMES_HOME", "/home/hermes/.hermes")).resolve()
     repository = Path(__file__).resolve().parents[2]
     output = private_output(args.output_root, (actual_home, args.checkout, args.module_dir, repository))
-    for name in ("review", "keys"):
+    for name in ("review", "keys", "recovery"):
         destination = output / name
         destination.mkdir(mode=0o700, exist_ok=True)
         private_output(destination, (actual_home, args.checkout, args.module_dir, repository))
     label = "answer-" + secrets.token_hex(6)
+    args.output_root, args.label = output, label
+    args.retry_history, args.resumed_from = [], None
     for key in ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "NOUS_API_KEY"):
         os.environ.pop(key, None)
     os.environ.update(PSY_OWNER_ID=str(group_example.OWNER), PSY_GROUP_ID=str(group_example.GROUP),
@@ -337,6 +508,8 @@ def main():
             fixture = Path(temporary).resolve()
             audit = group_example.install_storage_audit(fixture, actual_home, args.checkout,
                 pdf_reader=args.module_dir / "psy_source_evidence.py" if args.allow_pdf else None)
+            if args.resume_state:
+                args.resumed_from = restore_recovery(args, fixture, output)
             from pm.environments import committed_venv, site_packages
             environment = committed_venv(args.checkout)
             if environment is None:
@@ -369,7 +542,8 @@ def main():
     except Exception as error:
         metadata = {"status": "failed", "label": label, "case": args.case, "variant": args.variant,
                     "error_class": type(error).__name__, "started_at": started,
-                    "elapsed_seconds": round(time.time() - started, 2)}
+                    "elapsed_seconds": round(time.time() - started, 2),
+                    "retry_history": args.retry_history, "resumed_from": args.resumed_from}
         frames = []
         cursor = error.__traceback__
         while cursor:
@@ -382,7 +556,8 @@ def main():
             if isinstance(value, str) and re.fullmatch(r"[a-z_]+", value):
                 metadata[name] = value
         write_private(output / "keys" / (label + ".json"), json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")
-        print(json.dumps({key: value for key, value in metadata.items() if key != "variant"}, ensure_ascii=False))
+        public_keys = ("status", "label", "case", "error_class", "elapsed_seconds", "error_frames", "kind", "stage")
+        print(json.dumps({key: metadata[key] for key in public_keys if key in metadata}, ensure_ascii=False))
         raise SystemExit(1)
 
 

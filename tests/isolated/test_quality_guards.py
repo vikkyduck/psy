@@ -1,10 +1,12 @@
 """Fast guards for the real quality harness. No credentials, network or model calls."""
 from contextlib import ExitStack, contextmanager
 import importlib.util
+import json
 import os
 from pathlib import Path
 import socket
 import subprocess
+import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -301,6 +303,155 @@ class QualityOutputTests(unittest.TestCase):
         with store.database(self.root) as connection:
             self.assertEqual(connection.execute("SELECT long_job FROM schedule WHERE request_id=?",
                                                (group_example.UPDATE,)).fetchone(), (1,))
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="psy-quality-recovery-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.fixture = self.root / "fixture"
+        self.fixture.mkdir(mode=0o700)
+        self.output = self.root / "output"
+        self.output.mkdir(mode=0o700)
+        (self.output / "recovery").mkdir(mode=0o700)
+        self.modules = Path(__file__).resolve().parents[2] / "gateway/plugins/platforms/telegram"
+        spec = importlib.util.spec_from_file_location("quality_recovery_store", self.modules / "psy_group_store.py")
+        self.store = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.store)
+        self.checkpoints = quality.fixture_job(self.store, self.fixture)
+        self.args = SimpleNamespace(case="concepts", variant="candidate", module_dir=self.modules)
+
+    def snapshot(self):
+        self.checkpoints.put("model:effort:v1", {"silent_cuts": 2})
+        self.checkpoints.put("model:synthetic-stage", {"text": "synthetic checkpoint", "complete": True,
+            "generation_metadata": {"effort": "max", "generation_complete": True, "generated_at": 1000}})
+        original = self.store.database
+        with patch.object(self.store, "database", lambda *args, **kwargs: original(self.fixture)):
+            path = quality.export_recovery(self.store, self.fixture, self.output, "answer-synthetic", self.args,
+                                           "synthetic-model", [{"kind": "timeout"}], None)
+        self.args.resume_state = Path(path)
+        return Path(path)
+
+    def restore(self):
+        destination = self.root / "restored"
+        destination.mkdir(mode=0o700)
+        return destination, quality.restore_recovery(self.args, destination, self.output)
+
+    def test_snapshot_restores_actual_effort_mark_and_stage_provenance(self):
+        snapshot = self.snapshot()
+        destination, provenance = self.restore()
+        self.assertEqual(provenance["checkpoint_count"], 2)
+        self.assertEqual(provenance["snapshot"], str(snapshot))
+        restored = quality.fixture_job(self.store, destination, resumed=True)
+        self.assertEqual(restored.get("model:effort:v1"), {"silent_cuts": 2})
+        self.assertEqual(restored.get("model:synthetic-stage")["generation_metadata"]["effort"], "max")
+        self.assertEqual(provenance["manifest"]["model_requested"], "synthetic-model")
+        self.assertEqual((snapshot / "group.sqlite3").stat().st_mode & 0o777, 0o600)
+
+    def test_snapshot_wrong_variant_or_case_is_rejected(self):
+        self.snapshot()
+        self.args.variant = "baseline"
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_with_other_participant_is_rejected(self):
+        snapshot = self.snapshot()
+        with sqlite3.connect(snapshot / "group.sqlite3") as connection:
+            connection.execute("UPDATE requests SET uid=?", (group_example.OTHER_MEMBER,))
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_with_business_history_is_rejected(self):
+        snapshot = self.snapshot()
+        with sqlite3.connect(snapshot / "group.sqlite3") as connection:
+            connection.execute("INSERT INTO turns(uid,topic,prompt,answer) VALUES(?,1,'synthetic','synthetic')",
+                               (group_example.MEMBER,))
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_with_trigger_is_rejected(self):
+        snapshot = self.snapshot()
+        with sqlite3.connect(snapshot / "group.sqlite3") as connection:
+            connection.execute("CREATE TRIGGER synthetic_trigger AFTER INSERT ON checkpoints BEGIN SELECT 1; END")
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_with_public_file_or_wal_is_rejected(self):
+        snapshot = self.snapshot()
+        (snapshot / "group.sqlite3").chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.restore()
+        (self.root / "restored").rmdir()
+        (snapshot / "group.sqlite3").chmod(0o600)
+        (snapshot / "group.sqlite3-wal").write_bytes(b"synthetic sidecar")
+        with self.assertRaises(ValueError):
+            self.restore()
+
+    def test_snapshot_outside_recovery_or_symlinked_database_is_rejected(self):
+        snapshot = self.snapshot()
+        self.args.resume_state = self.fixture
+        with self.assertRaises(ValueError):
+            self.restore()
+        (self.root / "restored").rmdir()
+        self.args.resume_state = snapshot
+        (snapshot / "group.sqlite3").unlink()
+        (snapshot / "group.sqlite3").symlink_to(self.fixture / "group.sqlite3")
+        with self.assertRaises(OSError):
+            self.restore()
+
+    def test_retry_uses_same_checkpoints_and_production_delay(self):
+        class ModelIssue(Exception):
+            kind, stage, reset, retryable = "timeout", "stream_idle", None, True
+        calls = []
+        def respond(_turns, **kwargs):
+            calls.append(kwargs["checkpoints"])
+            if len(calls) == 1:
+                kwargs["checkpoints"].put("model:effort:v1", {"silent_cuts": 2})
+                raise ModelIssue()
+            self.assertEqual(kwargs["checkpoints"].get("model:effort:v1"), {"silent_cuts": 2})
+            return "synthetic success"
+        codex = SimpleNamespace(ModelIssue=ModelIssue, respond=respond)
+        clock = [1000.0]
+        waits, history = [], []
+        def sleep(seconds):
+            waits.append(seconds)
+            clock[0] += seconds
+        with patch.object(quality.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(quality.time, "sleep", side_effect=sleep), patch("builtins.print"):
+            result = quality.compose_with_retries(codex, self.store, self.fixture, self.checkpoints,
+                quality.CASES["concepts"], "synthetic-model", 3, history, lambda: "synthetic-snapshot")
+        self.assertEqual(result, "synthetic success")
+        self.assertEqual(calls, [self.checkpoints, self.checkpoints])
+        self.assertEqual(sum(waits), 60)
+        self.assertEqual(history[0]["retry_delay_seconds"], 60)
+        self.assertEqual(self.store.state(group_example.UPDATE, root=self.fixture), "running")
+
+    def test_retry_limit_preserves_queued_job_instead_of_looping(self):
+        class ModelIssue(Exception):
+            kind, stage, reset, retryable = "timeout", "stream_idle", None, True
+        respond = Mock(side_effect=ModelIssue)
+        codex = SimpleNamespace(ModelIssue=ModelIssue, respond=respond)
+        clock, history = [1000.0], []
+        with patch.object(quality.time, "time", side_effect=lambda: clock[0]), \
+                patch.object(quality.time, "sleep", side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds)), \
+                patch("builtins.print"), self.assertRaises(ModelIssue):
+            quality.compose_with_retries(codex, self.store, self.fixture, self.checkpoints,
+                quality.CASES["concepts"], "synthetic-model", 3, history, lambda: "synthetic-snapshot")
+        self.assertEqual(respond.call_count, 3)
+        self.assertEqual(len(history), 3)
+        self.assertEqual(self.store.state(group_example.UPDATE, root=self.fixture), "queued")
+
+    def test_nonretryable_failure_is_exported_but_not_retried(self):
+        class ModelIssue(Exception):
+            kind, stage, reset, retryable = "context", "source_missing", None, False
+        respond, snapshot = Mock(side_effect=ModelIssue), Mock(return_value="synthetic-snapshot")
+        codex = SimpleNamespace(ModelIssue=ModelIssue, respond=respond)
+        with patch("builtins.print"), self.assertRaises(ModelIssue):
+            quality.compose_with_retries(codex, self.store, self.fixture, self.checkpoints,
+                quality.CASES["concepts"], "synthetic-model", 3, [], snapshot)
+        self.assertEqual(respond.call_count, 1)
+        snapshot.assert_called_once()
 
 
 if __name__ == "__main__":
