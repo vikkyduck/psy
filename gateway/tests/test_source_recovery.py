@@ -13,8 +13,8 @@ def module(name):
         return importlib.import_module(name)
 
 
-sources, evidence, client, prompts = map(module, (
-    "psy_group_sources", "psy_source_evidence", "psy_group_client", "psy_group_prompts"))
+sources, evidence, client, prompts, quality = map(module, (
+    "psy_group_sources", "psy_source_evidence", "psy_group_client", "psy_group_prompts", "psy_group_quality"))
 
 URL = "https://archive.example/original"
 QUOTE = "An independently located original passage."
@@ -111,6 +111,77 @@ class SourceRecovery(unittest.TestCase):
         self.assertLess(len(result.text), 1200)
         self.assertTrue(all(len(g) <= 240 for g in result.missing_requirements))
         self.pages.assert_not_called()
+
+    def test_long_search_gap_stays_intact_for_retry_but_is_not_a_footer(self):
+        gap = ("Synthetic archive: a second copy could not be opened. " * 6
+               + "The author attribution still needs verification against the original publication.")
+        self.assertGreater(len(gap), 240)
+        call = Mock(side_effect=[client.Result("Public notes", [], 1), checked([card()], [gap]),
+                                 checked([card()], [gap])])
+        result = sources._primary_sources(call, "D. W. Winnicott")
+        self.assertEqual(json.loads(result.text)["gaps"], [gap])
+        self.assertEqual(result.quality_metadata["source_gaps"], [gap])
+        self.assertIn(gap, call.call_args_list[-1].args[0][-1]["content"])
+        self.assertEqual(result.missing_requirements, [sources.SOURCE_REASONS["reported_gaps"]])
+        result.text = "Подтвержденная часть учебного ответа."
+        quality.mark_partial_text(result)
+        self.assertEqual(result.task_status, "partial")
+        self.assertEqual(result.text.split("\n\n")[-1],
+                         "Материал пока частичный. При чтении источников остались содержательные пробелы.")
+        self.assertNotIn("Synthetic archive", result.text)
+
+    def test_bounded_gap_has_explicit_ellipsis_without_a_cut_word(self):
+        gap = ("Проверка исходной публикации продолжается " * 100).strip()
+        clean = sources._gaps([gap] * 2 + ["X" * 5000] + [str(i) + gap for i in range(20)])
+        self.assertEqual(len(clean), sources.SOURCE_GAP_COUNT)
+        self.assertTrue(all(len(item) <= sources.SOURCE_GAP_LIMIT for item in clean))
+        self.assertLessEqual(sum(map(len, clean)), sources.SOURCE_GAP_COUNT * sources.SOURCE_GAP_LIMIT)
+        self.assertTrue(clean[0].endswith("..."))
+        prefix = clean[0][:-3]
+        self.assertEqual(gap[:len(prefix)], prefix)
+        self.assertEqual(gap[len(prefix)], " ")
+        self.assertEqual(clean[1], "...")
+
+    def test_resolved_historical_reason_is_not_a_current_user_requirement(self):
+        closed = URL + "/closed"
+        self.pages.side_effect = lambda url: (_ for _ in ()).throw(ValueError("closed")) if url == closed else page(url)
+        gap = "A synthetic interpretive limitation remains after access is restored."
+        call = Mock(side_effect=[client.Result("Public notes", [], 1), checked([card(url=closed)]),
+                                 checked([card()], [gap])])
+        result = sources._primary_sources(call, "D. W. Winnicott")
+        self.assertIn("source_unreadable", result.quality_metadata["source_reason_codes"])
+        self.assertEqual(result.quality_metadata["source_current_reason_codes"], ["reported_gaps"])
+        self.assertEqual(result.missing_requirements, [sources.SOURCE_REASONS["reported_gaps"]])
+        self.assertEqual(result.task_status, "partial")
+
+    def test_legacy_saved_result_without_current_codes_has_only_known_limits(self):
+        coverage = {"required": ["D. W. Winnicott", "Wilfred Bion", "untrusted author"],
+                    "missing": ["Wilfred Bion", "untrusted author"]}
+        notices = sources.source_requirements(["An old raw gap cut in the middle of attribu"], coverage)
+        self.assertEqual(notices, ["Не подтверждены первоисточники для авторов: Wilfred Bion.",
+                                   sources.SOURCE_REASONS["reported_gaps"]])
+        self.assertNotIn("untrusted", " ".join(notices))
+        self.assertEqual(sources.source_requirements(["old raw gap"], {"required": [], "missing": []}),
+                         [sources.SOURCE_REASONS["reported_gaps"]])
+
+    def test_current_source_notices_are_fixed_whole_sentences_and_bounded(self):
+        notices = sources.source_requirements(["raw gap https://untrusted.example"],
+            {"required": [], "missing": []}, ["reported_gaps", "source_unreadable", "quote_not_found", "invalid_card"])
+        self.assertLessEqual(len(notices), 3)
+        self.assertTrue(all(notice in sources.SOURCE_REASONS.values() and notice.endswith(".") for notice in notices))
+        self.assertNotIn("https://", " ".join(notices))
+        self.assertEqual(sources.source_requirements([], {}, ["source_unreadable"]), [])
+
+    def test_source_gap_metadata_has_a_total_bound_and_keeps_partial_status(self):
+        gaps = [str(i) + " проверяемый фрагмент" * 300 for i in range(40)]
+        result = sources._source_result("Evidence", 1, usable=True, gaps=gaps,
+            coverage={"required": [], "covered": [], "missing": []},
+            reasons=["source_unreadable", "reported_gaps"], attempts=2,
+            current_reasons=["reported_gaps"])
+        self.assertEqual(result.task_status, "partial")
+        self.assertLess(len(json.dumps(result.quality_metadata, ensure_ascii=False)), 18000)
+        self.assertEqual(len(result.quality_metadata["source_gaps"]), 8)
+        self.assertTrue(all(gap.endswith("...") for gap in result.quality_metadata["source_gaps"]))
 
     def test_fabricated_quote_never_becomes_evidence_after_retry(self):
         fabricated = card(support="A plausible but entirely invented author quotation.")

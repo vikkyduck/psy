@@ -176,6 +176,8 @@ def mark_partial_text(result):
         gaps = getattr(result, "missing_requirements", [])
         note = "Материал пока частичный."
         if gaps:
-            note += " Не завершено: " + " ".join(x[:300] for x in gaps[:6])
+            source_notices = getattr(result, "quality_metadata", {}).get("source_missing_requirements", [])
+            prefix = " " if all(x in source_notices for x in gaps) else " Не завершено: "
+            note += prefix + " ".join(x[:300] for x in gaps[:6])
         result.text += "\n\n" + note
     return result

@@ -9,12 +9,12 @@ if __package__:
     from .psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
     from .psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
                                     reading_list)
-    from .psy_source_evidence import EvidenceReader, author_coverage
+    from .psy_source_evidence import EvidenceReader, PUBLIC_AUTHORS, author_coverage
 else:
     from psy_group_client import ModelIssue, Result, _json_value, _parallel, _user
     from psy_group_prompts import (CENTRAL_READING, REVIEW, SOURCE_CHECK, WEB_SYSTEM, central_reading_subject,
                                    reading_list)
-    from psy_source_evidence import EvidenceReader, author_coverage
+    from psy_source_evidence import EvidenceReader, PUBLIC_AUTHORS, author_coverage
 
 
 # Fixed diagnoses, not model-generated explanations, are used in metadata and
@@ -37,26 +37,67 @@ SOURCE_REASONS = {
 }
 
 
+SOURCE_GAP_LIMIT = 2000
+SOURCE_GAP_COUNT = 8
+
+
 def _gaps(values):
     """Keep public-search gaps useful and bounded, never executable instructions."""
     clean = []
     for value in values if isinstance(values, list) else ():
         if isinstance(value, str):
-            text = " ".join(value.split())[:240]
+            text = " ".join(value.split())
+            if len(text) > SOURCE_GAP_LIMIT:
+                # The ellipsis marks omitted data. Never turn a cut word or URL
+                # into an apparently complete description for the second search.
+                end = text.rfind(" ", 0, SOURCE_GAP_LIMIT - 2)
+                text = text[:end].rstrip(" ,:;.-") + "..." if end > 0 else "..."
             if text and text not in clean:
                 clean.append(text)
-        if len(clean) == 8:
+        if len(clean) == SOURCE_GAP_COUNT:
             break
     return clean
 
 
-def _source_result(text, searches, *, usable, gaps, coverage, reasons, attempts):
+def source_requirements(gaps, coverage, current_reasons=None):
+    """Render current source limits from fixed diagnoses, never search-log prose.
+
+    Historical source_reason_codes do not prove a current failure. A saved result
+    without current codes receives only a generic gap and known missing authors.
+    """
+    if not gaps:
+        return []
+    known = {canonical for _, canonical in PUBLIC_AUTHORS}
+    required = set(coverage.get("required", ())) & known
+    missing = [canonical for _, canonical in PUBLIC_AUTHORS
+               if canonical in required and canonical in coverage.get("missing", ())]
+    output = ["Не подтверждены первоисточники для авторов: " + ", ".join(missing) + "."] if missing else []
+    current = set(current_reasons or ()) & SOURCE_REASONS.keys()
+    priorities = ("reported_gaps", "source_unreadable", "no_primary_text", "identity_unverified",
+                  "quote_not_found", "locator_unverified", "support_unverified", "invalid_quote",
+                  "invalid_card", "uncited_url", "incomplete_response", "invalid_response", "no_candidates")
+    for reason in priorities:
+        if reason in current:
+            output.append(SOURCE_REASONS[reason])
+        if len(output) == 3:
+            break
+    if not output or not current:
+        output.append(SOURCE_REASONS["reported_gaps"])
+    return output
+
+
+def _source_result(text, searches, *, usable, gaps, coverage, reasons, attempts, current_reasons=None):
+    gaps = _gaps(gaps)
     result = Result(text, [], searches, usable)
     result.task_status = "partial" if usable and gaps else "complete" if usable else "needs_source"
-    result.missing_requirements = list(gaps)
+    result.missing_requirements = source_requirements(gaps, coverage, current_reasons)
     result.quality_metadata = {
         "source_check_attempts": attempts,
         "source_reason_codes": sorted(set(reasons)),
+        "source_current_reason_codes": (sorted(set(current_reasons) & SOURCE_REASONS.keys())
+                                        if current_reasons is not None else None),
+        "source_gaps": gaps,
+        "source_missing_requirements": list(result.missing_requirements),
         "source_coverage": coverage,
         "coverage_status": "missing" if not usable else "partial" if gaps else "checked",
     }
@@ -139,6 +180,7 @@ def _read_central_work(call, subject, reader=None):
             found = sorted(n for (key, n) in collected if key == (work, series))
             if len(found) != size:
                 gaps.append(f"{work}, серия {series}: подтверждены элементы {found} из {size}.")
+        gaps = _gaps(gaps)
         if collected and not gaps:
             break
         messages.append(_user("Повтори чтение основной работы. Дочитай все недостающие элементы, "
@@ -146,7 +188,7 @@ def _read_central_work(call, subject, reader=None):
                               "Приведи ссылки инструментом и верни указанный JSON.\n" + "\n".join(gaps)))
     if not collected:
         gaps.append("Сквозное чтение запрошенной работы по структуре подтвердить не удалось.")
-    return list(collected.values()), gaps, searches
+    return list(collected.values()), _gaps(gaps), searches
 
 
 def _primary_sources(call, topic, *, read_main=False):
@@ -211,7 +253,7 @@ def _primary_sources(call, topic, *, read_main=False):
             return _source_result(json.dumps({"claims": accepted, "central_reading": central,
                                                "gaps": remaining, "coverage": coverage}, ensure_ascii=False),
                                   searches, usable=True, gaps=remaining, coverage=coverage,
-                                  reasons=all_reasons, attempts=attempt + 1)
+                                  reasons=all_reasons, attempts=attempt + 1, current_reasons=reasons)
         if not attempt:
             # This second web-enabled pass changes its search to the diagnosed
             # gap. It receives only the released topic, public notes and fixed
@@ -236,11 +278,11 @@ def _primary_sources(call, topic, *, read_main=False):
         return _source_result(json.dumps({"claims": central, "central_reading": central,
                                            "gaps": remaining, "coverage": coverage}, ensure_ascii=False),
                               searches, usable=True, gaps=remaining, coverage=coverage,
-                              reasons=all_reasons, attempts=2)
+                              reasons=all_reasons, attempts=2, current_reasons=reasons)
     remaining = _gaps([*central_gaps, *gaps]) or [SOURCE_REASONS["no_candidates"]]
     # The final notice uses bounded fixed diagnoses and known public names.
     # Untrusted page titles, URLs and model-supplied gaps stay out of it.
-    diagnoses = list(dict.fromkeys(SOURCE_REASONS[code] for code in all_reasons
+    diagnoses = list(dict.fromkeys(SOURCE_REASONS[code] for code in reasons
                                   if code != "reported_gaps"))[-3:]
     text = "Содержательный ответ по первоисточникам пока не подготовлен. " + " ".join(diagnoses)
     if coverage["missing"]:
@@ -249,7 +291,7 @@ def _primary_sources(call, topic, *, read_main=False):
              "Укажите автора, название работы и издание или пришлите нужный фрагмент для разбора. "
              "Это ограничение выполненной проверки, а не вывод об отсутствии публикаций.")
     return _source_result(text, searches, usable=False, gaps=remaining, coverage=coverage,
-                          reasons=all_reasons, attempts=2)
+                          reasons=all_reasons, attempts=2, current_reasons=reasons)
 
 
 def _verify_draft(call, result, evidence):
