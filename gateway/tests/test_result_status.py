@@ -141,6 +141,84 @@ class ResultRoute(unittest.IsolatedAsyncioTestCase):
 
 
 class GenerationAudit(unittest.TestCase):
+    def test_silent_cut_fallback_persists_across_resume_and_audit_replay(self):
+        for silent in (client.SILENT_CUT_SECONDS - 1, client.SILENT_CUT_SECONDS,
+                       client.SILENT_CUT_SECONDS + 1):
+            with self.subTest(silent=silent), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                store.pending(7, 55, "synthetic", root=root)
+                self.assertEqual(store.claim_next(root=root)[0], 55)
+                cp = store.Checkpoints(55, root=root)
+                turns = [client._user("private synthetic manuscript")]
+                first_key = client._stage_key("fixture", turns, "first section", prose=False)
+                second_key = client._stage_key("fixture", turns, "second section", prose=False)
+                interruption = client.ModelIssue("timeout", "stream")
+                interruption.silent = silent
+                seen = []
+
+                def stream(_client, headers, messages, web, model, *, instructions, effort, **kwargs):
+                    seen.append((instructions, effort))
+                    if instructions == "second section" and len(seen) == 2:
+                        raise interruption
+                    return client.Result("saved " + instructions, [], 0)
+
+                with patch.object(client, "_transport", nullcontext), \
+                        patch.object(client, "_authenticated_request", side_effect=lambda invoke: invoke("", {})), \
+                        patch.object(client, "_stream", side_effect=stream):
+                    call, _ = client._job_calls(None, "fixture", cp)
+                    call.deep = True
+                    first = call(turns, "first section")
+                    with self.assertRaises(client._ResumeModelJob) as deferred:
+                        call(turns, "second section")
+                    self.assertIs(deferred.exception.issue, interruption)
+                    self.assertIs(call.halt.reason, deferred.exception)
+                    # The refusal parks the job instead of retrying inline or running siblings.
+                    with self.assertRaises(client._ResumeModelJob) as sibling:
+                        call(turns, "third section")
+                    self.assertIs(sibling.exception.issue, interruption)
+                    self.assertEqual(seen, [("first section", client.DEEP_EFFORT),
+                                            ("second section", client.DEEP_EFFORT)])
+                    self.assertIsNone(cp.get(second_key))
+                    original = cp.get(first_key)
+                    fallback = silent >= client.SILENT_CUT_SECONDS
+                    expected_mark = {"silent_cuts": 1} if fallback else None
+                    self.assertEqual(cp.get(client.EFFORT_MARK), expected_mark)
+
+                    # A new job instance reads the persisted mark and reuses completed work.
+                    store.recover(root=root)
+                    self.assertEqual(store.claim_next(root=root)[0], 55)
+                    cp = store.Checkpoints(55, root=root)
+                    resumed, _ = client._job_calls(None, "fixture", cp)
+                    resumed.deep = True
+                    self.assertEqual(resumed(turns, "first section").text, first.text)
+                    second = resumed(turns, "second section")
+                    expected_effort = client.FALLBACK_EFFORT if fallback else client.DEEP_EFFORT
+                    self.assertEqual(seen[-1], ("second section", expected_effort))
+                    self.assertEqual(len(seen), 3)
+                    self.assertEqual(cp.get(first_key), original)
+                    self.assertEqual(cp.get(client.EFFORT_MARK), expected_mark)
+                    self.assertEqual(second.quality_metadata["generation"]["fallback_used"], fallback)
+                    audit = resumed.audit()["generation_audit"]
+
+                expected_counts = ({client.DEEP_EFFORT: 1, client.FALLBACK_EFFORT: 1} if fallback else
+                                   {client.DEEP_EFFORT: 2})
+                self.assertEqual(audit["effort_counts"], expected_counts)
+                self.assertEqual(audit["fallback_stages"], int(fallback))
+                self.assertEqual(audit["stages"], 2)
+                self.assertEqual(audit["replayed_stages"], 1)
+                self.assertTrue(audit["generation_complete"])
+                replay, _ = client._job_calls(None, "fixture", store.Checkpoints(55, root=root))
+                replay.deep = True
+                with patch.object(client, "_authenticated_request", side_effect=AssertionError("network forbidden")):
+                    self.assertEqual(replay(turns, "first section").quality_metadata,
+                                     first.quality_metadata)
+                    self.assertEqual(replay(turns, "second section").quality_metadata,
+                                     second.quality_metadata)
+                replayed_audit = replay.audit()["generation_audit"]
+                self.assertEqual(replayed_audit, dict(audit, replayed_stages=2))
+                self.assertNotIn("private synthetic manuscript", str(replayed_audit))
+                self.assertNotIn("saved first section", str(replayed_audit))
+
     def test_replay_keeps_original_effort_and_missing_legacy_metadata_unknown(self):
         class Memory(dict):
             def put(self, key, value):
