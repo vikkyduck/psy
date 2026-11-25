@@ -46,6 +46,7 @@ class Renewal(unittest.TestCase):
         self.new_grant = "fixture-renewed-grant"
         self.oauth_posts = 0
         self.model_posts = 0
+        self.writing_stages = []
         self.transport = httpx.MockTransport(self.endpoint)
         stack.enter_context(patch.object(provider, "_codex_http_client",
                                          side_effect=lambda **_: httpx.Client(transport=self.transport)))
@@ -72,15 +73,45 @@ class Renewal(unittest.TestCase):
             if request.headers["Authorization"] == "Bearer " + self.old_access:
                 return httpx.Response(401, json={"error": {"code": "token_expired"}})
             self.assertEqual(request.headers["Authorization"], "Bearer " + self.new_access)
+            body = json.loads(request.content)
+            instructions = body["instructions"]
+            if instructions.startswith(quality._EXTRACT):
+                self.assertIn("6 * 7?", json.dumps(body["input"]))
+                self.writing_stages.append("contract")
+                text = json.dumps(dict(task="Calculate 6 * 7", audience=None, topics=["arithmetic"],
+                    examples=[], format=None, deliverables=[], constraints=[], obligations=["Return the product of 6 and 7"],
+                    continuation=False, superseded_requirements=[], kind="answer", minutes=None,
+                    outline_only=False, limited_scope=False, local_only=False))
+            elif instructions == quality._REVIEW:
+                # The real completion stage must receive both the original task and
+                # the whole generated answer, rather than being bypassed by this fixture.
+                self.assertIn("6 * 7?", json.dumps(body["input"]))
+                final_parts = body["input"][-1]["content"]
+                manuscript = final_parts if isinstance(final_parts, str) else "".join(
+                    part["text"] for part in final_parts if part["type"] == "input_text")
+                self.assertEqual(manuscript.split("\n", 1)[1], "42")
+                self.writing_stages.append("review")
+                text = '{"complete":true,"missing":[]}'
+            elif prompts.DISPATCH in instructions:
+                self.assertEqual(self.writing_stages[-1], "contract")
+                self.writing_stages.append("answer")
+                text = "42"
+            else:
+                self.fail("Unexpected model stage in the arithmetic fixture")
             event = {"type": "response.completed", "response": {
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": "42"}]}]}}
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}}
             return httpx.Response(200, text="data: " + json.dumps(event) + "\n")
         raise AssertionError(f"Unexpected fixture request: {request.method} {request.url.path}")
 
     def question(self):
         with httpx.Client(transport=self.transport) as client:
             question = "6 * 7?"
-            return pipeline._compose(client, [codex._user(question)], False, "fixture", question).text
+            result = pipeline._compose(client, [codex._user(question)], False, "fixture", question)
+        self.assertEqual(self.writing_stages[-3:], ["contract", "answer", "review"])
+        self.assertEqual(result.task_status, "complete")
+        self.assertEqual(result.quality_metadata["task_contract"]["contract_status"], "extracted")
+        self.assertEqual(result.quality_metadata["completion_review"], "passed")
+        return result.text
 
     def native_refresh(self):
         return pools.load_pool("openai-codex").try_refresh_matching(credential_id="primary")
@@ -179,6 +210,8 @@ if __name__ == "__main__":
         import psy_group_codex as group
         import psy_group_client as codex
         import psy_group_pipeline as pipeline
+        import psy_group_quality as quality
+        import psy_group_prompts as prompts
         monitor_path = Path(__file__).resolve().parents[2] / "ops/libexec/psy_codex_auth.py"
         spec = importlib.util.spec_from_file_location("psy_codex_auth", monitor_path)
         monitor = importlib.util.module_from_spec(spec)
