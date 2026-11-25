@@ -526,10 +526,33 @@ def remember(uid, topic, question, answer, *, source_id=None, message_id=None, r
         return turn_id
 
 
+def recorded_turn(uid, topic, request_key, *, root=ROOT):
+    """Read an idempotent turn only through its owning queued request and scope."""
+    with database(root) as con:
+        turn_id = _previous_write(con, request_key, uid, topic, "turn")
+        if turn_id is None:
+            return None
+        row = con.execute("""SELECT t.id,t.prompt,t.answer,s.doc_id FROM turns t
+                              LEFT JOIN turn_sources s ON s.turn_id=t.id
+                              WHERE t.id=? AND t.uid=? AND t.topic=?""", (turn_id, uid, topic)).fetchone()
+        if row is None:
+            raise ValueError("Recorded group turn mismatch")
+        return row
+
+
 # Job outcomes shared by the route, the queue and the model pipelines. They live here because
 # every group module already imports the store, and the store imports none of them.
 class DeliveryUncertain(Exception):
     """A Telegram send may have reached the group without a receipt. It is never repeated."""
+
+    def __init__(self, reason="unknown", stage="unknown", error_class=None):
+        super().__init__("Delivery outcome is uncertain")
+        self.audit = {"reason": reason, "stage": stage}
+        if error_class in {"TimedOut", "NetworkError", "Forbidden", "BadRequest", "InvalidToken",
+                           "ChatMigrated", "Conflict", "OperationalError", "OSError", "TimeoutError"}:
+            self.audit["error_class"] = error_class
+        elif error_class is not None:
+            self.audit["error_class"] = "other"
 
 
 class GroupJobParked(Exception):
@@ -853,7 +876,7 @@ def retry_delivery(ident, part, retry_at, *, root=ROOT, park=False):
         _finish_attempt(con, ident, part, "retry", None, retry_at, park=park)
 
 
-def settle(ident, success, *, root=ROOT):
+def settle(ident, success, *, root=ROOT, diagnostic=None):
     with database(root) as con:
         if success:
             key = "update:" + str(ident)
@@ -877,7 +900,7 @@ def settle(ident, success, *, root=ROOT):
         else:
             # Keep the request text for an operator requeue, and the answer if there is one.
             con.execute("UPDATE requests SET state='uncertain' WHERE id=?", (ident,))
-            _queue_audit(con, ident, "delivery_uncertain", "uncertain")
+            _queue_audit(con, ident, "delivery_uncertain", "uncertain", diagnostic or {})
             if con.execute("SELECT 1 FROM checkpoints WHERE request_id=? AND key=?", (ident, ANSWER)).fetchone():
                 _drop_stages(con, ident)
 

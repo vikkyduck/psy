@@ -586,6 +586,10 @@ def evaluate(args, fixture, guard):
     evidence = importlib.import_module(package + ".psy_source_evidence")
     store = importlib.import_module(package + ".psy_group_store")
     codex = importlib.import_module(package + ".psy_group_codex")
+    tokenizer = None
+    if (args.module_dir / "psy_group_context.py").is_file():
+        context = importlib.import_module(package + ".psy_group_context")
+        tokenizer = context.prepare_tokenizer()
     import hermes_cli.config as config
     model = config.load_config_readonly()["model"]
     if model.get("provider") != "openai-codex":
@@ -616,6 +620,7 @@ def evaluate(args, fixture, guard):
         raise group_example.IsolationViolation("unexpected network attempt during composition")
     hashes = module_hashes(args.module_dir)
     metadata = {"case": args.case, "variant": args.variant, "real_codex": True,
+                "tokenizer": tokenizer,
                 "provider": model["provider"], "model_requested": model["default"],
                 "composition_only": True, "delivery_tested": False, "real_telegram_requests": 0,
                 "synthetic_inputs_only": True, "temporary_database_verified": True,

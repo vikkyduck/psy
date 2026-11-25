@@ -26,8 +26,8 @@ class TestGuard(unittest.IsolatedAsyncioTestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         database = store.database
-        self.enterContext(patch.object(store, "database", lambda *a, **kw:
-                          database(*a, **kw) if a or kw else database(Path(directory.name))))
+        self.enterContext(patch.object(store, "database", lambda root=store.ROOT:
+                          database(Path(directory.name) if root == store.ROOT else root)))
 
     async def test_matrix_and_commands(self):
         self.assertFalse(await route.intercept(None,event(route.OWNER,route.OWNER,"/model")))

@@ -2,6 +2,7 @@
 import importlib
 import json
 import os
+import sqlite3
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
@@ -174,6 +175,28 @@ class Provenance(unittest.TestCase):
         self.assertEqual(cached.stop_reason, result.stop_reason)
         self.assertEqual(cached.quality_metadata, result.quality_metadata)
         self.assertEqual(replay.audit()["generation_audit"]["failed_attempts"], audit["failed_attempts"])
+
+    def test_audit_checkpoint_failure_preserves_original_provider_cause(self):
+        class FailedAudit(Memory):
+            def put(self, key, value):
+                if key == client.ATTEMPT_AUDIT:
+                    raise sqlite3.OperationalError("PRIVATE storage detail")
+                super().put(key, value)
+        for kind in ("timeout", "context"):
+            issue = client.ModelIssue(kind, "stream_idle" if kind == "timeout" else "http")
+            with self.subTest(kind=kind), patch.object(client, "_transport", nullcontext), \
+                    patch.object(client, "_authenticated_request", side_effect=issue):
+                call, _ = client._job_calls(None, MODEL, FailedAudit())
+                expected = client._ResumeModelJob if issue.retryable else client.ModelIssue
+                with self.assertRaises(expected) as caught:
+                    call([client._user("PRIVATE question")], "PRIVATE instruction")
+                original = caught.exception.issue if issue.retryable else caught.exception
+            self.assertIs(original, issue)
+            record = issue.quality_metadata["generation_audit"]["failed_attempts"][0]
+            self.assertEqual(record["stop_reason"], kind)
+            self.assertFalse(record["audit_checkpoint_persisted"])
+            self.assertEqual(record["audit_checkpoint_error_class"], "OperationalError")
+            self.assertNotIn("PRIVATE", str(issue.quality_metadata))
 
     def test_terminal_failure_attaches_audit_without_retry(self):
         issue = client.ModelIssue("context", "http")

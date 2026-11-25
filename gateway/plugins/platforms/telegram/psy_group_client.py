@@ -637,7 +637,13 @@ def _job_calls(client, model, checkpoints):
             with audit_lock:
                 failed_attempts.append(failure)
                 if checkpoints is not None:
-                    checkpoints.put(ATTEMPT_AUDIT, {"failed_attempts": failed_attempts})
+                    try:
+                        checkpoints.put(ATTEMPT_AUDIT, {"failed_attempts": failed_attempts})
+                    except Exception as audit_error:
+                        # Preserve the provider cause for the route's durable failure
+                        # envelope. A storage error must not replace that evidence.
+                        failure["audit_checkpoint_persisted"] = False
+                        failure["audit_checkpoint_error_class"] = type(audit_error).__name__
             exc.quality_metadata.update(audit())
             if checkpoints is not None and exc.retryable:
                 # Park in the durable queue with backoff. Never retry inline, switch

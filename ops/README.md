@@ -70,6 +70,59 @@ sudo bash ops/test-host --units
 
 Ключ --new-profile ставит публичный SOUL.md в новый профиль и при необходимости сохраняет первоначальный SOUL.md от Hermes рядом как SOUL.md.before-psy. При восстановлении личного профиля используйте install-runtime без ключа. Установщик располагает копию навыка и скрипта по пути skills/media/audio-transcription, исходники Mini App в /opt/psy-upload, общий модуль common/psy_common.py в /usr/local/lib/psy-common и независимый манифест границы группы в /usr/local/lib/psy-group. Общий модуль содержит проверку параметров экземпляра, вызов Bot API, атомарную запись файлов и чтение SQLite без создания служебных файлов. Службы, проверки и брокеры загружают его по явному пути, без изменения sys.path; переменную PSY_COMMON_PATH задают только тесты. При каждом старте шлюза preflight сверяет файлы адаптера, политики OAuth и проверки экземпляра, а также общий модуль, с манифестом релиза.
 
+## Локальный токенизатор для длинной истории
+
+Для длинной памяти группы отдельно установите закрепленный `tiktoken` и проверенную кодировку `o200k_base`. Это обязательный шаг приемки пакета с автоматическим сжатием истории. Без кодировки система использует консервативную оценку по байтам UTF-8, которая может начать сжатие значительно раньше реального заполнения окна модели. Установка токенизатора не меняет выбранную модель, профиль и пакетную среду Hermes.
+
+Сначала определите настоящий интерпретатор шлюза. Python загрузчика, распознавателя и системный `python3` для этого не подходят. У работающей службы сверяются `ExecStart`, `MainPID` и исполняемый файл процесса:
+
+```sh
+systemctl show hermes-gateway.service -p ExecStart -p MainPID
+psy_gateway_pid=$(systemctl show hermes-gateway.service -p MainPID --value)
+test "$psy_gateway_pid" -gt 0
+psy_runtime_python=$(sudo readlink -f "/proc/$psy_gateway_pid/exe")
+sudo -Hu hermes "$psy_runtime_python" -I -c 'print(__import__("sys").version)'
+```
+
+Если шлюз еще не запущен при восстановлении, прочитайте уже выбранное окружение от пользователя `hermes`. Этот код не запускает launcher, обновление, модель или Telegram:
+
+```sh
+psy_runtime_python=$(sudo -Hu hermes /usr/bin/python3.12 -I - /home/hermes/.hermes/hermes-agent <<'PY'
+from pathlib import Path
+import os
+import sys
+os.environ["HERMES_HOME"] = "/home/hermes/.hermes"
+checkout = Path(sys.argv[1])
+sys.path.insert(0, str(checkout))
+from pm.environments import committed_venv, venv_python
+environment = committed_venv(checkout)
+if environment is None:
+    raise SystemExit("No committed Hermes environment")
+print(venv_python(environment).resolve(strict=True))
+PY
+)
+sudo -Hu hermes "$psy_runtime_python" -I -c 'print(__import__("sys").version)'
+```
+
+В проверенном рабочем экземпляре 25 ноября 2026 года использовался CPython 3.14.7. Это наблюдение, а не путь для копирования в новую установку. Повторяйте определение после смены пакетной среды Hermes.
+
+Запустите установщик из проверенной копии репозитория, принадлежащей root. Для подготовки wheel-файлов ему нужен доверенный системный CPython 3.12. Фактический Python Hermes передается отдельно и выполняется установщиком только от `hermes`, включая определение ABI и проверку кодировки без сети:
+
+```sh
+sudo /usr/bin/python3.12 ops/install-context-tokenizer \
+  --python /usr/bin/python3.12 \
+  --runtime-user hermes \
+  --runtime-python "$psy_runtime_python"
+```
+
+Версии и SHA-256 wheel-файлов закреплены в `ops/context-tokenizer/requirements.lock.txt`. Установщик получает только эти wheel-файлы и публичную кодировку OpenAI, проверяет контрольные суммы и сохраняет manifest. Поддерживаются CPython 3.12 и 3.14 с указанными в lock-файле платформами. При несовпадении ABI установщик завершается с ошибкой. Запускать пользовательский Python Hermes от root нельзя.
+
+Готовые неизменяемые выпуски находятся в `/opt/psy-context-tokenizer/releases/<id>`. Внутри выпуска находятся `venv/lib/pythonX.Y/site-packages`, `cache`, `manifest.json` и копия lock-файла. Указатель `/opt/psy-context-tokenizer/current` переключается атомарно после проверки, старые выпуски сохраняются. Для Python 3.14 каталог `venv` содержит подготовленные пакеты нужного ABI, отдельного исполняемого `venv/bin/python` там может не быть.
+
+Групповой модуль добавляет проверенный каталог пакетов в конец пути импорта, не подменяя зависимости Hermes и не выполняя `.pth`. Кодировка читается из кеша выбранного выпуска, сетевых загрузок при ответе нет. Явные `TIKTOKEN_CACHE_DIR` и `DATA_GYM_CACHE_DIR` имеют приоритет, поэтому при приемке проверьте отсутствие устаревшей настройки. Установщик не перезапускает рабочий шлюз.
+
+Приемочный пример запускайте фактическим Python Hermes по [TESTS.md](../docs/TESTS.md). В результате нового стенда [quality_compare.py](../tests/isolated/quality_compare.py) ожидаются `tokenizer.available=true`, `tokenizer.estimator=o200k_base` и `quality_metadata.context_audit.token_estimator=o200k_base` для запросов с подготовкой контекста. Сценарий `memory_compacted` использует отдельный тестовый бюджет 4096 токенов и должен действительно сжать часть истории. Эти признаки не доказывают точность пересказа сами по себе, итоговый ответ проверяется содержательно.
+
 ## Локальные учетные данные
 
 Для нового бота введите полученный в BotFather токен через скрытый ввод. Запускайте команду в личном интерактивном терминале. Файл telegram-token.pending принадлежит hermes, режим 0600. Конфигуратор переносит значение в закрытый .env и проверяет совпадение с PSY_BOT_ID. Восстановленный профиль с действующим .env пропускает шаг скрытого ввода.

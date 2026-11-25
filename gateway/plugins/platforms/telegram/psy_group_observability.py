@@ -5,6 +5,7 @@ model or printed in logs. Public metadata contains only hashes and effective pol
 """
 import hashlib
 import errno
+from functools import lru_cache
 import json
 import importlib.metadata
 import os
@@ -19,11 +20,29 @@ def digest(data):
 
 
 def _read(path):
+    info = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("Runtime snapshot needs regular files")
+    return _read_version(str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@lru_cache(maxsize=8192)
+def _read_version(path, device, inode, size, modified, changed):
+    # Reuse bytes only while identity, length, mtime and ctime all match.
+    # This includes snapshot files, so changed/corrupted snapshots are re-read.
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, "rb") as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ValueError("Runtime snapshot needs regular files")
         return stream.read()
+
+
+@lru_cache(maxsize=1)
+def _environment():
+    # Dependency environments are committed and fixed for a gateway process.
+    return json.dumps({"python": list(sys.version_info[:3]), "packages": sorted(
+        (d.metadata.get("Name", "unknown"), d.version) for d in importlib.metadata.distributions())},
+        sort_keys=True).encode()
 
 
 def capture_runtime(model, *, profile=None, code_dir=None, root=None, policy=None, include_manifest=False):
@@ -35,9 +54,13 @@ def capture_runtime(model, *, profile=None, code_dir=None, root=None, policy=Non
     if (checkout / "agent/reasoning_effort.py").is_file():
         # These are the actual execution dependencies, not just the group wrappers.
         # In particular reasoning capabilities, context catalog and OAuth policy live here.
-        for area in ("agent", "hermes_cli", "gateway", "pm", "plugins/platforms/telegram"):
+        for area in ("agent", "hermes_cli", "gateway", "pm", "plugins/platforms/telegram", "plugins/image_gen"):
             for path in sorted((checkout / area).rglob("*.py")):
                 files["runtime/" + str(path.relative_to(checkout))] = _read(path)
+        # Image tier resolution and native request parameters live outside the group
+        # wrapper. Keep both provider code and plugin declarations in the same baseline.
+        for path in sorted((checkout / "plugins/image_gen").rglob("plugin.yaml")):
+            files["runtime/" + str(path.relative_to(checkout))] = _read(path)
         for relative in ("pyproject.toml", "uv.lock", ".git/HEAD", ".git/packed-refs"):
             path = checkout / relative
             if path.is_file():
@@ -47,9 +70,11 @@ def capture_runtime(model, *, profile=None, code_dir=None, root=None, policy=Non
             path = checkout / ".git" / head.removeprefix("ref: ")
             if path.is_file():
                 files["runtime/git-reference"] = _read(path)
-    environment = {"python": list(sys.version_info[:3]), "packages": sorted(
-        (d.metadata.get("Name", "unknown"), d.version) for d in importlib.metadata.distributions())}
-    files["runtime/environment.json"] = json.dumps(environment, sort_keys=True).encode()
+    files["runtime/environment.json"] = _environment()
+    for name in ("manifest.json", "requirements.lock.txt"):
+        path = Path("/opt/psy-context-tokenizer/current") / name
+        if path.is_file():
+            files["runtime/tokenizer/" + name] = _read(path)
     for name in ("config.yaml", "SOUL.md"):
         path = profile / name
         if path.exists():

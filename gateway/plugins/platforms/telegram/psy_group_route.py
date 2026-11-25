@@ -66,14 +66,73 @@ async def record_event(msg, event, details=None, **kwargs):
 
 async def record_failure(msg, event, details=None, *, action=None, **kwargs):
     checkpoints = getattr(msg, "checkpoints", None)
+    pending = None
     if action is not None and checkpoints is not None:
         # The exact safe cause survives a failure of the subsequent audit transaction.
         # A resumed job flushes this record before any new model or delivery action.
-        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1",
-                                   {"event": event, "details": details, "options": kwargs, "action": action})
+        pending = {"event": event, "details": details, "options": kwargs, "action": action,
+                   "recorded": False}
+        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", pending)
     await record_event(msg, event, details, **kwargs)
-    if action is not None and checkpoints is not None:
+    if pending is not None:
+        # Keep the terminal action until private history and its error delivery
+        # have completed. A restart in between must not run the model again.
+        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", {**pending, "recorded": True})
+
+
+async def clear_failure_action(msg):
+    checkpoints = getattr(msg, "checkpoints", None)
+    if checkpoints is not None:
         await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", None)
+
+
+async def remember_failure(msg, text, action):
+    """Retain the failed user turn privately before delivery or queue cleanup."""
+    uid, topic = msg.from_user.id, message_topic(msg)
+    mid = getattr(msg, "message_id", None)
+    checkpoints = getattr(msg, "checkpoints", None)
+    job = await asyncio.to_thread(checkpoints.get, "route:input:v1") if checkpoints is not None else None
+    question = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
+    source_id = None
+    trusted_job = (isinstance(job, dict) and job.get("destination") == [msg.chat.id, uid, topic, mid]
+                   and isinstance(job.get("question"), str))
+    if trusted_job:
+        question, source_id = job["question"], job.get("doc_id")
+    details = {"task_status": "failed", "generation_complete": False, "missing_requirements": [],
+               "quality_metadata": {"terminal_failure": True, "failure_type": action["type"],
+                                    "stop_reason": action.get("stop_reason", action.get("kind", "execution_failure")),
+                                    "stop_stage": action.get("stage")}}
+    # If generation finished before a later failure, preserve its checkpointed
+    # bytes and status. A terminal-only turn uses a different receipt, allowing
+    # an operator retry to retain both the failure and the later real answer.
+    final = await asyncio.to_thread(checkpoints.get, "route:answer:v1") if trusted_job else None
+    generated = isinstance(final, dict) and isinstance(final.get("text"), str)
+    if generated:
+        text = final["text"]
+        details = final.get("result_details", {"task_status": "unknown", "generation_complete": None,
+                                               "missing_requirements": [], "quality_metadata": {}})
+    existing = await asyncio.to_thread(store.recorded_turn, uid, topic, (msg.ident, "turn")) if checkpoints is not None else None
+    if existing is not None:
+        # This also preserves legacy generated turns with unknown provenance.
+        turn_id, source_id = existing[0], existing[3]
+    else:
+        options = {"request_key": (msg.ident, "turn" if generated else "failed_turn")} if checkpoints is not None else {}
+        turn_id = await committed_diagnostic(store.remember, uid, topic, question, text,
+                                            source_id=source_id, message_id=mid, result_details=details, **options)
+    saved = await asyncio.to_thread(store.result_details, uid, topic, turn_id)
+    is_failure = bool(saved and saved["quality_metadata"].get("terminal_failure"))
+    await record_event(msg, "failure_context_saved", {"failed_result": is_failure}, turn_id=turn_id)
+    return turn_id, source_id, is_failure
+
+
+async def deliver_failure(msg, text, action):
+    turn_id, source_id, is_failure = await remember_failure(msg, text, action)
+    sent = await error_reply(msg, text)
+    if is_failure and type(getattr(sent, "message_id", None)) is int and sent.message_id > 0:
+        uid, topic = msg.from_user.id, message_topic(msg)
+        await committed_diagnostic(store.bind_message, uid, topic, sent.message_id, source_id, turn_id)
+        await committed_diagnostic(store.confirm_result_delivery, uid, topic, turn_id)
+    await clear_failure_action(msg)
 
 
 async def finish_failure(msg, action):
@@ -81,16 +140,20 @@ async def finish_failure(msg, action):
         issue = ModelIssue(action["kind"], action["stage"], action.get("reset"))
         recovery = getattr(msg, "defer_model", None)
         if issue.retryable and recovery is not None:
+            # A retry starts model work again, rather than replaying this same
+            # deferral forever. Its retry metadata is committed by defer_model.
+            await clear_failure_action(msg)
             await recovery(issue)
             raise store.GroupJobParked()
-        await error_reply(msg, issue.public())
+        await deliver_failure(msg, issue.public(), action)
     else:
         queued = getattr(msg, "defer_failure", None)
         if queued is not None and action["transient"]:
+            await clear_failure_action(msg)
             await queued()
             raise store.GroupJobParked()
         safe = action.get("safe")
-        await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
+        await deliver_failure(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.", action)
         if queued is not None and safe is None:
             raise store.GroupJobFailed()
 
@@ -100,8 +163,16 @@ async def resume_diagnostic(msg):
     pending = await asyncio.to_thread(checkpoints.get, "route:diagnostic:v1") if checkpoints is not None else None
     if pending is None:
         return False
-    await record_event(msg, pending["event"], pending["details"], **pending["options"])
-    await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", None)
+    if not pending.get("recorded"):
+        # An interruption can occur after audit commit but before the phase flag.
+        # Reuse that exact safe event instead of duplicating the recorded cause.
+        report = await asyncio.to_thread(store.explain_request, audit_key(msg), uid=msg.from_user.id,
+                                         topic=message_topic(msg))
+        recorded = bool(report and any(event["event"] == pending["event"]
+                        and event["details"] == (pending["details"] or {}) for event in report["events"]))
+        if not recorded:
+            await record_event(msg, pending["event"], pending["details"], **pending["options"])
+        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", {**pending, "recorded": True})
     await finish_failure(msg, pending["action"])
     return True
 
@@ -531,6 +602,7 @@ async def error_reply(msg, text):
     sent = await msg.reply_text(text)
     await record_event(msg, "error_delivery", {"confirmed": type(getattr(sent, "message_id", None)) is int
                        and sent.message_id > 0})
+    return sent
 
 
 async def process_group(msg):
@@ -551,6 +623,7 @@ async def process_group(msg):
     except (store.GroupJobParked, store.DeliveryUncertain) as exc:
         # A timed-out Telegram send may already have reached the group.
         await record_failure(msg, "parked" if isinstance(exc, store.GroupJobParked) else "delivery_uncertain",
+                           getattr(exc, "audit", {}),
                            state="waiting" if isinstance(exc, store.GroupJobParked) else "uncertain")
         raise
     except ModelIssue as exc:
@@ -561,8 +634,10 @@ async def process_group(msg):
                            "retryable": exc.retryable,
                            "audit": result_audit({"quality_metadata": getattr(exc, "quality_metadata", {})})},
                            state="waiting" if exc.retryable and recovery is not None else "failed",
-                           action={"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset})
-        await finish_failure(msg, {"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset})
+                           action={"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset,
+                                   "stop_reason": getattr(exc, "stop_reason", exc.kind)})
+        await finish_failure(msg, {"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset,
+                                  "stop_reason": getattr(exc, "stop_reason", exc.kind)})
     except Exception as exc:
         tb = exc.__traceback__
         while tb and tb.tb_next:

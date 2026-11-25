@@ -221,6 +221,9 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 return
             await asyncio.to_thread(classify, msg.checkpoints)
         with (patch.object(queue.Update, "de_json", side_effect=restore), patch.object(route, "group_message",group),
+              # The five-second assertion concerns worker admission and model liveness.
+              # Snapshot integrity/concurrency has its own filesystem tests.
+              patch.object(route, "runtime_snapshot", return_value={"snapshot_id": "synthetic"}),
               patch.object(codex, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(codex, "_transport", nullcontext),
               patch.object(codex, "time", NS(monotonic=lambda: getattr(clocks,"now",0), time=lambda: 1800000000 + getattr(clocks,"now",0)))):
             worker=asyncio.create_task(queue.work(self.app, wake))

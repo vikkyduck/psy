@@ -106,6 +106,10 @@ class Outbound:
                 self.msg.message_thread_id if self.msg.is_topic_message else None, self.msg.message_id]
 
     async def resume_saved_text(self):
+        if await asyncio.to_thread(self.checkpoints.get, "route:diagnostic:v1") is not None:
+            # Terminal actions still need private history and post-send bookkeeping.
+            # The route will reuse the saved delivery receipt without sending twice.
+            return False
         saved = await asyncio.to_thread(self.checkpoints.get, "outbound.single_text")
         if saved is None:
             return False
@@ -123,13 +127,13 @@ class Outbound:
             # Persist the exact one-part response before contacting Telegram.
             try:
                 await committed_call(self.checkpoints.put, "outbound.single_text", saved)
-            except Exception:
-                raise DeliveryUncertain() from None
+            except Exception as exc:
+                raise DeliveryUncertain("storage_error", "save_response", type(exc).__name__) from None
         return await self._send_saved_text(saved)
 
     async def _send_saved_text(self, saved):
         if saved["destination"] != self._destination():
-            raise DeliveryUncertain()
+            raise DeliveryUncertain("destination_mismatch", "replay")
         options = dict(saved["options"])
         if options.get("reply_markup") is not None:
             from telegram import InlineKeyboardMarkup
@@ -151,8 +155,10 @@ class Outbound:
         envelope = [self._destination(), kind, content]
         fingerprint = hashlib.sha256(json.dumps(envelope, sort_keys=True, ensure_ascii=False,
                                                 separators=(",", ":")).encode()).hexdigest()
+        stage = "reserve_send"
         try:
             while True:
+                stage = "reserve_send"
                 action, value = await committed_call(store.begin_delivery, self.ident, part, fingerprint)
                 if action == "confirmed":
                     return SimpleNamespace(message_id=value)
@@ -160,28 +166,35 @@ class Outbound:
                     await asyncio.sleep(max(0, value - time.time()))
                     continue
                 if action != "send":
-                    raise DeliveryUncertain()
+                    raise DeliveryUncertain("unconfirmed_previous_attempt", stage)
                 try:
+                    stage = "telegram_send"
                     sent = await send()
                 except Exception as exc:
                     delay = retry_seconds(exc)
                     if delay is None:
-                        raise DeliveryUncertain() from None
+                        name = type(exc).__name__
+                        reason = ("timeout" if name in ("TimedOut", "TimeoutError") else
+                                  "telegram_rejected" if name in ("Forbidden", "BadRequest", "InvalidToken",
+                                                                  "ChatMigrated", "Conflict") else "transport_error")
+                        raise DeliveryUncertain(reason, stage, name) from None
+                    stage = "save_retry"
                     if self.scheduled:
                         await committed_call(store.retry_delivery, self.ident, part, time.time() + delay, park=True)
                         raise store.GroupJobParked()
                     await committed_call(store.retry_delivery, self.ident, part, time.time() + delay)
                     continue
                 if type(sent.message_id) is not int or sent.message_id <= 0:
-                    raise DeliveryUncertain()
+                    raise DeliveryUncertain("invalid_receipt", "telegram_send")
+                stage = "save_receipt"
                 await committed_call(store.confirm_delivery, self.ident, part, sent.message_id)
                 return sent
-        except store.GroupJobParked:
+        except (store.GroupJobParked, DeliveryUncertain):
             raise
-        except Exception:
+        except Exception as exc:
             # A receipt write can fail after Telegram accepted an answer. The route must
             # never answer that failure with another message or retry an ambiguous send.
-            raise DeliveryUncertain() from None
+            raise DeliveryUncertain("storage_error", stage, type(exc).__name__) from None
 
 
 async def typing(bot, msg, finished):
@@ -279,8 +292,8 @@ async def run_job(app, wake, ident, body):
         raise
     except store.GroupJobFailed:
         await durable(app, store.fail, ident)
-    except DeliveryUncertain:
-        await durable(app, store.settle, ident, False)
+    except DeliveryUncertain as exc:
+        await durable(app, store.settle, ident, False, diagnostic=exc.audit)
     except Exception as exc:
         if store.transient(exc):
             # Even recording the retry failed inside the job. Keep every checkpoint.

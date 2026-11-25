@@ -1,0 +1,33 @@
+# Isolated PSY tokenizer. CPython 3.12/3.14, Linux x86_64/aarch64.
+# Exact versions and SHA256 from https://pypi.org/pypi/<name>/<version>/json.
+# Include all production wheels plus universal wheels. No sdists, extras or unpinned dependencies.
+tiktoken==0.12.0 \
+    --hash=sha256:285ba9d73ea0d6171e7f9407039a290ca77efcdb026be7769dccc01d2c8d7fff \
+    --hash=sha256:65b26c7a780e2139e73acc193e5c63ac754021f160df919add909c1492c0fb37 \
+    --hash=sha256:d186a5c60c6a0213f04a7a802264083dea1bbde92a2d4c7069e1a56630aef830 \
+    --hash=sha256:edde1ec917dfd21c1f2f8046b86348b0f54a2c0547f68149d8600859598769ad
+
+regex==2026.11.24 \
+    --hash=sha256:0778f76a63e677ef022087a6a49c9b82de9bb1916bd7402a25abfe9f66bdd97f \
+    --hash=sha256:2c0d25b5a9c8d45c1a097880b63879a3e7738cfbe6ee1af7f00cd6be30490419 \
+    --hash=sha256:80da5c9043fac73a95cccd68e5eb3afb88bc7c531670e6245adb4a95690890de \
+    --hash=sha256:9156eebdd717b3904ced2542162a8e2b31d96cfafc72faf35b5cac23f506be4e
+
+requests==2.34.2 \
+    --hash=sha256:2a0d60c172f83ac6ab31e4554906c0f3b3588d37b5cb939b1c061f4907e278e0
+
+charset-normalizer==3.5.3 \
+    --hash=sha256:61e32fdbf56f4cd25a1efa451c8b5fe886fc5e00143ccaacafdf21f301fad059 \
+    --hash=sha256:70f65dd0c2ed79ea2d9776096e9c7d25e398c2c03eb31877753598d201d91784 \
+    --hash=sha256:96e268b0cbda016ac519513294fcd17032264085b600abaac58b93049477e132 \
+    --hash=sha256:e5e4785d8a0adeadfbdf75f4efc357911842674651cbafd7e97f69b11ec3cbc6 \
+    --hash=sha256:ee9de080e8d6221bbe4ba2667367b1cee0f47a53f60ffc5e431b698cd2f2b214
+
+idna==3.20 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3
+
+certifi==2026.11.20 \
+    --hash=sha256:7422df25243767b9877031a2248cb14d09ddac9beee846f4cef3d5c9191d488f

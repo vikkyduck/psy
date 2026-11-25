@@ -1,6 +1,7 @@
 """Failure provenance, private snapshots and full history use synthetic data only."""
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 import sqlite3
 from pathlib import Path
 import stat
@@ -83,6 +84,19 @@ class DurableDiagnostics(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'verification failed'):
             observation.capture_runtime('fixture', profile=profile, code_dir=code, root=snapshot_root)
 
+    def test_concurrent_snapshot_creation_is_verified_and_idempotent(self):
+        profile, code = self.root / 'profile', self.root / 'code'
+        profile.mkdir()
+        code.mkdir()
+        (code / 'psy_example.py').write_text('VALUE = 1\n')
+        def capture(_):
+            return observation.capture_runtime('fixture', profile=profile, code_dir=code,
+                                               root=self.root / 'snapshots')
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(capture, range(4)))
+        self.assertTrue(all(item == results[0] for item in results))
+        self.assertEqual(len(list((self.root / 'snapshots').iterdir())), 1)
+
 
 class RouteFailureDiagnostics(unittest.IsolatedAsyncioTestCase):
     async def test_terminal_issue_retained_without_transcript_or_private_memory(self):
@@ -152,7 +166,8 @@ class QueueDiagnosticRecovery(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("private memory", json.dumps(pending))
                     msg.reply_text.assert_not_awaited()
                 else:
-                    self.assertIsNone(pending)
+                    self.assertEqual(pending["details"]["stage"], "contract_input")
+                    self.assertTrue(pending["recorded"])
                     msg.reply_text.assert_awaited_once()
                 # Reopen the durable queue as a new worker after the backoff.
                 store.recover()

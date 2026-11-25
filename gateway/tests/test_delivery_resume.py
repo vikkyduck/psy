@@ -135,6 +135,7 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
                          [("original listing",), ("original listing",)])
 
     async def test_unknown_after_accept_never_replays(self):
+        store.audit_start('update:31', 7, 444, 100)
         accepted_on_wire = []
         async def ambiguous(text):
             accepted_on_wire.append(text)
@@ -148,6 +149,29 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
             await queue.work(self.app, asyncio.Event())
         self.assertEqual(store.state(self.ident), "uncertain")
         self.assertEqual(accepted_on_wire, ["already accepted"])
+        report = store.explain_request('update:31')
+        failure = next(item['details'] for item in report['events'] if item['event'] == 'delivery_uncertain')
+        self.assertEqual(failure, {'reason': 'timeout', 'stage': 'telegram_send', 'error_class': 'TimeoutError'})
+        self.assertNotIn('telegram receipt lost', str(report))
+
+    async def test_receipt_storage_failure_retains_safe_reason_without_repeating_send(self):
+        import sqlite3
+        store.audit_start('update:31', 7, 444, 100)
+        self.message.reply_text.return_value = NS(message_id=801)
+        async def group(outbound):
+            outbound.model_delivery()
+            await outbound.reply_text('private generated answer')
+        with patch.object(route, 'process_group', group), \
+             patch.object(store, 'confirm_delivery', side_effect=sqlite3.OperationalError('private database path')):
+            await queue.work(self.app, asyncio.Event())
+        report = store.explain_request('update:31')
+        failure = next(item['details'] for item in report['events'] if item['event'] == 'delivery_uncertain')
+        self.assertEqual(failure, {'reason': 'storage_error', 'stage': 'save_receipt',
+                                   'error_class': 'OperationalError'})
+        self.assertNotIn('private', str(report))
+        store.recover()
+        await queue.work(self.app, asyncio.Event())
+        self.assertEqual(self.message.reply_text.await_count, 1)
 
     async def test_missing_receipt_and_content_or_destination_mismatch_do_not_send(self):
         self.assertIsNotNone(store.claim_next())
