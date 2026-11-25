@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from psy_modules import psy_group_client as codex, psy_group_codex as m
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
-from psy_modules import psy_group_sources as sources
+from psy_modules import psy_group_sources as sources, psy_group_quality as quality
 
 
 def event(kind, **values):
@@ -73,14 +73,18 @@ class Duration(unittest.TestCase):
         plan = {"title": "Лекция", "sections": [{"title": "Теория", "minutes": 30, "activity_minutes": 0,
                                                  "brief": "Исторический пример"}]}
         outputs = iter([('PSY_TASK {"minutes":30}', False), (json.dumps(plan), False),
-                        ("Начало речи", True), ("Конец речи", False), ('{"missing":""}', False)])
+                        ("Начало речи", True), ("Конец речи", False), ('{"missing":""}', False),
+                        ('{"complete":true,"missing":[]}', False)])
         def stage(payload):
             text, incomplete = next(outputs)
+            if '"complete"' in text:
+                self.assertEqual(payload["instructions"], quality._REVIEW)
             return self.answer(text, incomplete=incomplete)
         result = self.compose("Напиши текст лекции", stage)
         self.assertTrue(result.complete)
+        self.assertEqual(result.task_status, "complete")
         self.assertIn("Начало речи\nКонец речи", result.text)
-        self.assertEqual(self.elapsed, 10 * 3600)
+        self.assertEqual(self.elapsed, 12 * 3600)
 
     def test_research_finishes_search_validation_synthesis_and_cross_check(self):
         url = "https://source.example/work"

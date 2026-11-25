@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from psy_modules import psy_group_quality as quality
 
 
 BLOCK_SIZE = 1024
@@ -44,6 +45,7 @@ class LectureEndpoint:
         self.inputs = []
         self.chapter_reviews = []
         self.source_reviews = []
+        self.task_reviews = []
 
     def stream(self, method, endpoint, *, headers, json, timeout):
         payload = json
@@ -73,6 +75,9 @@ class LectureEndpoint:
         elif instruction == prompts.REVIEW:
             self.source_reviews.extend(prose_fragments(payload))
             text = '{"edits":[]}'
+        elif instruction == quality._REVIEW:
+            self.task_reviews.extend(prose_fragments(payload))
+            text = '{"complete":true,"missing":[]}'
         else:
             raise AssertionError("Unknown stage of the synthetic lecture")
         return text, complete
@@ -129,9 +134,11 @@ class ContinuationCost(unittest.TestCase):
                 result = endpoint.compose()
                 manuscript = "\n".join(endpoint.blocks)
                 self.assertTrue(result.complete)
+                self.assertEqual(result.task_status, "complete")
                 self.assertEqual(list(prose_fragments(result.text)), [manuscript])
                 self.assertEqual(endpoint.chapter_reviews, [manuscript])
                 self.assertEqual(endpoint.source_reviews, [manuscript])
+                self.assertEqual(endpoint.task_reviews, [manuscript])
                 self.assertEqual(len(endpoint.contexts), count)
                 self.assertEqual(endpoint.contexts[0], [])
                 total = 0

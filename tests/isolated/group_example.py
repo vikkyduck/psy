@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -215,11 +216,51 @@ class NetworkGuard:
         self.stack.close()
 
 
-def install_storage_audit(fixture_root, actual_home, checkout):
+def install_storage_audit(fixture_root, actual_home, checkout, *, pdf_reader=None):
     """A missed store override must fail before accessing a production business database."""
     fixture_root = fixture_root.resolve()
     checkout = checkout.resolve()
     business = [(actual_home / name).resolve() for name in ('vault', 'media-vault')]
+    observed = {'pdf_subprocesses': 0, 'denials': 0}
+    pdf_permit = threading.local()
+    pdf_command = None
+    pdf_env = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8'}
+    if pdf_reader is not None:
+        pdf_reader = Path(pdf_reader)
+        if pdf_reader.is_symlink() or not pdf_reader.is_file() or pdf_reader.name != 'psy_source_evidence.py':
+            raise IsolationViolation('PDF reader must be the selected regular production module')
+        pdf_reader = pdf_reader.resolve(strict=True)
+        pdf_hash = hashlib.sha256(pdf_reader.read_bytes()).digest()
+        pdf_command = ['/usr/bin/python3', '-I', str(pdf_reader), '--pdf']
+
+    def deny(reason):
+        observed['denials'] += 1
+        raise IsolationViolation(reason)
+
+    def pdf_run_allowed(argv, args, kwargs):
+        # Opt-in only. This does not permit general Python or PDF utilities. The
+        # selected production decoder retains its own seccomp/Landlock sandbox.
+        if (pdf_command is None or not isinstance(argv, (list, tuple))
+                or list(argv) != pdf_command or args
+                or set(kwargs) != {'input', 'stdout', 'stderr', 'timeout', 'env', 'check'}
+                or kwargs['env'] != pdf_env or kwargs['stderr'] != subprocess.DEVNULL
+                or kwargs['timeout'] != 32 or kwargs['check'] is not True):
+            return False
+        data = kwargs['input']
+        if not isinstance(data, bytes) or not data.startswith(b'%PDF-') or len(data) > 8 * 1024 * 1024:
+            return False
+        if pdf_reader.is_symlink() or hashlib.sha256(pdf_reader.read_bytes()).digest() != pdf_hash:
+            return False
+        try:
+            descriptor = kwargs['stdout'].fileno()
+            output = os.fstat(descriptor)
+            # The production decoder runs on Linux. Resolve its already-open
+            # output descriptor, including TemporaryFile's unlinked pathname.
+            path = Path(os.readlink('/proc/self/fd/' + str(descriptor)).removesuffix(' (deleted)')).resolve()
+            return (stat.S_ISREG(output.st_mode) and output.st_uid == os.geteuid()
+                    and output.st_mode & 0o077 == 0 and path.is_relative_to(fixture_root))
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
     # Version metadata is imported by auth constants, even with the Codex provider.
     # Allow only its exact immutable queries, with hooks, locks, credentials,
     # prompts and every Git transport disabled. No inherited environment enters Git.
@@ -246,11 +287,19 @@ def install_storage_audit(fixture_root, actual_home, checkout):
                    and re.fullmatch(r'v2[0-9]{3}\.[0-9]+\.[0-9]+:pyproject\.toml', parts[1]) is not None)
     original_run = subprocess.run
     def metadata_run(argv, *args, **kwargs):
+        if pdf_run_allowed(argv, args, kwargs):
+            # The audit hook consumes this one-use permit on this same thread.
+            # Direct Popen calls, even with identical arguments, stay forbidden.
+            pdf_permit.active = True
+            try:
+                return original_run(argv, **kwargs)
+            finally:
+                pdf_permit.active = False
         if (not isinstance(argv, (list, tuple)) or not argv
                 or argv[0] not in ('git', '/usr/bin/git', '/bin/git') or args
                 or set(kwargs) - {'capture_output', 'text', 'encoding', 'errors', 'timeout', 'cwd', 'check'}
                 or Path(kwargs.get('cwd') or '.').resolve() != checkout):
-            raise IsolationViolation('subprocess is not an approved Git metadata probe')
+            deny('subprocess is not an approved Git metadata probe or opted-in PDF decoder')
         parts = list(argv[1:])
         if parts[:1] == ['--no-optional-locks']:
             parts = parts[1:]
@@ -261,20 +310,26 @@ def install_storage_audit(fixture_root, actual_home, checkout):
             VERSION_STATUS_METADATA_STUB.append(True)
             return subprocess.CompletedProcess(list(argv), 0, ' M isolated-fixture\n', '')
         if not query_allowed(parts):
-            raise IsolationViolation('Git arguments are outside the immutable version allowlist')
+            deny('Git arguments are outside the immutable version allowlist')
         timeout = kwargs.get('timeout', 3)
         if not isinstance(timeout, (int, float)) or not 0 < timeout <= 5:
-            raise IsolationViolation('invalid Git metadata probe timeout')
+            deny('invalid Git metadata probe timeout')
         return original_run([*git_prefix, *parts], env=dict(git_env), **kwargs)
     subprocess.run = metadata_run
     def audit(event, args):
         if event == 'subprocess.Popen':
             executable, argv, cwd, env = args
+            if (pdf_command is not None and getattr(pdf_permit, 'active', False)
+                    and executable == pdf_command[0] and argv == pdf_command
+                    and cwd is None and env == pdf_env):
+                pdf_permit.active = False
+                observed['pdf_subprocesses'] += 1
+                return
             if (executable != '/usr/bin/git' or not isinstance(argv, list)
                     or argv[:len(git_prefix)] != git_prefix
                     or not query_allowed(argv[len(git_prefix):])
                     or Path(cwd or '.').resolve() != checkout or env != git_env):
-                raise IsolationViolation('subprocesses are disabled except immutable Git metadata')
+                deny('subprocesses are disabled except immutable Git metadata and opted-in PDF decoding')
             READONLY_GIT_QUERIES.append(argv[len(git_prefix)])
         if event == 'sqlite3.connect':
             path = str(args[0])
@@ -284,12 +339,13 @@ def install_storage_audit(fixture_root, actual_home, checkout):
                 path = urllib.parse.urlsplit(path).path
             resolved = Path(path).resolve()
             if not resolved.is_relative_to(fixture_root):
-                raise IsolationViolation('database outside isolated fixture')
+                deny('database outside isolated fixture')
         if event == 'open' and isinstance(args[0], (str, bytes, os.PathLike)):
             path = Path(os.fsdecode(args[0])).resolve()
             if any(path.is_relative_to(root) for root in business):
-                raise IsolationViolation('production business files are excluded')
+                deny('production business files are excluded')
     sys.addaudithook(audit)
+    return observed
 
 
 async def example(args, fixture, receiver, guard):

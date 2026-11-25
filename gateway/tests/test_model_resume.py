@@ -23,6 +23,7 @@ if __name__ == "__main__":
 from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 from psy_modules import psy_group_continuation as continuation, psy_group_pipeline as pipeline
 from psy_modules import psy_group_prompts as prompts, psy_group_sources as sources
+from psy_modules import psy_group_quality as quality
 
 
 class FakeHttp(types.ModuleType):
@@ -87,6 +88,8 @@ def run_child(root, kind, interrupt):
         elif instructions == prompts.REVIEW:
             step = "review"
             text = json.dumps({"edits": [{"before": "draft assertion", "after": "verified assertion"}]})
+        elif instructions == quality._REVIEW:
+            step, text = "task-review", '{"complete":true,"missing":[]}'
         else:
             assert kind == "analysis"
             step, text = "analysis-draft", "The draft assertion."
@@ -102,6 +105,7 @@ def run_child(root, kind, interrupt):
         result = pipeline._compose(None, [codex._user(question)], kind == "analysis", "fixture", question,
                                    checkpoints=Checkpoints(ident, root=root))
     assert result.complete
+    assert result.task_status == "complete"
     (root/"answer").write_text(result.text)
     store.settle(ident, True, root=root)
 
@@ -124,8 +128,8 @@ class ModelRestart(unittest.TestCase):
         before, after, text = self.run_restart("lecture")
         self.assertEqual(Counter(before), Counter(["dispatch", "plan", *[
             f"{phase}-{i}" for i in range(1, 4) for phase in ("draft", "check")]]))
-        self.assertEqual(Counter(after), Counter(
-            f"{phase}-{i}" for i in range(4, 7) for phase in ("draft", "check")))
+        self.assertEqual(Counter(after), Counter(["task-review", *[
+            f"{phase}-{i}" for i in range(4, 7) for phase in ("draft", "check")]]))
         for i in range(1, 7):
             self.assertEqual(text.count(f"Original draft for chapter {i}."), 1)
 

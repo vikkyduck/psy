@@ -342,17 +342,33 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             await asyncio.gather(generation, return_exceptions=True)
             raise
         text, images = result.text, result.images
+        metadata = getattr(result, "quality_metadata", {})
+        generation = metadata.get("generation_audit", metadata.get("generation", {}))
+        api_complete = generation.get("generation_complete")
+        details = {
+            "task_status": getattr(result, "task_status", "unknown"),
+            "generation_complete": api_complete if type(api_complete) is bool else None,
+            "missing_requirements": getattr(result, "missing_requirements", []),
+            "quality_metadata": {"model_requested": job["model"],
+                                 **metadata},
+        }
         if checkpoints is not None:
-            final = {"text": text, "images": [base64.b64encode(img).decode("ascii") for img in images]}
+            final = {"text": text, "images": [base64.b64encode(img).decode("ascii") for img in images],
+                     "result_details": details}
             await asyncio.to_thread(checkpoints.put, "route:answer:v1", final)
     else:
         text = final["text"]
         images = [base64.b64decode(encoded, validate=True) for encoded in final["images"]]
+        # A legacy checkpoint has no trustworthy completion or generation metadata.
+        # Its bytes remain unchanged so already accepted delivery fingerprints still match.
+        details = final.get("result_details", {"task_status": "unknown", "generation_complete": None,
+                                              "missing_requirements": [], "quality_metadata": {}})
 
     def receipt(part):
         return {"request_key": (msg.ident, part)} if checkpoints is not None else {}
 
-    turn_id = await asyncio.to_thread(store.remember, uid, topic, question, text, source_id=doc_id, message_id=mid, **receipt("turn"))
+    turn_id = await asyncio.to_thread(store.remember, uid, topic, question, text, source_id=doc_id, message_id=mid,
+                                     result_details=details, **receipt("turn"))
     async def archive_answer(name, kind, data, key):
         try:
             await asyncio.to_thread(store.archive, uid, topic, name, kind, data, **receipt(key))
@@ -361,6 +377,7 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             # A nearly full disk must not discard work that already finished.
             log.info("group answer not archived: disk reserve reached")
 
+    confirmed = bool(text or images)
     if text:
         if len(text) <= 4000:
             sent = await msg.reply_text(text, disable_web_page_preview=True)
@@ -370,11 +387,17 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             await archive_answer(name, "text", data, "text")
             sent = await deliver(msg, name, data)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
+        confirmed &= type(getattr(sent, "message_id", None)) is int and sent.message_id > 0
     for index, img in enumerate(images):
         name = "Изображение PSY.png"
         await archive_answer(name, "png", img, f"image:{index}")
         sent = await deliver(msg, name, img)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)
+        confirmed &= type(getattr(sent, "message_id", None)) is int and sent.message_id > 0
+
+    # All payloads need a receipt. Failure leaves pending even when earlier parts arrived.
+    if confirmed:
+        await asyncio.to_thread(store.confirm_result_delivery, uid, topic, turn_id)
 
 
 async def intercept(app, update):

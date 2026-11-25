@@ -23,7 +23,8 @@ MAX_BLOCKS = 30_000
 # Fixed public search terms; matched text from a participant never enters this mapping.
 PUBLIC_SUBJECTS = (
     (r"винникот|winnicott", "D. W. Winnicott"),
-    (r"мелани\s+кляйн|melanie\s+klein", "Melanie Klein"),
+    (r"\bбион\w*|\bbion\b", "Wilfred Bion"),
+    (r"\bкляйн\w*|\bklein\b", "Melanie Klein"),
     (r"лакан|lacan", "Jacques Lacan"),
     (r"лапланш|laplanche", "Jean Laplanche"),
     (r"понталис|понтали|pontalis", "Jean-Bertrand Pontalis"),
@@ -37,7 +38,28 @@ PUBLIC_SUBJECTS = (
     (r"стади\w+\s+зеркал|mirror stage", "mirror stage"),
     (r"форклюзи|foreclosure", "foreclosure"),
     (r"вытеснен|refoulement|verdr[äa]ngung|repression", "repression"),
+    (r"я[ -]идеал|идеал[ -]я|ego[ -]ideal|ideal[ -]ego|id[ée]al\s+du\s+moi|moi[ -]id[ée]al", "ego ideal and ideal ego"),
 )
+
+# Coverage is deliberately limited to known public author identities. A model's
+# proposed topic and arbitrary participant names never become outgoing queries.
+PUBLIC_AUTHORS = PUBLIC_SUBJECTS[:7]
+
+
+def required_authors(topic):
+    """Named sides of a comparison, without claiming semantic coverage of a whole topic."""
+    authors = [canonical for pattern, canonical in PUBLIC_AUTHORS if re.search(pattern, topic, re.I)]
+    return authors if len(authors) > 1 else []
+
+
+def author_coverage(topic, cards):
+    required = required_authors(topic)
+    covered = []
+    for pattern, canonical in PUBLIC_AUTHORS:
+        if canonical in required and any(re.search(pattern, str(card.get("author", "")), re.I) for card in cards):
+            covered.append(canonical)
+    return {"scope": "named_authors", "required": required, "covered": covered,
+            "missing": [name for name in required if name not in covered]}
 
 
 def public_topic(question):
@@ -192,6 +214,7 @@ class EvidenceReader:
         self.cache_bytes = 0
         self.lock = threading.Lock()
         self.ready = threading.Condition(self.lock)
+        self._diagnostics = threading.local()
 
     def _page(self, base):
         with self.ready:
@@ -231,13 +254,23 @@ class EvidenceReader:
         return page
 
     def locate(self, url, support, location, author, work):
+        located, reason = self.locate_checked(url, support, location, author, work)
+        # Parallel central and comparative readers must not overwrite each
+        # other's reason. The compatibility method still returns only a locator.
+        self._diagnostics.reason = reason
+        return located
+
+    def failure_reason(self):
+        return getattr(self._diagnostics, "reason", "support_unverified")
+
+    def locate_checked(self, url, support, location, author, work):
         quote = norm(support)
         if not 12 <= len(quote) <= 600 or len(quote.split()) < 3:
-            return None
+            return None, "invalid_quote"
         base = url.partition("#")[0]
         source = self._page(base)
         if not source:
-            return None
+            return None, "source_unreadable"
         kind, blocks = source
         # Require independent evidence that the retrieved document identifies the work
         # and the attributed author. Initials, catalog dates and URL slugs are insufficient.
@@ -252,7 +285,7 @@ class EvidenceReader:
         title_intro = " ".join(re.findall(r"[^\W_]+", intro))
         if len(title) < 4 or not surnames or not re.search(r"(?<!\w)" + re.escape(title) + r"(?!\w)", title_intro) or not re.search(
                 r"(?<!\w)" + re.escape(surnames[-1]) + r"(?!\w)", intro):
-            return None
+            return None, "identity_unverified"
         requested = re.search(r"(?:^|[&#])page=(\d+)\b", url.partition("#")[2], re.I) if kind == "PDF" else None
         if kind == "PDF" and not requested:
             requested = re.fullmatch(r"\s*(?:PDF\s*)?(?:стр\.?|с\.|p\.|page)\s*(\d+)(?:\s*PDF)?\s*", location, re.I)
@@ -262,8 +295,8 @@ class EvidenceReader:
             if quote in block:
                 locator = f"PDF, страница {i}" if kind == "PDF" else f"{kind}, абзац {i}"
                 start = block.index(quote)
-                return locator, block[max(0,start-180):start+len(quote)+180]
-        return None
+                return (locator, block[max(0,start-180):start+len(quote)+180]), None
+        return None, "locator_unverified" if requested else "quote_not_found"
 
 
 def decode_pdf():

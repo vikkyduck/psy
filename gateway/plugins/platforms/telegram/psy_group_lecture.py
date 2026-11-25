@@ -94,6 +94,7 @@ def _lecture(call, turns, minutes, *, write_prose=None):
     parts = []
     complete = True
     first_failure = None
+    missing = []
     # A section that ends with a model issue leaves a gap; a deferred 429 or any other
     # failure stops the remaining sections and parks the job with the written ones saved.
     for result, issue in _parallel(call, write, range(len(sections)), tolerate=ModelIssue):
@@ -101,9 +102,12 @@ def _lecture(call, turns, minutes, *, write_prose=None):
             first_failure = first_failure or issue
             complete = False
             parts.append(None)
+            missing.append("Раздел не сформирован: " + sections[len(parts) - 1]["title"])
         else:
             parts.append(result.text)
             complete &= result.complete
+            if not result.complete:
+                missing.append("Раздел требует завершения или проверки: " + sections[len(parts) - 1]["title"])
     if not any(parts):
         if first_failure:
             raise first_failure
@@ -124,7 +128,14 @@ def _lecture(call, turns, minutes, *, write_prose=None):
     if not complete:
         out.append("Работа над рукописью завершена частично. " + (
             first_failure.public() if first_failure else "Доступный текст сохранен."))
-    return Result("\n\n".join(out), [], 0, complete)
+    result = Result("\n\n".join(out), [], 0, complete)
+    result.task_status = "unknown" if complete else "partial"
+    result.missing_requirements = missing
+    result.quality_metadata = {"lecture_sections_planned": len(sections),
+                               "lecture_sections_present": sum(part is not None for part in parts),
+                               "planned_minutes": minutes, "planned_activity_minutes": practice,
+                               "duration_basis": "schedule_not_measured"}
+    return result
 
 
 def _valid_plan(plan, minutes):

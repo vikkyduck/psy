@@ -76,6 +76,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 text = f"chapter {i} completed. " * 90
             elif "Проверь содержание раздела" in instructions:
                 text = '{"missing":""}'
+            elif "Проверь выполнение исходного заказа" in instructions:
+                text = '{"complete":true,"missing":[]}'
             else:
                 self.fail("unexpected manuscript stage")
             return model.Result(text, [], 0)
@@ -151,6 +153,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 if prompts.DISPATCH in instructions:
                     first_calls += 1
                     return model.Result("Первая глава.",[],0,False)
+                if "Проверь выполнение исходного заказа" in instructions:
+                    return model.Result('{"complete":true,"missing":[]}', [], 0)
                 self.assertEqual(args[2][-2]["content"],"Первая глава.")
                 if interrupted:
                     raise model.ModelIssue(kind,"stream_read" if kind=="connection" else "credentials")

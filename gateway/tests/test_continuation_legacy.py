@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 from psy_modules import psy_group_lecture as lecture, psy_group_pipeline as pipeline
-from psy_modules import psy_group_prompts as prompts
+from psy_modules import psy_group_prompts as prompts, psy_group_quality as quality
 
 
 MODEL = "fixture"
@@ -85,8 +85,12 @@ class LegacyContinuation(unittest.TestCase):
             store.recover(root=root)
             self.assertIsNotNone(store.claim_next(root=root))
             sent = []
+            task_reviews = []
 
             def endpoint(client, headers, messages, web, selected, *, instructions, **kwargs):
+                if instructions == quality._REVIEW:
+                    task_reviews.append(messages)
+                    return model.Result('{"complete":true,"missing":[]}', [], 0)
                 sent.append(messages)
                 return model.Result("A new ending.", [], 0)
 
@@ -97,8 +101,14 @@ class LegacyContinuation(unittest.TestCase):
                                            checkpoints=store.Checkpoints(17, root=root))
 
         self.assertTrue(result.complete)
+        self.assertEqual(result.task_status, "complete")
         self.assertIn(CHAPTER + "\n\n" + "\n".join(parts + ["A new ending."]), result.text)
         self.assertEqual(len(sent), 1)
         self.assertIn("|end 4.", str(sent[0]))
         self.assertNotIn("chapter-start|", str(sent[0]))
         self.assertNotIn("Supplement 1|", str(sent[0]))
+        # The bounded continuation keeps its old window. A separate semantic
+        # check intentionally sees the completed manuscript, not another draft.
+        self.assertEqual(len(task_reviews), 1)
+        self.assertIn(CHAPTER, str(task_reviews[0]))
+        self.assertIn("Supplement 1|", str(task_reviews[0]))
