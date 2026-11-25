@@ -19,11 +19,13 @@ if __name__ == "__main__":
     pkg.__path__ = [sys.argv[1]]
     sys.path.insert(0, str(Path(sys.argv[1]).parents[2]))
     sys.modules[pkg.__name__] = pkg
+    sys.path.insert(0, str(Path(__file__).parent))
 
 from psy_modules import psy_group_client as codex, psy_group_codex as model, psy_group_store as store
 from psy_modules import psy_group_continuation as continuation, psy_group_pipeline as pipeline
 from psy_modules import psy_group_prompts as prompts, psy_group_sources as sources
 from psy_modules import psy_group_quality as quality
+from task_contract_fixture import contract_json
 
 
 class FakeHttp(types.ModuleType):
@@ -41,7 +43,8 @@ def run_child(root, kind, interrupt):
         store.recover(root=root)
     assert store.claim_next(root=root)[0] == ident
     source = "https://example.org/public-work"
-    question = "Публичная тема: Synthetic assignment"
+    question = ("Напиши лекцию на 1 час только по приложенному материалу" if kind == "lecture"
+                else "Публичная тема: Synthetic assignment")
     plan = {"title": "Lecture", "sections": [
         {"title": f"Chapter {i}", "brief": "An example", "minutes": 10, "activity_minutes": 0}
         for i in range(1, 7)
@@ -53,7 +56,7 @@ def run_child(root, kind, interrupt):
         def put(self, key, value):
             super().put(key, value)
             # Exit from a worker only after SQLite has committed the third review.
-            if kind == "lecture" and interrupt and value and '"checked_chapter"' in value["text"]:
+            if kind == "lecture" and interrupt and value and '"checked_chapter"' in value.get("text", ""):
                 chapter = json.loads(value["text"])["checked_chapter"]
                 with lock:
                     saved_reviews.add(chapter)
@@ -62,7 +65,11 @@ def run_child(root, kind, interrupt):
 
     def stream(client, headers, messages, web, selected_model, *, instructions, **kwargs):
         step = None
-        if prompts.DISPATCH in instructions:
+        if instructions.startswith(quality._EXTRACT):
+            step = "contract"
+            text = contract_json(question, kind="lecture" if kind == "lecture" else "answer",
+                                 minutes=60 if kind == "lecture" else None, local_only=kind == "lecture")
+        elif prompts.DISPATCH in instructions:
             step = "dispatch"
             task = {"minutes": 60} if kind == "lecture" else {"public_topic": "Synthetic public topic"}
             text = "PSY_TASK " + json.dumps(task)
@@ -126,7 +133,7 @@ class ModelRestart(unittest.TestCase):
 
     def test_fresh_process_keeps_first_three_chapters_and_verified_reviews(self):
         before, after, text = self.run_restart("lecture")
-        self.assertEqual(Counter(before), Counter(["dispatch", "plan", *[
+        self.assertEqual(Counter(before), Counter(["contract", "dispatch", "plan", *[
             f"{phase}-{i}" for i in range(1, 4) for phase in ("draft", "check")]]))
         self.assertEqual(Counter(after), Counter(["task-review", *[
             f"{phase}-{i}" for i in range(4, 7) for phase in ("draft", "check")]]))
@@ -135,8 +142,8 @@ class ModelRestart(unittest.TestCase):
 
     def test_fresh_process_resumes_at_source_verification_with_saved_analysis_draft(self):
         before, after, text = self.run_restart("analysis")
-        self.assertEqual(before, ["dispatch", "sources", "source-check", "analysis-draft", "review"])
-        self.assertEqual(after, ["review"])
+        self.assertEqual(before, ["contract", "dispatch", "sources", "source-check", "analysis-draft", "task-review", "review"])
+        self.assertEqual(after, ["review", "task-review"])
         self.assertEqual(text, "The verified assertion.")
 
     def test_stream_resumes_only_final_prose_after_process_interruption(self):
@@ -159,27 +166,42 @@ class ModelRestart(unittest.TestCase):
                                            "delta": text})
             raise Interrupted()
         def restored(*args, instructions, **kwargs):
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json(question), [], 0)
+            if instructions == quality._REVIEW:
+                return model.Result('{"complete":true,"missing":[]}', [], 0)
             inputs = args[2]
-            expected_tail = kept.strip()[-continuation.CONTINUATION_TAIL_CHARS:]
-            self.assertEqual(inputs[-2], {"role": "assistant", "content": expected_tail})
+            self.assertEqual(inputs[-2], {"role": "assistant", "content": kept})
             self.assertNotIn(hidden.strip(), str(inputs))
             return model.Result("Restored ending.", [], 0)
         client = Mock()
-        client.stream.return_value = nullcontext(Mock(status_code=200, iter_lines=events))
+        def stream(*args, json, **kwargs):
+            if json["instructions"].startswith(quality._EXTRACT):
+                lines = ["data: " + __import__("json").dumps({"type": "response.output_text.delta", "delta": contract_json(question)}),
+                         'data: {"type":"response.completed"}']
+                return nullcontext(Mock(status_code=200, iter_lines=lambda: iter(lines)))
+            return nullcontext(Mock(status_code=200, iter_lines=events))
+        client.stream.side_effect = stream
         with patch.object(sources.EvidenceReader, "locate", return_value=("HTML, абзац 1", "fixture context")), patch.dict(sys.modules, {"httpx": FakeHttp("httpx")}), patch.object(codex, "_connection", return_value=("", {}, "fixture-generation")):
             with self.assertRaises(Interrupted):
                 pipeline._compose(client, turns, False, "fixture", question, checkpoints=checkpoints)
             self.assertNotIn(hidden[:100], json.dumps(checkpoints))
             with patch.object(codex, "_stream", side_effect=restored) as provider:
                 result = pipeline._compose(None, turns, False, "fixture", question, checkpoints=checkpoints)
-                self.assertEqual(provider.call_count, 1)
+                self.assertEqual(provider.call_count, 2)
             self.assertTrue(result.complete)
-            self.assertEqual(result.text, kept.strip()+"\nRestored ending.")
+            self.assertEqual(result.text, kept + "Restored ending.")
 
-            with patch.object(codex, "_stream", return_value=model.Result("different answer", [], 0)) as provider:
+            def different(*args, instructions, **kwargs):
+                if instructions.startswith(quality._EXTRACT):
+                    return model.Result(contract_json("Different question"), [], 0)
+                if instructions == quality._REVIEW:
+                    return model.Result('{"complete":true,"missing":[]}', [], 0)
+                return model.Result("different answer", [], 0)
+            with patch.object(codex, "_stream", side_effect=different) as provider:
                 fresh = pipeline._compose(None, [codex._user("Different question")], False, "fixture",
                                           "Different question", checkpoints=checkpoints)
-                self.assertEqual((provider.call_count, fresh.text), (1, "different answer"))
+                self.assertEqual((provider.call_count, fresh.text), (3, "different answer"))
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ import json
 
 from psy_modules import psy_group_client as codex, psy_group_codex as adapter
 from psy_modules import psy_group_pipeline as pipeline
+from task_contract_fixture import contract_json
 
 
 class OAuthError(Exception):
@@ -358,8 +359,16 @@ class TestPreferredCredentials(unittest.TestCase):
             if reply(token) == 401:
                 response = Mock(status_code=401, iter_bytes=lambda *_: [b'{"error":{"code":"token_expired"}}'])
             else:
-                response = Mock(status_code=200, iter_lines=lambda: [
-                    'data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"42"}]}]}}'])
+                instructions = kwargs["json"]["instructions"]
+                if "До написания ответа составь внутреннюю карту" in instructions:
+                    text = contract_json("6 * 7?")
+                elif "Проверь выполнение исходного заказа" in instructions:
+                    text = '{"complete":true,"missing":[]}'
+                else:
+                    text = "42"
+                event = {"type": "response.completed", "response": {"output": [
+                    {"type": "message", "content": [{"type": "output_text", "text": text}]}]}}
+                response = Mock(status_code=200, iter_lines=lambda: ["data: " + json.dumps(event)])
             return nullcontext(response)
         with patch.dict(sys.modules, {"agent.codex_headers": headers}):
             return pipeline._compose(Mock(stream=stream), [codex._user("6 * 7?")], False, "test", "6 * 7?")
@@ -367,7 +376,7 @@ class TestPreferredCredentials(unittest.TestCase):
     def test_model_401_before_local_expiry_rotates_once_and_completes_question(self):
         reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
         self.assertEqual(self.group_question(reply).text, "42")
-        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "renewed"])
+        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "renewed", "renewed", "renewed"])
         self.codex.refresh_codex_oauth_pure.assert_called_once_with("live", "first-grant", timeout_seconds=20.0, on_received=ANY)
 
     def test_rejected_refresh_on_model_401_blocks_later_questions_until_owner_login(self):
@@ -416,7 +425,7 @@ class TestPreferredCredentials(unittest.TestCase):
         self.on_lock = lambda: self.primary.update(access_token="peer-live", refresh_token="peer-grant")
         reply = Mock(side_effect=lambda token: 401 if token == "live" else 200)
         self.assertEqual(self.group_question(reply).text, "42")
-        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "peer-live"])
+        self.assertEqual([call.args[0] for call in reply.call_args_list], ["live", "peer-live", "peer-live", "peer-live"])
         self.codex.refresh_codex_oauth_pure.assert_not_called()
 
     def test_model_401_renewal_temporarily_unavailable_then_recovers(self):

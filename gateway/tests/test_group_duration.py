@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 from psy_modules import psy_group_client as codex, psy_group_codex as m
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 from psy_modules import psy_group_sources as sources, psy_group_quality as quality
+from task_contract_fixture import contract_json
 
 
 def event(kind, **values):
@@ -19,6 +20,7 @@ class Duration(unittest.TestCase):
     def setUp(self):
         self.elapsed = 0
         self.streams = []
+        self.quality_streams = []
         module = types.ModuleType("httpx")
         module.RequestError = type("RequestError", (Exception,), {})
         module.TimeoutException = type("TimeoutException", (module.RequestError,), {})
@@ -37,10 +39,22 @@ class Duration(unittest.TestCase):
     def compose(self, question, stage, *, research=False):
         def stream(method, endpoint, *, headers, json, timeout):
             self.assertEqual(headers["fixture-issued"], self.elapsed)
-            # A long job thinks at max and may stay silent longer; an ordinary reply thinks at high.
-            deep = json.get("reasoning", {}).get("effort") == codex.DEEP_EFFORT
-            idle = codex.DEEP_IDLE_SECONDS if deep else codex.READ_IDLE_SECONDS[bool(json["tools"])]
-            self.assertEqual(timeout, (10, idle, 60, 10))
+            # All stages use maximum effort. These fixtures time writing/source traffic,
+            # while schema extraction and the task verdict use immediate synthetic SSE.
+            self.assertEqual(json["reasoning"]["effort"], codex._maximum_effort("test"))
+            self.assertEqual(timeout, (10, codex.DEEP_IDLE_SECONDS, 60, 10))
+            if json["instructions"].startswith(quality._EXTRACT):
+                local = quality.contract_for(question)
+                text = contract_json(question, **{key: local[key] for key in
+                                     ("kind", "minutes", "outline_only", "limited_scope", "local_only")})
+            elif json["instructions"] == quality._REVIEW:
+                text = '{"complete":true,"missing":[]}'
+            else:
+                text = None
+            if text is not None:
+                self.quality_streams.append(json)
+                return nullcontext(Mock(status_code=200, iter_lines=lambda: iter([
+                    event("response.output_text.delta", delta=text), event("response.completed")])))
             self.streams.append(json)
             return nullcontext(Mock(status_code=200, iter_lines=lambda: stage(json)))
         client = Mock(stream=stream)
@@ -63,7 +77,7 @@ class Duration(unittest.TestCase):
     def test_unclassified_deep_answer_continues_as_long_as_text_advances(self):
         def stage(payload):
             index = len(self.streams)
-            return self.answer(f"Раздел {index}.", incomplete=index < 8)
+            return self.answer(("\n" if index > 1 else "") + f"Раздел {index}.", incomplete=index < 8)
         result = self.compose("Проследи ход рассуждения по всей записи", stage)
         self.assertTrue(result.complete)
         self.assertEqual(result.text.splitlines(), [f"Раздел {i}." for i in range(1, 9)])
@@ -73,8 +87,7 @@ class Duration(unittest.TestCase):
         plan = {"title": "Лекция", "sections": [{"title": "Теория", "minutes": 30, "activity_minutes": 0,
                                                  "brief": "Исторический пример"}]}
         outputs = iter([('PSY_TASK {"minutes":30}', False), (json.dumps(plan), False),
-                        ("Начало речи", True), ("Конец речи", False), ('{"missing":""}', False),
-                        ('{"complete":true,"missing":[]}', False)])
+                        ("Начало речи", True), ("\nКонец речи", False), ('{"missing":""}', False)])
         def stage(payload):
             text, incomplete = next(outputs)
             if '"complete"' in text:
@@ -84,7 +97,7 @@ class Duration(unittest.TestCase):
         self.assertTrue(result.complete)
         self.assertEqual(result.task_status, "complete")
         self.assertIn("Начало речи\nКонец речи", result.text)
-        self.assertEqual(self.elapsed, 12 * 3600)
+        self.assertEqual(self.elapsed, 10 * 3600)
 
     def test_research_finishes_search_validation_synthesis_and_cross_check(self):
         url = "https://source.example/work"
@@ -137,7 +150,7 @@ class Duration(unittest.TestCase):
                 def stage(payload):
                     if len(self.streams) == 2:
                         self.assertEqual(payload["input"][-2]["content"], "Готовый раздел.\nНачало следующего.")
-                        yield event("response.output_text.delta", delta="Окончание.")
+                        yield event("response.output_text.delta", delta="\nОкончание.")
                         yield event("response.completed")
                         return
                     yield event("response.output_item.done", item={"id":"c", "type":"message", "phase":"commentary",
@@ -179,7 +192,7 @@ class Duration(unittest.TestCase):
         def stage(payload):
             if len(self.streams) == 2:
                 self.assertEqual(payload["input"][-2]["content"], "Раздел 1.\nРаздел 2.")
-                yield event("response.output_text.delta", delta="Раздел 3.")
+                yield event("response.output_text.delta", delta="\nРаздел 3.")
                 yield event("response.completed")
                 return
             yield event("response.output_text.delta", item_id="a", content_index=0, delta="Раздел")
@@ -198,7 +211,8 @@ class Duration(unittest.TestCase):
                         yield event("response.output_text.delta", delta=short_marker)
                         raise self.timeout()
                     self.assertIn(prompts.DISPATCH, payload["instructions"])
-                    self.assertEqual(payload["input"], [codex._user("Напиши разбор")])
+                    self.assertEqual(payload["input"][0], codex._user("Напиши разбор"))
+                    self.assertIn("Карта текущего заказа", payload["input"][-1]["content"])
                     yield event("response.output_text.delta", delta="Готовый ответ.")
                     yield event("response.completed")
                 result = self.compose("Напиши разбор", stage)

@@ -11,6 +11,7 @@ from unittest.mock import patch
 from psy_modules import psy_group_client as codex, psy_group_codex as model
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
 from psy_modules import psy_group_quality as quality
+from task_contract_fixture import contract_json
 
 
 class Memory:
@@ -53,6 +54,8 @@ class ParallelHalt(unittest.TestCase):
         first = threading.Event()
 
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json("synthetic lecture request", kind="lecture", minutes=90), [], 0)
             if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":90}', [], 0)
             if "Сейчас нужен внутренний редакционный" in instructions:
@@ -100,6 +103,8 @@ class ParallelHalt(unittest.TestCase):
 
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
             nonlocal reads
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json("synthetic request", kind="lecture", minutes=60), [], 0)
             if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":60,"public_topic":"Freud"}', [], 0)
             if instructions == prompts.CENTRAL_READING:
@@ -121,6 +126,8 @@ class ParallelHalt(unittest.TestCase):
 
     def test_without_checkpoints_a_failed_section_still_leaves_a_gap(self):
         def stream(client, headers, messages, web, selected, *, instructions, **kwargs):
+            if instructions.startswith(quality._EXTRACT):
+                return model.Result(contract_json("synthetic lecture request", kind="lecture", minutes=90), [], 0)
             if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"minutes":90}', [], 0)
             if "Сейчас нужен внутренний редакционный" in instructions:

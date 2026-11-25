@@ -7,6 +7,7 @@ import types
 import unittest
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
+from task_contract_fixture import contract_json
 
 def plugin_module(name):
     if os.environ.get("PSY_GROUP_TEST_INSTALLED"):
@@ -47,15 +48,24 @@ class Depth(unittest.TestCase):
         mods.start()
         self.addCleanup(mods.stop)
 
-    def test_semantic_ordinary_and_analysis_use_one_request(self):
+    def test_ordinary_and_analysis_answers_are_checked_without_research(self):
         for q in ("merci", "Qu'est-ce qui laisse penser que sa position a changé ?"):
-            result = m.Result("réponse", [], 0)
-            with patch.object(codex, "_stream", return_value=result) as stream:
-                self.assertEqual(pipeline._compose(None, [codex._user(q)], False, "fake", q).text, "réponse")
-                self.assertEqual(stream.call_count, 1)
-                self.assertFalse(stream.call_args.args[3])
-                self.assertIn("по умолчанию разбирай глубоко", stream.call_args.kwargs["instructions"])
-                self.assertNotIn("8000", stream.call_args.kwargs["instructions"])
+            stages = []
+            def run(_client, headers, messages, web, model, *, instructions, **kwargs):
+                self.assertFalse(web)
+                stages.append(instructions)
+                if "До написания ответа составь внутреннюю карту" in instructions:
+                    return m.Result(contract_json(q), [], 0)
+                if "Проверь выполнение исходного заказа" in instructions:
+                    return m.Result('{"complete":true,"missing":[]}', [], 0)
+                self.assertIn("по умолчанию разбирай глубоко", instructions)
+                self.assertNotIn("8000", instructions)
+                return m.Result("réponse", [], 0)
+            with patch.object(codex, "_stream", side_effect=run):
+                result = pipeline._compose(None, [codex._user(q)], False, "fake", q)
+            self.assertEqual(result.text, "réponse")
+            self.assertEqual(result.task_status, "complete")
+            self.assertEqual(len(stages), 3)
 
     def test_web_cannot_see_private_attachment_filename_quote_or_history(self):
         q = "Сопоставь с понятием вытеснения у Фрейда и проверь публикации"
@@ -63,6 +73,12 @@ class Depth(unittest.TestCase):
             {"type":"input_text","text":q+"\n\nЦитата из этого чата:\nsecret-quote"},
             {"type":"input_text","text":"Материал: secret-name\nsecret-transcript"}]}]
         def run(client, headers, messages, web, model, *, instructions, **kwargs):
+            if "До написания ответа составь внутреннюю карту" in instructions:
+                self.assertFalse(web)
+                return m.Result(contract_json(q), [], 0)
+            if "Проверь выполнение исходного заказа" in instructions:
+                self.assertFalse(web)
+                return m.Result('{"complete":true,"missing":[]}', [], 0)
             if prompts.DISPATCH in instructions:
                 return m.Result('PSY_TASK {"public_topic":"secret-private-topic"}', [], 0)
             if "Выдели только" in instructions:
@@ -161,37 +177,38 @@ class Depth(unittest.TestCase):
             pass  # only the request matters here: a search stream without a completed search is refused
         return client.stream.call_args.kwargs["json"], client.stream.call_args.kwargs["timeout"]
 
-    def test_depth_quick_reply_deep_job_and_service_calls(self):
-        # Owner's decision 2026-11-19: ordinary replies think at high, long jobs at max with full
-        # prose and deep web search; calls outside a job send no effort at all.
+    def test_maximum_depth_applies_to_ordinary_long_and_service_calls(self):
+        # No genre-based reasoning downgrade. The selected model's wire capacity governs.
         quick, timeout = self.payload_of(effort=codex.QUICK_EFFORT)
-        self.assertEqual(quick["reasoning"], {"effort": "high"})
+        self.assertEqual(quick["reasoning"], {"effort": "max"})
         self.assertNotIn("text", quick)
-        self.assertEqual(timeout[1], codex.READ_IDLE_SECONDS[False])
+        self.assertEqual(timeout[1], codex.DEEP_IDLE_SECONDS)
         deep, timeout = self.payload_of(research=True, effort=codex.DEEP_EFFORT, deep=True, verbose=True)
         self.assertEqual(deep["reasoning"], {"effort": "max"})
         self.assertEqual(deep["text"], {"verbosity": "high"})
         self.assertEqual(deep["tools"], [{"type": "web_search", "search_context_size": "high"}])
         self.assertEqual(timeout[1], codex.DEEP_IDLE_SECONDS)
         plain, _ = self.payload_of(research=True)
-        self.assertNotIn("reasoning", plain)
-        self.assertEqual(plain["tools"], [{"type": "web_search"}])
+        self.assertEqual(plain["reasoning"], {"effort": codex._maximum_effort("model")})
+        self.assertEqual(plain["tools"], [{"type": "web_search", "search_context_size": "high"}])
 
-    def test_a_job_turns_deep_once_it_is_admitted_long(self):
+    def test_every_job_starts_at_the_selected_models_maximum(self):
         seen = []
         def run(client, headers, messages, web, model, *, instructions, **kwargs):
             seen.append((kwargs.get("effort"), kwargs.get("deep"), kwargs.get("verbose")))
             return m.Result("ответ", [], 0)
         with patch.object(codex, "_stream", side_effect=run):
             pipeline._compose(None, [codex._user("merci")], False, "fake", "merci")
-        self.assertEqual(seen, [("high", False, False)])
+        self.assertTrue(seen)
+        self.assertTrue(all(effort == codex._maximum_effort("fake") and deep for effort, deep, _ in seen))
+        self.assertTrue(any(verbose for _, _, verbose in seen))
         seen.clear()
         with patch.object(codex, "_stream", side_effect=run):
             call, _ = codex._job_calls(None, "fake", None)
             pipeline._admit_long(None, call)
             call([codex._user("лекция")], "instr", prose=True)
             call([codex._user("поиск")], "instr", web=True)
-        self.assertEqual(seen, [("max", True, True), ("max", True, False)])
+        self.assertEqual(seen, [(codex._maximum_effort("fake"), True, True), (codex._maximum_effort("fake"), True, False)])
 
     def test_commentary_never_becomes_a_response_or_a_continuation(self):
         prefix = [{"type":"response.output_item.added","item":{"id":"c","type":"message","phase":"commentary"}},
@@ -227,10 +244,19 @@ class Depth(unittest.TestCase):
 
     def test_resume_waits_for_terminal_event_and_preserves_earlier_text(self):
         parts = [m.Result("first", [], 0, False),m.Result("last", [], 0, True)]
-        with patch.object(codex, "_stream", side_effect=parts) as stream:
+        prose = iter(parts)
+        continued = []
+        def run(_client, headers, messages, web, model, *, instructions, **kwargs):
+            if "До написания ответа составь внутреннюю карту" in instructions:
+                return m.Result(contract_json("question"), [], 0)
+            if "Проверь выполнение исходного заказа" in instructions:
+                return m.Result('{"complete":true,"missing":[]}', [], 0)
+            continued.append(messages)
+            return next(prose)
+        with patch.object(codex, "_stream", side_effect=run):
             r = pipeline._compose(None, [codex._user("question")], False, "fake", "question")
-            self.assertEqual((r.text,r.complete),("first\nlast",True))
-            self.assertIn("first", str(stream.call_args.args[2]))
+            self.assertEqual((r.text,r.complete),("firstlast",True))
+            self.assertIn("first", str(continued[-1]))
         call = Mock(side_effect=m.ModelIssue("timeout","upstream"))
         partial = continuation._complete(call, [], prompts.SYSTEM, initial=parts[0])
         self.assertTrue(partial.text.startswith("first"))
@@ -328,8 +354,39 @@ class Depth(unittest.TestCase):
         for value, expected in ((16,16),(17,"clarify"),(None,None),(True,"clarify")):
             result=m.Result(json.dumps({"source":value}),[],0)
             with patch.object(codex,"_connection",return_value=("fake",{}, "fixture-generation")), patch.object(codex,"_stream",return_value=result) as stream:
-                self.assertEqual(m.choose_source("почему?",opts,16,model="fake"),expected)
+                audit = {}
+                self.assertEqual(m.choose_source("почему?",opts,16,model="fake",audit_out=audit),expected)
                 self.assertFalse(stream.call_args.args[3])
+                self.assertEqual(stream.call_args.kwargs["effort"], codex._maximum_effort("fake"))
+                self.assertNotIn("read_idle", stream.call_args.kwargs)
+                self.assertEqual(audit["generation_audit"]["stages"], 1)
+                self.assertEqual(audit["generation_audit"]["stage_records"][0]["transport"]["read_idle_seconds"], 900)
+                self.assertNotIn("почему?", str(audit))
+
+    def test_selector_failure_audit_survives_and_success_replays_without_provider(self):
+        class Memory(dict):
+            def put(self, key, value):
+                self[key] = value
+        checkpoints = Memory()
+        audit = {}
+        options = [{"id": 16, "name": "private document name"}]
+        issue = m.ModelIssue("timeout", "stream_idle")
+        with patch.object(codex, "_stream", side_effect=issue):
+            with self.assertRaises(m.ModelIssue) as failed:
+                m.choose_source("private question", options, 16, model="gpt-6.1-sol",
+                                checkpoints=checkpoints, audit_out=audit)
+        self.assertIs(failed.exception, issue)
+        self.assertEqual(audit["generation_audit"]["failed_attempts"][0]["stop_reason"], "timeout")
+        self.assertNotIn("private", str(audit))
+        with patch.object(codex, "_stream", return_value=m.Result('{"source":16}', [], 0)) as stream:
+            self.assertEqual(m.choose_source("private question", options, 16, model="gpt-6.1-sol",
+                                             checkpoints=checkpoints, audit_out=audit), 16)
+            self.assertEqual(stream.call_args.kwargs["effort"], "max")
+        with patch.object(codex, "_stream", side_effect=AssertionError("provider forbidden")):
+            self.assertEqual(m.choose_source("private question", options, 16, model="gpt-6.1-sol",
+                                             checkpoints=checkpoints, audit_out=audit), 16)
+        self.assertEqual(audit["generation_audit"]["replayed_stages"], 1)
+        self.assertEqual(len(audit["generation_audit"]["failed_attempts"]), 1)
 
 
 URL = "https://example.org/research.pdf"

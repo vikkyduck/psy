@@ -14,6 +14,7 @@ import test_delivery_resume as harness
 from test_delivery_resume import RetryAfter, queue, route, store
 from psy_modules import psy_group_client as codex, psy_group_codex as model
 from psy_modules import psy_group_pipeline as pipeline, psy_group_prompts as prompts
+from task_contract_fixture import contract_json
 
 
 class Recovery(unittest.IsolatedAsyncioTestCase):
@@ -64,6 +65,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
         accepted = []
         authenticated = False
         def stream(client, headers, messages, web, selected_model, *, instructions, **kwargs):
+            if "До написания ответа составь внутреннюю карту" in instructions:
+                return model.Result(contract_json("write lecture", kind="lecture", minutes=60), [], 0)
             if prompts.DISPATCH in instructions:
                 text = 'PSY_TASK {"minutes":60}'
             elif "Сейчас нужен внутренний редакционный" in instructions:
@@ -150,6 +153,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             interrupted=True
             def stream(*args, instructions, **kwargs):
                 nonlocal first_calls
+                if "До написания ответа составь внутреннюю карту" in instructions:
+                    return model.Result(contract_json("write lecture"), [], 0)
                 if prompts.DISPATCH in instructions:
                     first_calls += 1
                     return model.Result("Первая глава.",[],0,False)
@@ -158,7 +163,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(args[2][-2]["content"],"Первая глава.")
                 if interrupted:
                     raise model.ModelIssue(kind,"stream_read" if kind=="connection" else "credentials")
-                return model.Result("Вторая глава.",[],0)
+                return model.Result("\nВторая глава.",[],0)
             async def deliver(text, **kwargs):
                 received.append(text)
                 return NS(message_id=300+len(received))
@@ -217,7 +222,7 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             await asyncio.to_thread(classify, msg.checkpoints)
         with (patch.object(queue.Update, "de_json", side_effect=restore), patch.object(route, "group_message",group),
               patch.object(codex, "_connection", return_value=("fixture", {}, "fixture-generation")), patch.object(codex, "_transport", nullcontext),
-              patch.object(codex, "time", NS(monotonic=lambda: getattr(clocks,"now",0)))):
+              patch.object(codex, "time", NS(monotonic=lambda: getattr(clocks,"now",0), time=lambda: 1800000000 + getattr(clocks,"now",0)))):
             worker=asyncio.create_task(queue.work(self.app, wake))
             try:
                 await asyncio.wait_for(answered.wait(),5)
@@ -306,7 +311,8 @@ class Recovery(unittest.IsolatedAsyncioTestCase):
             sent.append(document.read())
             return NS(message_id=842)
         self.message.reply_document.side_effect = document
-        job = dict(destination=[self.message.chat.id,7,444,100], doc_id=None, question="lecture")
+        job = dict(destination=[self.message.chat.id,7,444,100], doc_id=None, question="lecture",
+                   model="fixture", draw=False, research=False, quote="", history=[])
         cp = store.Checkpoints(self.ident)
         cp.put("route:input:v1", job)
         cp.put("route:answer:v1", {"text":manuscript, "images":[]})

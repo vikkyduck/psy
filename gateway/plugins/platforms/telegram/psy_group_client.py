@@ -37,6 +37,10 @@ class Result:
     task_status: str = "unknown"
     missing_requirements: list = field(default_factory=list)
     quality_metadata: dict = field(default_factory=dict)
+    # Stable provider/transport outcome, independent of semantic task completion.
+    stop_reason: str = "unknown"
+    stop_stage: str = None
+    model_actual: str = None
 
     @property
     def searched(self):
@@ -47,22 +51,23 @@ class Result:
 # first response. A lecture or research job has no deadline across reads/calls.
 # At high effort the model may think for minutes before the first byte.
 READ_IDLE_SECONDS = {False: 300, True: 300}
-# Reasoning depth of a group job (owner's decision 2026-11-19): a long job - research, lecture,
-# analysis of a recording - thinks at the deep end with full prose and deep web search; an ordinary
-# reply stays quick. Calls outside a job (source choice, recovery checks) send no effort at all.
-QUICK_EFFORT = "high"
-DEEP_EFFORT = "max"
-# At max the model can stay silent - no bytes, no visible text - for many minutes.
+# Every group model stage uses the highest supported wire effort of the selected model.
+# "ultra" is a Codex application harness with delegation, not a Responses wire level.
+QUICK_EFFORT = DEEP_EFFORT = "max"  # compatibility names for the selected gpt-6.1-sol
 DEEP_IDLE_SECONDS = 900
-# A deep call that showed no visible text or reasoning for this long and was then cut off - by
-# DEEP_IDLE_SECONDS above, or by the provider, which on 2026-11-24 closed every silent max-effort
-# source check exactly 15 minutes after the request - fails the same way on every retry (retries
-# have no limit), and a source check that returns a fragment is simply asked again. After such a
-# cut every later deep call of the job thinks at FALLBACK_EFFORT. The mark is a job checkpoint
-# (EFFORT_MARK), so it survives restarts and is dropped with the model stages once the answer is saved.
+# Retained solely for reading old release metadata/tests. Silent cuts no longer lower effort.
 SILENT_CUT_SECONDS = 600
-FALLBACK_EFFORT = QUICK_EFFORT
+FALLBACK_EFFORT = "high"
 EFFORT_MARK = "model:effort:v1"
+ATTEMPT_AUDIT = "model:audit:v2"
+
+
+def _maximum_effort(model):
+    from agent.reasoning_effort import EFFORT_LADDER, codex_supported_efforts
+    supported = codex_supported_efforts(model)
+    return max(supported, key=EFFORT_LADDER.index)
+
+
 # job_progress stage of a deep model call: psy-alerts allows it DEEP_IDLE_SECONDS of silence.
 DEEP_PROGRESS_STAGE = "model_deep"
 
@@ -78,9 +83,14 @@ class ModelIssue(Exception):
         "connection": "Соединение PSY с Codex прервалось до завершения ответа. Повторите запрос.",
         "unavailable": "Codex не завершил ответ. Попробуйте еще раз чуть позже.",
     }
-    def __init__(self, kind, stage, reset=None):
+    def __init__(self, kind, stage, reset=None, *, stop_reason=None):
         super().__init__(kind)
         self.kind, self.stage, self.reset = kind, stage, reset
+        self.stop_reason = stop_reason or kind
+        self.quality_metadata = {}
+        self.model_actual = None
+        self.http_status = None
+        self.provider_error_code = None
         # Seconds an interrupted stream ran without any visible text or reasoning; None otherwise.
         self.silent = None
 
@@ -98,19 +108,31 @@ class ModelIssue(Exception):
 
 
 def _failure(status, detail, stage):
-    if status in (408, 504):
-        return ModelIssue("timeout", stage)
     detail = detail if isinstance(detail, dict) else {}
     codes = (detail.get("code"), detail.get("type"))
+    safe_codes = {"usage_limit_reached", "insufficient_quota", "usage_limit_exceeded",
+                  "context_length_exceeded", "context_window_exceeded", "input_too_large",
+                  "rate_limit_exceeded", "invalid_token", "token_expired", "server_error",
+                  "invalid_request_error", "invalid_value", "unsupported_value", "model_not_found",
+                  "permission_denied", "account_deactivated", "content_filter"}
+
+    def issue(kind, at=stage, reset=None):
+        error = ModelIssue(kind, at, reset)
+        error.http_status = status if type(status) is int else None
+        error.provider_error_code = next((code for code in codes if isinstance(code, str) and code in safe_codes), None)
+        return error
+
+    if status in (408, 504):
+        return issue("timeout")
     if any(c in ("usage_limit_reached", "insufficient_quota", "usage_limit_exceeded") for c in codes):
-        return ModelIssue("quota", stage, detail.get("resets_at"))
+        return issue("quota", reset=detail.get("resets_at"))
     if any(c in ("context_length_exceeded", "context_window_exceeded", "input_too_large") for c in codes):
-        return ModelIssue("context", stage)
+        return issue("context")
     if status == 429 or "rate_limit_exceeded" in codes:
-        return ModelIssue("busy", stage)
-    if status == 401 or any(c in ("invalid_token","token_expired") for c in codes):
-        return ModelIssue("signin", stage)
-    return ModelIssue("unavailable", "upstream" if type(status) is int and 500 <= status < 600 else stage)
+        return issue("busy")
+    if status == 401 or any(c in ("invalid_token", "token_expired") for c in codes):
+        return issue("signin")
+    return issue("unavailable", "upstream" if type(status) is int and 500 <= status < 600 else stage)
 
 
 CredentialIssue = codex_policy.CredentialIssue
@@ -232,23 +254,29 @@ def _parallel(call, func, items, *, workers=3, tolerate=()):
     return [(None, f.exception()) if f.exception() is not None else (f.result(), None) for f in futures]
 
 
+def _request_parameters(model, effort, deep, verbose, research):
+    search = {"type": "web_search", "search_context_size": "high"} if deep else {"type": "web_search"}
+    parameters = dict(model=model, tools=[search] if research else [], store=False, stream=True,
+                      tool_choice="required" if research else "auto")
+    if effort:
+        parameters["reasoning"] = {"effort": effort}
+    if verbose:
+        parameters["text"] = {"verbosity": "high"}
+    if research:
+        parameters["include"] = ["web_search_call.action.sources"]
+    return parameters
+
+
 def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, read_idle=None, save_prefix=None, progress_idle=300, on_progress=None,
-            effort=None, deep=False, verbose=False):
+            effort=None, deep=True, verbose=False):
+    if effort is None:
+        effort = _maximum_effort(model)
     if read_idle is None:
         read_idle = DEEP_IDLE_SECONDS if deep else READ_IDLE_SECONDS[bool(research)]
     if deep and progress_idle:
         progress_idle = max(progress_idle, DEEP_IDLE_SECONDS)
-    search = {"type": "web_search", "search_context_size": "high"} if deep else {"type": "web_search"}
-    tools = [search] if research else []
-    payload = dict(model=model, instructions=instructions, input=turns, tools=tools,
-                   store=False, stream=True,
-                   tool_choice="required" if research else "auto")
-    if effort:
-        payload["reasoning"] = {"effort": effort}
-    if verbose:
-        payload["text"] = {"verbosity": "high"}
-    if research:
-        payload["include"] = ["web_search_call.action.sources"]
+    payload = dict(_request_parameters(model, effort, deep, verbose, research),
+                   instructions=instructions, input=turns)
     with client.stream("POST", ENDPOINT + "/responses", headers=headers, json=payload,
                        timeout=(10, read_idle, 60, 10)) as response:
         if response.status_code != 200:
@@ -270,6 +298,7 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
         written = {}
         final_items = set()
         refused = False
+        model_actual = None
         interruption = ModelIssue("connection", "stream_end")
         unsaved_chars = 0
         last_save = time.monotonic() if save_prefix else 0
@@ -290,9 +319,11 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
             try:
                 event = json.loads(line[6:])
             except ValueError:
-                raise ModelIssue("connection", "stream_format") from None
+                interruption = ModelIssue("connection", "stream_format")
+                break
             if not isinstance(event, dict):
-                raise ModelIssue("connection", "stream_format")
+                interruption = ModelIssue("connection", "stream_format")
+                break
             typ = event.get("type")
             item = event.get("item") or {}
             item_id = event.get("item_id") or item.get("id") or event.get("output_index", 0)
@@ -346,6 +377,11 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
                     if text:
                         written[item_id] = {0: [text]}
             body = event.get("response") or {}
+            # Only the provider's model identifier, never arbitrary response metadata.
+            actual = body.get("model")
+            if isinstance(actual, str) and 0 < len(actual) <= 160 and all(
+                    c.isalnum() or c in "-._/:" for c in actual):
+                model_actual = actual
             if typ == "response.completed":
                 if body.get("status") not in (None, "completed"):
                     raise _failure(None, body.get("error"), "stream_status")
@@ -358,10 +394,16 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
                     searches = sum(i.get("type") == "web_search_call" and i.get("status") == "completed" for i in output)
                     if not searches:
                         raise ModelIssue("unavailable", "search_not_completed")
-                text = "\n".join(results).strip() or _written(written, commentary)
-                if not text:
+                text = "\n".join(results)
+                if not text.strip():
+                    text = _written(written, commentary)
+                if not text.strip():
                     raise ModelIssue("unavailable", "stream_empty")
-                return Result(text, images, searches, source_urls=tuple(sorted(source_urls)))
+                provider_refusal = refused or any(
+                    p.get("type") == "refusal" for item in output for p in item.get("content") or ())
+                return Result(text, images, searches, source_urls=tuple(sorted(source_urls)),
+                              stop_reason="provider_refusal" if provider_refusal else "completed",
+                              stop_stage="stream", model_actual=model_actual)
             if typ == "response.incomplete":
                 # Continue only for a documented output ceiling, never after a
                 # refusal, a safety block, quota, or a failed provider event.
@@ -371,18 +413,31 @@ def _stream(client, headers, turns, research, model, *, instructions=SYSTEM, rea
                         refused = True
                 if reason == "max_output_tokens" and not refused and (not research or searches):
                     partial = _written(written, commentary)
-                    if not partial:
+                    if not partial.strip():
                         partial = "\n".join(part for item in (body.get("output") or []) if item.get("type") == "message"
-                                            for part in _parts(item)).strip()
-                    if partial:
-                        return Result(partial, images, searches, False)
+                                            for part in _parts(item))
+                    if partial.strip():
+                        return Result(partial, images, searches, False, tuple(sorted(source_urls)),
+                                      stop_reason="max_output_tokens", stop_stage="stream",
+                                      model_actual=model_actual)
+                issue = _failure(None, body.get("error") or event.get("error"), "stream")
+                issue.stop_reason = reason if reason in ("max_output_tokens", "content_filter") else "incomplete_unknown"
+                if refused:
+                    issue.stop_reason = "provider_refusal"
+                issue.model_actual = model_actual
+                raise issue
             if typ in ("error", "response.failed", "response.incomplete"):
-                raise _failure(None, body.get("error") or event.get("error") or event, "stream")
+                issue = _failure(None, body.get("error") or event.get("error") or event, "stream")
+                issue.model_actual = model_actual
+                raise issue
         partial = _written(written, commentary)
         silent = None if visible else time.monotonic() - started
-        if partial and not refused and (not research or searches):
-            return Result(partial, images, searches, False, tuple(sorted(source_urls)), silent=silent)
+        if partial.strip() and not refused and (not research or searches):
+            return Result(partial, images, searches, False, tuple(sorted(source_urls)), silent=silent,
+                          stop_reason=interruption.stop_reason, stop_stage=interruption.stage,
+                          model_actual=model_actual)
         interruption.silent = silent
+        interruption.model_actual = model_actual
         raise interruption
 
 
@@ -403,7 +458,7 @@ def _lines(response):
 
 def _written(written, commentary):
     return "\n".join("".join(deltas) for ident, parts in written.items() if ident not in commentary
-                     for _, deltas in sorted(parts.items())).strip()
+                     for _, deltas in sorted(parts.items()))
 
 
 def _dispatch_marker(text, *, complete):
@@ -471,6 +526,8 @@ def _job_calls(client, model, checkpoints):
     `continuation_call` finds one continuation block by its chain digest or legacy prompt."""
     stages = {}
     audit_lock = threading.Lock()
+    saved_audit = checkpoints.get(ATTEMPT_AUDIT) if checkpoints is not None else None
+    failed_attempts = list(saved_audit.get("failed_attempts", [])) if isinstance(saved_audit, dict) else []
 
     def record_stage(key, metadata, *, replay=False):
         with audit_lock:
@@ -481,7 +538,8 @@ def _job_calls(client, model, checkpoints):
         # No prompts, answers, URLs, member identifiers or credentials. These
         # observations survive only with the private answer, not public logs.
         with audit_lock:
-            values = list(stages.values())
+            values = [dict(item) for item in stages.values()]
+            failures = [dict(item) for item in failed_attempts]
         efforts = {}
         for item in values:
             effort = item.get("effort", "unknown")
@@ -499,6 +557,9 @@ def _job_calls(client, model, checkpoints):
             "generation_complete": complete,
             "first_generated_at": min(generated) if generated else None,
             "last_generated_at": max(generated) if generated else None,
+            "failed_attempts": failures,
+            "stage_records": sorted(values, key=lambda item: item.get("started_at") or item.get("generated_at") or 0),
+            "effort_policy": "maximum_supported_no_downgrade",
         }}
 
     def cached(key):
@@ -507,7 +568,10 @@ def _job_calls(client, model, checkpoints):
             metadata = saved.get("generation_metadata", {})
             record_stage(key, metadata, replay=True)
             return Result(saved["text"], [], saved["searches"], saved["complete"], tuple(saved["source_urls"]),
-                          quality_metadata={"generation": metadata})
+                          quality_metadata={"generation": metadata},
+                          stop_reason=saved.get("stop_reason", metadata.get("stop_reason", "unknown")),
+                          stop_stage=saved.get("stop_stage", metadata.get("stop_stage")),
+                          model_actual=saved.get("model_actual", metadata.get("model_actual")))
 
     halt = _Halt()
 
@@ -523,68 +587,72 @@ def _job_calls(client, model, checkpoints):
         def save(result):
             checkpoints.put(key, {"text": result.text, "searches": result.searches,
                                   "complete": result.complete, "source_urls": list(result.source_urls),
-                                  "generation_metadata": result.quality_metadata.get("generation", {})})
+                                  "generation_metadata": result.quality_metadata.get("generation", {}),
+                                  "stop_reason": result.stop_reason, "stop_stage": result.stop_stage,
+                                  "model_actual": result.model_actual})
 
+        effort = _maximum_effort(model)
+        deep, verbose = True, bool(prose)
+        parameters = _request_parameters(model, effort, deep, verbose, web)
+        request_bytes = json.dumps(dict(parameters, instructions=instructions, input=messages),
+                                   ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        metadata = {"model_requested": model, "effort": effort, "deep": deep,
+                    "web": web, "prose": prose, "fallback_used": False,
+                    "generation_complete": False, "started_at": time.time(),
+                    "prompt_sha256": hashlib.sha256(instructions.encode()).hexdigest(),
+                    "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                    "effective_parameters": parameters,
+                    "transport": {"connect_seconds": 10, "read_idle_seconds": DEEP_IDLE_SECONDS,
+                                  "write_seconds": 60, "pool_seconds": 10,
+                                  "progress_idle_seconds": DEEP_IDLE_SECONDS},
+                    "stop_reason": "in_progress", "stop_stage": "stream"}
         saved_prefix = False
+
         def save_prefix(text):
             nonlocal saved_prefix
-            save(Result(text, [], 0, False))
+            saved_metadata = dict(metadata, stop_reason="process_interrupted")
+            save(Result(text, [], 0, False, quality_metadata={"generation": saved_metadata},
+                        stop_reason="process_interrupted", stop_stage="stream"))
             saved_prefix = True
 
         options = {"save_prefix": save_prefix} if prose and checkpoints is not None else {}
-        effort = DEEP_EFFORT if call.deep else QUICK_EFFORT
-        marking, cuts = call.deep and checkpoints is not None, 0
-        if marking:
-            saved_cuts = checkpoints.get(EFFORT_MARK)
-            cuts = saved_cuts.get("silent_cuts", 0) if isinstance(saved_cuts, dict) else 0
-            if cuts:
-                effort = FALLBACK_EFFORT
-
-        def silent_cut(silent):
-            if not (marking and effort != FALLBACK_EFFORT and silent is not None and silent >= SILENT_CUT_SECONDS):
-                return
-            try:
-                checkpoints.put(EFFORT_MARK, {"silent_cuts": cuts + 1})
-                log.warning("group model call silent for %.0fs at effort=%s; the rest of the job uses effort=%s",
-                            silent, effort, FALLBACK_EFFORT)
-            except Exception as error:
-                log.warning("group model silent cut not recorded: %s", type(error).__name__)
-
         if checkpoints is not None:
             report = getattr(checkpoints, "progress", None)
             if report is not None:
-                options["on_progress"] = partial(report, DEEP_PROGRESS_STAGE) if call.deep else report
+                options["on_progress"] = partial(report, DEEP_PROGRESS_STAGE)
         started = time.monotonic()
         try:
             with _transport():
                 result = _authenticated_request(lambda token, headers: _stream(
                     client, headers, messages, web, model, instructions=instructions,
-                    effort=effort, deep=call.deep,
-                    verbose=call.deep and prose, **options))
+                    effort=effort, deep=deep, verbose=verbose, **options))
         except ModelIssue as exc:
-            silent = exc.silent
-            if silent is None and (exc.kind, exc.stage) == ("timeout", "transport"):
-                # No response at all: the whole attempt was silent.
-                silent = time.monotonic() - started
-            if exc.retryable:
-                silent_cut(silent)
+            failure = dict(metadata, generated_at=time.time(),
+                           duration_seconds=max(0, time.monotonic() - started),
+                           stop_reason=exc.stop_reason, stop_stage=exc.stage,
+                           error_kind=exc.kind, retryable=exc.retryable, model_actual=exc.model_actual,
+                           http_status=exc.http_status, provider_error_code=exc.provider_error_code,
+                           silent_seconds=(exc.silent if exc.silent is not None else
+                                           max(0, time.monotonic() - started) if exc.stage == "transport" else None))
+            with audit_lock:
+                failed_attempts.append(failure)
+                if checkpoints is not None:
+                    checkpoints.put(ATTEMPT_AUDIT, {"failed_attempts": failed_attempts})
+            exc.quality_metadata.update(audit())
             if checkpoints is not None and exc.retryable:
-                # Parallel siblings must not keep calling a model that just refused.
+                # Park in the durable queue with backoff. Never retry inline, switch
+                # models or weaken effort after a silent cut.
                 deferred = _ResumeModelJob(exc)
                 halt.trip(deferred)
                 raise deferred from None
-            # A terminal error (including a provider refusal) invalidates speculative
-            # output. Only a process interruption leaves a prefix to resume from.
+            # A terminal error invalidates speculative prose. Process interruption
+            # and deferred transport errors still leave a prefix to resume from.
             if saved_prefix:
                 checkpoints.put(key, None)
             raise
-        if not result.complete:
-            # A fragment kept from a cut-off stream: a source check asks again with a new prompt.
-            silent_cut(result.silent)
-        metadata = {"model_requested": model, "effort": effort, "deep": call.deep,
-                    "web": web, "prose": prose, "fallback_used": bool(cuts),
-                    "generation_complete": result.complete, "generated_at": time.time(),
-                    "prompt_sha256": hashlib.sha256(instructions.encode()).hexdigest()}
+        metadata.update(model_actual=result.model_actual, generation_complete=result.complete,
+                        generated_at=time.time(), duration_seconds=max(0, time.monotonic() - started),
+                        stop_reason=result.stop_reason, stop_stage=result.stop_stage, silent_seconds=result.silent)
         result.quality_metadata["generation"] = metadata
         record_stage(key, metadata)
         if checkpoints is not None and (result.complete or (prose and result.text and not _dispatch_marker(result.text, complete=False))):
@@ -605,6 +673,6 @@ def _job_calls(client, model, checkpoints):
 
     call.halt = halt
     call.audit = audit
-    # Set by the pipeline once the job turns out long (_admit_long): later stages think deep.
-    call.deep = False
+    # Kept for callers that mark long jobs. Maximum effort applies from the first stage.
+    call.deep = True
     return call, continuation_call

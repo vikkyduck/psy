@@ -7,6 +7,7 @@ PATH is plugins/platforms/telegram in the Hermes checkout. The gateway may keep 
 it never runs a job in these states, and a requeued job starts within its 30 s check.
 Only identifiers and job metadata are printed, never message text or answers."""
 import argparse
+import json
 import importlib.util
 import os
 import sys
@@ -56,6 +57,8 @@ def main(argv=None, *, out=sys.stdout):
     commands = parser.add_subparsers(dest="command", required=True)
     listing = commands.add_parser("list", help="jobs that are uncertain, failed or waiting for a retry")
     listing.add_argument("--all", action="store_true", help="also list running and fresh queued jobs")
+    explain = commands.add_parser("explain", help="durable diagnostics without conversation text")
+    explain.add_argument("request_key", help="update:ID or message:CHAT:MEMBER:TOPIC:MESSAGE")
     settle = commands.add_parser("resolve", help="settle one job")
     settle.add_argument("ident", type=int)
     settle.add_argument("action", choices=ACTIONS)
@@ -64,6 +67,10 @@ def main(argv=None, *, out=sys.stdout):
         parser.error("run as the hermes user, for example with sudo -u hermes")
     if not (opts.root / "group.sqlite3").is_file():
         parser.error(f"no group vault in {opts.root}")
+    if opts.command == "explain":
+        result = store.explain_request(opts.request_key, root=opts.root)
+        print(json.dumps(result, ensure_ascii=False, indent=2), file=out)
+        return 0 if result is not None else 1
     if opts.command == "list":
         rows = store.jobs(root=opts.root, include_all=opts.all)
         for row in rows:

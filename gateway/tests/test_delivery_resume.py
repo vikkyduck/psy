@@ -2,6 +2,7 @@
 import asyncio
 import importlib.util
 import io
+import os
 import tempfile
 import sys
 import unittest
@@ -32,6 +33,11 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        # Even when the suite runs on a restored production host, snapshots must
+        # read only this synthetic profile, never the service account's SOUL/config.
+        profile = Path(tmp.name) / "synthetic-profile"
+        profile.mkdir()
+        self.enterContext(patch.dict(os.environ, {"HERMES_HOME": str(profile)}))
         database = store.database
         self.enterContext(patch.object(store, "database", lambda *a, **kw: database(root=Path(tmp.name))))
         self.enterContext(patch.dict(sys.modules, {"telegram.error": errors}))

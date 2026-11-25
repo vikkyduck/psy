@@ -8,6 +8,7 @@ import time
 
 from . import psy_group_store as store
 from . import psy_group_audio as audio
+from .psy_group_observability import capture_runtime, result_audit
 from .psy_group_codex import ModelIssue, choose_source, research_requested, respond
 
 from .psy_instance import BOT, BOT_USERNAME, GROUP, OWNER
@@ -29,6 +30,80 @@ HELLO = ("В этой группе я отвечаю на сообщения, и
 MAX_TEXT = 8 * 1024**2
 MAX_IMAGE = 5 * 1024**2
 log = logging.getLogger("psy.group")
+
+
+def audit_key(msg):
+    ident = getattr(msg, "ident", None)
+    if type(ident) is int:
+        return "update:" + str(ident)
+    return "message:" + ":".join(str(x) for x in (msg.chat.id, msg.from_user.id,
+                           message_topic(msg), getattr(msg, "message_id", id(msg))))
+
+
+def runtime_snapshot(model):
+    from pathlib import Path
+    with store.database() as con:
+        vault = Path(con.execute("PRAGMA database_list").fetchone()[2]).parent
+    return capture_runtime(model, root=vault / "runtime-snapshots")
+
+
+async def committed_diagnostic(func, *args, **kwargs):
+    # Keep the queue lease until a diagnostic/checkpoint transaction has finished,
+    # including cancellation during a SQLite busy wait.
+    operation = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        await asyncio.gather(operation, return_exceptions=True)
+        raise
+
+
+async def record_event(msg, event, details=None, **kwargs):
+    await committed_diagnostic(store.audit_start, audit_key(msg), msg.from_user.id, message_topic(msg),
+                               getattr(msg, "message_id", None))
+    await committed_diagnostic(store.audit_event, audit_key(msg), event, details, **kwargs)
+
+
+async def record_failure(msg, event, details=None, *, action=None, **kwargs):
+    checkpoints = getattr(msg, "checkpoints", None)
+    if action is not None and checkpoints is not None:
+        # The exact safe cause survives a failure of the subsequent audit transaction.
+        # A resumed job flushes this record before any new model or delivery action.
+        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1",
+                                   {"event": event, "details": details, "options": kwargs, "action": action})
+    await record_event(msg, event, details, **kwargs)
+    if action is not None and checkpoints is not None:
+        await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", None)
+
+
+async def finish_failure(msg, action):
+    if action["type"] == "model":
+        issue = ModelIssue(action["kind"], action["stage"], action.get("reset"))
+        recovery = getattr(msg, "defer_model", None)
+        if issue.retryable and recovery is not None:
+            await recovery(issue)
+            raise store.GroupJobParked()
+        await error_reply(msg, issue.public())
+    else:
+        queued = getattr(msg, "defer_failure", None)
+        if queued is not None and action["transient"]:
+            await queued()
+            raise store.GroupJobParked()
+        safe = action.get("safe")
+        await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
+        if queued is not None and safe is None:
+            raise store.GroupJobFailed()
+
+
+async def resume_diagnostic(msg):
+    checkpoints = getattr(msg, "checkpoints", None)
+    pending = await asyncio.to_thread(checkpoints.get, "route:diagnostic:v1") if checkpoints is not None else None
+    if pending is None:
+        return False
+    await record_event(msg, pending["event"], pending["details"], **pending["options"])
+    await committed_diagnostic(checkpoints.put, "route:diagnostic:v1", None)
+    await finish_failure(msg, pending["action"])
+    return True
 
 
 def scope(update):
@@ -286,9 +361,17 @@ async def group_message(msg):
         active_id, options = await asyncio.to_thread(store.choices, uid, topic, mentions_material(question),
                                                      before_message_id=mid)
         if options:
-            selected = await asyncio.to_thread(choose_source, question, options, active_id, model=model["default"])
+            selection_audit = {}
+            # Failed selections carry their client audit in ModelIssue. Do not let
+            # a separate diagnostic write mask the original model failure.
+            selected = await asyncio.to_thread(choose_source, question, options, active_id,
+                                               model=model["default"], checkpoints=checkpoints,
+                                               audit_out=selection_audit)
+            await record_event(msg, "source_selection", selection_audit)
             if selected == "clarify" or (selected is not None and
                     (type(selected) is not int or selected not in {item["id"] for item in options})):
+                await record_event(msg, "clarification_requested", {"candidate_count": len(options)},
+                                   state="needs_clarification")
                 await msg.reply_text(choice_help(options))
                 return
             if selected is not None:
@@ -304,6 +387,10 @@ async def group_message(msg):
     draw = command == "/image" or bool(re.search(r"(?:нарисуй|сгенерируй\s+(?:изображение|картин\w*)|создай\s+(?:изображение|картин\w*))", question, re.I))
     job = dict(destination=destination, question=question, doc_id=doc_id, quote=quote, history=history,
                model=model["default"], research=research and not draw, draw=draw)
+    job["context_scope"] = {"uid": uid, "topic": topic, "source_id": doc_id}
+    job["context_state"] = await asyncio.to_thread(store.get_context, uid, topic, doc_id,
+                                                  before_message_id=mid)
+    job["runtime"] = await asyncio.to_thread(runtime_snapshot, model["default"])
     if checkpoints is not None:
         await asyncio.to_thread(checkpoints.put, "route:input:v1", job)
     await prepared_answer(msg, job, checkpoints, source=source)
@@ -319,6 +406,9 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
         raise RuntimeError("checkpoint destination mismatch")
     doc_id = job["doc_id"]
     question = job["question"]
+    runtime = await asyncio.to_thread(runtime_snapshot, job["model"])
+    await record_event(msg, "execution", {"runtime": runtime,
+                       "route": "group_image" if job["draw"] else "group_text"}, state="running")
     if checkpoints is not None:
         msg.model_delivery()
         final = await asyncio.to_thread(checkpoints.get, "route:answer:v1")
@@ -331,6 +421,8 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
                 raise ValueError(UNLINKED_REPLY)
         sessions = [*job["history"], {"role": "user", "content": content(question, source, job["quote"])}]
         options = {"checkpoints": checkpoints} if checkpoints is not None else {}
+        options.update(context_state=job.get("context_state"), context_scope=job.get("context_scope",
+                       {"uid": uid, "topic": topic, "source_id": doc_id}))
         generation = asyncio.create_task(asyncio.to_thread(
             respond, sessions, research=job["research"], draw=job["draw"],
             model=job["model"], question=question, **options))
@@ -342,7 +434,11 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             await asyncio.gather(generation, return_exceptions=True)
             raise
         text, images = result.text, result.images
-        metadata = getattr(result, "quality_metadata", {})
+        metadata = dict(getattr(result, "quality_metadata", {}))
+        context_state = metadata.pop("context_state", None)
+        await asyncio.to_thread(store.save_context, uid, topic, doc_id, context_state, message_id=mid)
+        metadata.update(runtime=runtime, stop_reason=getattr(result, "stop_reason", "unknown"),
+                        stop_stage=getattr(result, "stop_stage", None))
         generation = metadata.get("generation_audit", metadata.get("generation", {}))
         api_complete = generation.get("generation_complete")
         details = {
@@ -369,6 +465,7 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
 
     turn_id = await asyncio.to_thread(store.remember, uid, topic, question, text, source_id=doc_id, message_id=mid,
                                      result_details=details, **receipt("turn"))
+    await record_event(msg, "result_saved", result_audit(details), state="sending", turn_id=turn_id)
     async def archive_answer(name, kind, data, key):
         try:
             await asyncio.to_thread(store.archive, uid, topic, name, kind, data, **receipt(key))
@@ -398,6 +495,10 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
     # All payloads need a receipt. Failure leaves pending even when earlier parts arrived.
     if confirmed:
         await asyncio.to_thread(store.confirm_result_delivery, uid, topic, turn_id)
+        await record_event(msg, "delivery_confirmed", {"task_status": details["task_status"],
+                           "parts": int(bool(text)) + len(images)}, state="finished", turn_id=turn_id)
+    else:
+        await record_event(msg, "delivery_pending", state="pending", turn_id=turn_id)
 
 
 async def intercept(app, update):
@@ -427,24 +528,41 @@ async def error_reply(msg, text):
     mode = getattr(msg, "error_delivery", None)
     if mode is not None:
         mode()
-    await msg.reply_text(text)
+    sent = await msg.reply_text(text)
+    await record_event(msg, "error_delivery", {"confirmed": type(getattr(sent, "message_id", None)) is int
+                       and sent.message_id > 0})
 
 
 async def process_group(msg):
+    user = getattr(msg, "from_user", None)
+    if user is None:
+        return
+    # Replay a safely recorded cause before starting fresh work. Storage failures here
+    # escape to the durable queue instead of replacing the original diagnostic.
+    if await resume_diagnostic(msg):
+        return
     start = time.monotonic()
     try:
+        baseline = await asyncio.to_thread(runtime_snapshot, "see-profile-config.yaml")
+        await record_event(msg, "started", {"runtime": baseline, "route": "group"}, state="running")
         await group_message(msg)
+        await record_event(msg, "action_finished")
         log.info("group action finished elapsed=%.1fs", time.monotonic() - start)
-    except (store.GroupJobParked, store.DeliveryUncertain):
+    except (store.GroupJobParked, store.DeliveryUncertain) as exc:
         # A timed-out Telegram send may already have reached the group.
+        await record_failure(msg, "parked" if isinstance(exc, store.GroupJobParked) else "delivery_uncertain",
+                           state="waiting" if isinstance(exc, store.GroupJobParked) else "uncertain")
         raise
     except ModelIssue as exc:
         log.warning("group model issue kind=%s stage=%s elapsed=%.1fs", exc.kind, exc.stage, time.monotonic() - start)
         recovery = getattr(msg, "defer_model", None)
-        if exc.retryable and recovery is not None:
-            await recovery(exc)
-            raise store.GroupJobParked()
-        await error_reply(msg, exc.public())
+        await record_failure(msg, "model_failure", {"kind": exc.kind, "stage": exc.stage,
+                           "stop_reason": getattr(exc, "stop_reason", exc.kind),
+                           "retryable": exc.retryable,
+                           "audit": result_audit({"quality_metadata": getattr(exc, "quality_metadata", {})})},
+                           state="waiting" if exc.retryable and recovery is not None else "failed",
+                           action={"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset})
+        await finish_failure(msg, {"type": "model", "kind": exc.kind, "stage": exc.stage, "reset": exc.reset})
     except Exception as exc:
         tb = exc.__traceback__
         while tb and tb.tb_next:
@@ -454,16 +572,13 @@ async def process_group(msg):
         log.warning("group request failed class=%s function=%s line=%d elapsed=%.1fs",
                     type(exc).__name__, fn, tb.tb_lineno if tb else 0, time.monotonic() - start)
         queued = getattr(msg, "defer_failure", None)
-        if queued is not None and store.transient(exc):
-            # A locked or full database, a disk error or a dropped Telegram download says
-            # nothing about the request. Keep its checkpoints and run it again later.
-            await queued()
-            raise store.GroupJobParked() from None
         safe = str(exc) if isinstance(exc, ValueError) and str(exc) in SAFE_ERRORS else None
-        await error_reply(msg, safe or "Не удалось завершить запрос. Попробуйте еще раз.")
-        if queued is not None and safe is None:
-            # The member was told. The operator can still requeue it from its checkpoints.
-            raise store.GroupJobFailed() from None
+        action = {"type": "execution", "transient": store.transient(exc), "safe": safe}
+        await record_failure(msg, "execution_failure", {"class": type(exc).__name__,
+                           "function": fn, "line": tb.tb_lineno if tb else 0},
+                           state="waiting" if queued is not None and store.transient(exc) else "failed",
+                           action=action)
+        await finish_failure(msg, action)
 
 
 UNLINKED_REPLY = ("В этой теме у Вас нет привязки этого сообщения к исходному материалу. "

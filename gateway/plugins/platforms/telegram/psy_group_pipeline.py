@@ -7,7 +7,7 @@ if __package__:
     from .psy_group_continuation import _complete
     from .psy_group_lecture import _lecture
     from .psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
-    from .psy_group_quality import annotate, contract_for, finish_task, mark_partial_text, recheck_edited_task
+    from .psy_group_quality import annotate, contract_message, extract_contract, finish_task, mark_partial_text, recheck_edited_task
     from .psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from .psy_source_evidence import public_topic
 else:
@@ -15,7 +15,7 @@ else:
     from psy_group_continuation import _complete
     from psy_group_lecture import _lecture
     from psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
-    from psy_group_quality import annotate, contract_for, finish_task, mark_partial_text, recheck_edited_task
+    from psy_group_quality import annotate, contract_message, extract_contract, finish_task, mark_partial_text, recheck_edited_task
     from psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from psy_source_evidence import public_topic
 
@@ -31,9 +31,31 @@ def _admit_long(checkpoints, call=None):
         admit()
 
 
-def _compose(client, turns, research, model, question, *, checkpoints=None):
+def _compose(client, turns, research, model, question, *, checkpoints=None,
+             context_scope=None, context_state=None, input_budget_tokens=None):
     call, continuation_call = _job_calls(client, model, checkpoints)
-    result = _compose_task(call, continuation_call, turns, research, model, question, checkpoints)
+    prepared = None
+    try:
+        if context_scope is not None:
+            if __package__:
+                from .psy_group_context import prepare_context
+            else:
+                from psy_group_context import prepare_context
+            prepared = prepare_context(turns[:-1], turns[-1], call, scope=context_scope,
+                                       previous=context_state, input_budget_tokens=input_budget_tokens,
+                                       model=model)
+            turns = prepared.turns
+        result = _compose_task(call, continuation_call, turns, research, model, question, checkpoints)
+    except ModelIssue as exc:
+        if prepared is not None:
+            exc.context_state = prepared.state
+            exc.quality_metadata.update(context_audit=prepared.metadata)
+        audit = getattr(call, "audit", None)
+        if callable(audit):
+            exc.quality_metadata.update(audit())
+        raise
+    if prepared is not None:
+        result.quality_metadata.update(context_state=prepared.state, context_audit=prepared.metadata)
     audit = getattr(call, "audit", None)
     if callable(audit):
         result.quality_metadata.update(audit())
@@ -43,20 +65,30 @@ def _compose(client, turns, research, model, question, *, checkpoints=None):
 def _compose_task(call, continuation_call, turns, research, model, question, checkpoints):
     write_prose = partial(_complete, partial(call, prose=True), model=model,
                           continuation_call=continuation_call if checkpoints is not None else None)
-    contract = contract_for(question)
+    contract = extract_contract(call, turns, question)
+    if contract.get("contract_failure") == "context":
+        _admit_long(checkpoints, call)
+        turns = _map_source(call, turns, question)
+        contract = extract_contract(call, turns, question)
     dispatch = SYSTEM + DISPATCH
     if research:
         _admit_long(checkpoints, call)
         dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
                      "публичной темой. Если искать приватно нельзя, верни пустую public_topic.")
     try:
-        initial = call(turns, dispatch, prose=not research)
+        initial = call([*turns, contract_message(contract)], dispatch, prose=not research)
     except ModelIssue as exc:
         if exc.kind != "context":
             raise
         _admit_long(checkpoints, call)
         turns = _map_source(call, turns, question)
-        initial = call(turns, dispatch, prose=not research)
+        contract = extract_contract(call, turns, question)
+        initial = call([*turns, contract_message(contract)], dispatch, prose=not research)
+
+    turns = [*turns, contract_message(contract)]
+
+    if getattr(initial, "stop_reason", None) == "provider_refusal":
+        return annotate(initial, contract, status="refused", review="provider_refusal")
 
     task = None
     for attempt in range(2):
@@ -92,7 +124,10 @@ def _compose_task(call, continuation_call, turns, research, model, question, che
 
     # Dispatch is already checkpointed. A parked job can resume at this point.
     _admit_long(checkpoints, call)
-    contract = contract_for(question, task)
+    # Keep the pre-writing obligations. Routing advice cannot replace or widen them.
+    if contract["kind"] == "lecture" and not contract["outline_only"] and not contract["limited_scope"]:
+        if contract["minutes"] is None and type(task.get("minutes")) is int and task["minutes"] >= 30:
+            contract["minutes"] = task["minutes"]
     minutes = contract["minutes"] if not contract["outline_only"] else None
     long_form = type(minutes) is int and minutes >= 30
     wants_sources = (bool(task.get("public_topic")) or research) and not contract["local_only"]
@@ -122,6 +157,8 @@ def _compose_task(call, continuation_call, turns, research, model, question, che
             result.text += CUT_NOTE
     result = finish_task(call, write_prose, turns, SYSTEM + ("\n" + ATTRIBUTION if sources else ""),
                          result, contract)
+    if result.task_status == "refused":
+        return result
     if sources:
         previous_status = result.task_status
         previous_missing = result.missing_requirements

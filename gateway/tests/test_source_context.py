@@ -1,4 +1,5 @@
 """Exercise the production group route with SQLite, synthetic messages and zero network I/O."""
+import json
 import sqlite3
 import sys
 import tempfile
@@ -32,7 +33,7 @@ class SourceContext(unittest.IsolatedAsyncioTestCase):
         config.load_config = lambda: {"model": {"provider": "openai-codex", "default": "fixture"}}
         stack.enter_context(patch.dict(sys.modules, {"hermes_cli.config": config}))
         self.response = Mock(return_value=NS(text="Первый ответ", images=[]))
-        self.selector = Mock(side_effect=lambda q, choices, active, model: active)
+        self.selector = Mock(side_effect=lambda q, choices, active, model, **kwargs: active)
         stack.enter_context(patch.object(route, "respond", self.response))
         stack.enter_context(patch.object(route, "choose_source", self.selector))
         self.next_id = 1
@@ -59,7 +60,7 @@ class SourceContext(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(on_loop, [False])
         self.response.assert_called_once()
 
-    async def test_full_document_and_persistent_continuation_after_history_truncation(self):
+    async def test_full_document_and_persistent_continuation(self):
         body = "Первый факт\n" + "ф"*220001 + "\nПоследний факт"
         src = self.msg("Разбери", file("session.txt", body.encode()))
         await route.group_message(src)
@@ -71,6 +72,39 @@ class SourceContext(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Последний факт", repr(options))
         self.assertEqual(options[0]["id"], active)
         self.assertEqual(len(store.listing(11, 0)), 1)
+
+    async def test_original_correction_reaches_model_after_eight_more_exchanges(self):
+        correction = "x" * 3500 + " Use columns Name and Date."
+        self.response.return_value.text = "y" * 4500 + " full answer tail"
+        await route.group_message(self.msg(correction))
+        self.response.return_value.text = "Next answer"
+        for index in range(8):
+            await route.group_message(self.msg(f"Clarification {index}"))
+        await route.group_message(self.msg("Replace Date with Status and continue"))
+        turns = self.response.call_args.args[0]
+        self.assertEqual(turns[0]["content"], correction)
+        self.assertTrue(turns[1]["content"].endswith("full answer tail"))
+        self.assertEqual(len(turns), 19)
+        self.assertIn("Replace Date with Status", turns[-1]["content"][0]["text"])
+        self.assertEqual(self.response.call_args.kwargs["context_scope"],
+                         {"uid": 11, "topic": 0, "source_id": None})
+
+    async def test_private_context_is_saved_but_excluded_from_technical_result_audit(self):
+        state = {"memory": {"summary": "SYNTHETIC PRIVATE MEMORY"}}
+        self.response.return_value.quality_metadata = {"context_state": state,
+                                                       "context_audit": {"compacted_messages": 20}}
+        request = self.msg("Use this synthetic memory")
+        await route.group_message(request)
+        self.assertEqual(store.get_context(11, 0, None), state)
+        audit = store.explain_request(route.audit_key(request), uid=11, topic=0)
+        self.assertNotIn("SYNTHETIC PRIVATE MEMORY", json.dumps(audit))
+        with store.database() as con:
+            metadata = con.execute("SELECT metadata FROM turn_results").fetchone()[0]
+        self.assertNotIn("SYNTHETIC PRIVATE MEMORY", metadata)
+        await route.group_message(self.msg("Continue"))
+        self.assertEqual(self.response.call_args.kwargs["context_state"], state)
+        await route.group_message(self.msg("Another participant", uid=12))
+        self.assertIsNone(self.response.call_args.kwargs["context_state"])
 
     async def test_mini_app_then_explicit_answer_then_free_followup(self):
         attached = file("Расшифровка.txt", b"full mini-app text")

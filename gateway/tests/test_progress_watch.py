@@ -17,9 +17,11 @@ class ProgressWatch(unittest.TestCase):
                 yield 'data: ' + json.dumps({"type":"response.output_text.delta", "item_id":"c", "delta":"working"})
         client = Mock(stream=Mock(return_value=nullcontext(Mock(status_code=200, iter_lines=lines))))
         with patch.object(codex.time, "monotonic", side_effect=lambda:clock[0]):
-            with self.assertRaises(model.ModelIssue):
+            with self.assertRaises(model.ModelIssue) as error:
                 codex._stream(client, {}, [], False, "test")
-        self.assertLessEqual(clock[0], 315)
+        self.assertEqual((error.exception.kind, error.exception.stage), ("timeout", "model_progress_idle"))
+        self.assertGreaterEqual(clock[0], codex.DEEP_IDLE_SECONDS)
+        self.assertLess(clock[0], codex.DEEP_IDLE_SECONDS + 45)
 
     def test_keepalive_cannot_hold_a_stage_forever(self):
         clock = [0]
@@ -33,7 +35,9 @@ class ProgressWatch(unittest.TestCase):
             with self.assertRaises(model.ModelIssue) as error:
                 codex._stream(client, {}, [], False, "test")
         self.assertEqual(error.exception.kind, "timeout")
-        self.assertLessEqual(clock[0], 315)
+        self.assertEqual((error.exception.kind, error.exception.stage), ("timeout", "model_progress_idle"))
+        self.assertGreaterEqual(clock[0], codex.DEEP_IDLE_SECONDS)
+        self.assertLess(clock[0], codex.DEEP_IDLE_SECONDS + 45)
 
     def test_real_progress_can_continue_for_more_than_a_day(self):
         clock = [0]
