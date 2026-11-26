@@ -10,6 +10,7 @@ from . import psy_group_store as store
 from . import psy_group_audio as audio
 from .psy_group_observability import capture_runtime, result_audit
 from .psy_group_codex import ModelIssue, choose_source, research_requested, respond
+from .psy_group_quality import delivery_plan
 
 from .psy_instance import BOT, BOT_USERNAME, GROUP, OWNER
 
@@ -510,8 +511,15 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
         await asyncio.to_thread(store.save_context, uid, topic, doc_id, context_state, message_id=mid)
         metadata.update(runtime=runtime, stop_reason=getattr(result, "stop_reason", "unknown"),
                         stop_stage=getattr(result, "stop_stage", None))
-        generation = metadata.get("generation_audit", metadata.get("generation", {}))
-        api_complete = generation.get("generation_complete")
+        # Historical stages retain interrupted prefixes, even after successful
+        # continuation. They are evidence of recovery, not the current outcome.
+        # Source coverage may be partial with all API streams complete, so never
+        # substitute result.complete or the most recent review stage here.
+        api_complete = metadata.get("current_generation_complete")
+        if type(api_complete) is not bool:
+            api_complete = metadata.get("generation", {}).get("generation_complete")
+        if type(api_complete) is not bool:
+            api_complete = metadata.get("generation_audit", {}).get("generation_complete")
         details = {
             "task_status": getattr(result, "task_status", "unknown"),
             "generation_complete": api_complete if type(api_complete) is bool else None,
@@ -519,9 +527,12 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
             "quality_metadata": {"model_requested": job["model"],
                                  **metadata},
         }
+        contract = metadata.get("task_contract")
+        plan = delivery_plan(contract if isinstance(contract, dict) else {"request": question}, text)
+        details["quality_metadata"]["delivery_plan"] = plan
         if checkpoints is not None:
             final = {"text": text, "images": [base64.b64encode(img).decode("ascii") for img in images],
-                     "result_details": details}
+                     "result_details": details, "delivery_plan": plan}
             await asyncio.to_thread(checkpoints.put, "route:answer:v1", final)
     else:
         text = final["text"]
@@ -530,6 +541,15 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
         # Its bytes remain unchanged so already accepted delivery fingerprints still match.
         details = final.get("result_details", {"task_status": "unknown", "generation_complete": None,
                                               "missing_requirements": [], "quality_metadata": {}})
+        # Older checkpoints used only the length boundary. Preserve their exact
+        # delivery method as well as bytes, rather than changing an accepted part.
+        plan = final.get("delivery_plan", delivery_plan({}, text))
+        if not isinstance(plan, dict):
+            raise ValueError("invalid delivery plan")
+        expected = delivery_plan({"file_output": {"format": plan["requested_format"]}
+                                  if plan.get("requested_format") else None}, text)
+        if plan != expected:
+            raise ValueError("invalid delivery plan")
 
     def receipt(part):
         return {"request_key": (msg.ident, part)} if checkpoints is not None else {}
@@ -547,11 +567,11 @@ async def prepared_answer(msg, job, checkpoints, *, source=None):
 
     confirmed = bool(text or images)
     if text:
-        if len(text) <= 4000:
+        if plan["mode"] == "message":
             sent = await msg.reply_text(text, disable_web_page_preview=True)
         else:
-            name = "Ответ PSY.txt"
-            data = text.encode()
+            name = plan["filename"]
+            data = text.encode(plan["encoding"])
             await archive_answer(name, "text", data, "text")
             sent = await deliver(msg, name, data)
         await asyncio.to_thread(store.bind_message, uid, topic, getattr(sent, "message_id", None), doc_id, turn_id)

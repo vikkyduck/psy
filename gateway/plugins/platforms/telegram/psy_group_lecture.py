@@ -102,6 +102,10 @@ def _lecture(call, turns, minutes, *, write_prose=None):
                     raise ModelIssue("unavailable", "lecture_supplement")
                 result.text += "\n\n" + addition
                 result.complete = supplement.complete
+                outcomes = [result.quality_metadata.get("current_generation_complete"),
+                            supplement.quality_metadata.get("current_generation_complete")]
+                result.quality_metadata["current_generation_complete"] = (
+                    False if False in outcomes else True if all(x is True for x in outcomes) else None)
         except ModelIssue as exc:
             result.text += "\n\n[Проверка полноты раздела не завершена. " + exc.public() + "]"
             result.complete = False
@@ -111,6 +115,7 @@ def _lecture(call, turns, minutes, *, write_prose=None):
     complete = True
     first_failure = None
     missing = []
+    generation_outcomes = []
     # A section that ends with a model issue leaves a gap; a deferred 429 or any other
     # failure stops the remaining sections and parks the job with the written ones saved.
     for result, issue in _parallel(call, write, range(len(sections)), tolerate=ModelIssue):
@@ -118,11 +123,13 @@ def _lecture(call, turns, minutes, *, write_prose=None):
             first_failure = first_failure or issue
             complete = False
             parts.append(None)
+            generation_outcomes.append(False)
             missing.append("Раздел не сформирован: " + sections[len(parts) - 1]["title"])
         else:
             if getattr(result, "stop_reason", None) == "provider_refusal":
                 return result
             parts.append(result.text)
+            generation_outcomes.append(result.quality_metadata.get("current_generation_complete"))
             complete &= result.complete
             if not result.complete:
                 missing.append("Раздел требует завершения или проверки: " + sections[len(parts) - 1]["title"])
@@ -152,7 +159,10 @@ def _lecture(call, turns, minutes, *, write_prose=None):
     result.quality_metadata = {"lecture_sections_planned": len(sections),
                                "lecture_sections_present": sum(part is not None for part in parts),
                                "planned_minutes": minutes, "planned_activity_minutes": practice,
-                               "duration_basis": "schedule_not_measured"}
+                               "duration_basis": "schedule_not_measured",
+                               "current_generation_complete": (
+                                   False if False in generation_outcomes else
+                                   True if all(x is True for x in generation_outcomes) else None)}
     return result
 
 

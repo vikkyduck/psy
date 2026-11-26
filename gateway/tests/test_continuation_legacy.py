@@ -90,7 +90,7 @@ class LegacyContinuation(unittest.TestCase):
             task_reviews = []
 
             def endpoint(client, headers, messages, web, selected, *, instructions, **kwargs):
-                if instructions == quality._REVIEW:
+                if instructions.startswith(quality._REVIEW):
                     task_reviews.append(messages)
                     return model.Result('{"complete":true,"missing":[]}', [], 0)
                 sent.append(messages)

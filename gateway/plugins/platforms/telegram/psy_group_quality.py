@@ -13,7 +13,54 @@ else:
     from psy_group_client import ModelIssue, _json_value, _user
 
 
-VERSION = "task-completion-v2"
+VERSION = "task-completion-v3"
+DELIVERY_VERSION = "telegram-text-delivery-v1"
+
+
+def delivery_plan(contract, text=None):
+    """Application-owned text transport, shared by writing, review and Telegram send.
+
+    Extracted file_output describes user intent, not a capability. Only this code
+    decides what the sender can provide. A missing field in a legacy contract keeps
+    the prior length-based transport. Format mentions never become output requests.
+    """
+    requested = contract.get("file_output")
+    file_format = requested.get("format") if isinstance(requested, dict) else None
+    file_format = file_format.strip().lower() if isinstance(file_format, str) else None
+    if isinstance(requested, dict) and not file_format:
+        file_format = "txt"
+    supported = file_format in (None, "txt")
+    document = file_format == "txt" or (isinstance(text, str) and len(text) > 4000)
+    mode = "document" if document else "automatic" if text is None else "message"
+    return {"version": DELIVERY_VERSION, "transport": "telegram", "mode": mode,
+            "format": "txt" if document else None,
+            "filename": "Ответ PSY.txt" if document else None,
+            "encoding": "utf-8", "requested_format": file_format,
+            "supported": supported, "status": "pending"}
+
+
+def delivery_instructions(contract, text=None):
+    plan = delivery_plan(contract, text)
+    return ("\nСлужебный план доставки, рассчитанный приложением:\n"
+            + json.dumps(plan, ensure_ascii=False)
+            + "\nПриложение отправляет готовый текст в Telegram после проверки содержания. "
+              "Для mode=document весь текст без сокращений будет упакован в один UTF-8 TXT с указанным именем. "
+              "При mode=automatic текст длиннее 4000 символов также будет отправлен целиком одним TXT, "
+              "короткий текст - сообщением. Это способ доставки, не ограничение объема ответа. "
+              "Факт отправки еще не проверяется: он подтверждается отдельно квитанцией Telegram. "
+              "Готовь и проверяй содержимое результата, а не наличие уже отправленного вложения. "
+              "Не предлагай участнику самостоятельно сохранять готовый TXT, не утверждай, что отправить "
+              "такой TXT невозможно, не выдумывай ссылки на файлы и не заявляй, что файл уже отправлен. "
+              "Служебный план не включай в материал. При supported=false запрошенный формат файла "
+              "этим маршрутом не создается: TXT не считается выполнением заказа PDF, DOCX или другого "
+              "формата. Проверяй остальные требования к содержимому, ограничение формата учтет приложение.")
+
+
+def delivery_missing(plan):
+    if not plan["supported"]:
+        return ["Запрошенный формат файла " + plan["requested_format"].upper()
+                + " не создается этим маршрутом. Доступна отправка текста в TXT."]
+    return []
 _CREATE = re.compile(r"\b(?:состав\w*|напиш\w*|написа\w*|подготов\w*|созда\w*|разработ\w*|нуж\w*|хочу|дай|сделай|write|draft|prepare)\b", re.I)
 _LECTURE = re.compile(r"\b(?:лекци\w*|выступлени\w*|заняти\w*|lecture|speech)\b", re.I)
 _FULL = re.compile(r"(?:полн\w*\s+(?:текст|лекци\w*|рукопис\w*|стать\w*|отчет\w*)|(?:текст|рукопис\w*)\s+(?:лекци\w*|выступлени\w*)|full\s+(?:text|manuscript))", re.I)
@@ -66,7 +113,7 @@ def contract_for(question, task=None):
             "limited_scope": limited,
             "local_only": bool(_LOCAL_ONLY.search(question)),
             "review_required": True,
-            "contract_status": "local_fallback"}
+            "contract_status": "local_fallback", "file_output": None}
 
 
 _EXTRACT = """До написания ответа составь внутреннюю карту текущего заказа участника.
@@ -86,7 +133,15 @@ _EXTRACT = """До написания ответа составь внутрен
 {"task":"текущая задача","audience":null,"topics":[],"examples":[],"format":null,
 "deliverables":[],"constraints":[],"obligations":["что именно нужно выполнить"],
 "continuation":false,"superseded_requirements":[],"kind":"answer",
-"minutes":null,"outline_only":false,"limited_scope":false,"local_only":false}.
+"minutes":null,"outline_only":false,"limited_scope":false,"local_only":false,
+"file_output":null}.
+file_output описывает только явный заказ готового файла как результата: {"format":"txt"},
+{"format":"pdf"}, {"format":"docx"} или иной названный формат. Для файла без заданного
+формата используй {"format":"txt"}. Для обычного сообщения используй null. Вопрос о формате,
+сравнение PDF и DOCX, разбор цитируемой чужой инструкции или приложенный исходный файл не
+являются заказом файла. Явный отказ от вложения означает null. Для продолжения той же работы
+учитывай действующий формат результата, явная новая правка его заменяет. Не приписывай приложению
+возможности создавать файл: здесь извлекается только требование участника.
 kind: answer, manuscript или lecture. lecture означает заказ готовой лекции, выступления или
 занятия, а не любой вопрос о лекциях. minutes - заданное время занятия целым числом минут,
 с учетом академических часов по 45 минут только при явном указании. outline_only означает
@@ -117,9 +172,18 @@ def _contract_data(value):
             return None
     if not value["obligations"]:
         return None
+    if "file_output" not in value:
+        return None
+    file_output = value["file_output"]
+    if file_output is not None and (not isinstance(file_output, dict)
+            or set(file_output) != {"format"} or not isinstance(file_output["format"], str)
+            or not re.fullmatch(r"[a-zA-Z0-9_+-]{1,24}", file_output["format"])):
+        return None
     keys = ("task", "audience", "format", "kind", "minutes", "continuation", "outline_only",
             "limited_scope", "local_only", *lists)
-    return {key: value[key] for key in keys}
+    result = {key: value[key] for key in keys}
+    result["file_output"] = file_output
+    return result
 
 
 def extract_contract(call, turns, question):
@@ -167,13 +231,17 @@ def declared_partial(text):
 
 
 def annotate(result, contract, *, status=None, missing=(), review="not_required", repairs=0):
+    plan = delivery_plan(contract, result.text)
+    missing = [*missing, *delivery_missing(plan)]
+    if missing and status == "complete":
+        status = "partial"
     if status is not None:
         result.task_status = status
     result.missing_requirements = list(dict.fromkeys([*getattr(result, "missing_requirements", []), *missing]))
     metadata = dict(getattr(result, "quality_metadata", {}))
     metadata.update(completion_version=VERSION, completion_review=review, completion_repairs=repairs,
                     deliverable_kind=contract["kind"], requested_minutes=contract["minutes"],
-                    task_contract=contract)
+                    task_contract=contract, delivery_plan=plan)
     result.quality_metadata = metadata
     return result
 
@@ -197,7 +265,8 @@ _REVIEW = """Проверь выполнение исходного заказа
 
 def _verdict(call, turns, contract, result):
     check = call([*turns, _user("Контракт исходного заказа:\n" + json.dumps(contract, ensure_ascii=False)),
-                  _user("Созданный материал для проверки:\n" + result.text)], _REVIEW)
+                  _user("Созданный материал для проверки:\n" + result.text)],
+                 _REVIEW + delivery_instructions(contract, result.text))
     verdict = _json_value(check.text) if check.complete else None
     if not isinstance(verdict, dict) or type(verdict.get("complete")) is not bool:
         raise ModelIssue("unavailable", "task_completion_review")
@@ -229,7 +298,7 @@ def finish_task(call, write_prose, turns, instructions, result, contract):
                           _user("Проверка нашла невыполненные требования:\n" + "\n".join(missing)
                                 + "\nВерни весь исправленный материал целиком. Сохрани уже выполненное, "
                                   "закрой перечисленные пробелы. Не обещай продолжить в следующем сообщении.")]
-            corrected = write_prose(correction, instructions)
+            corrected = write_prose(correction, instructions + delivery_instructions(contract))
             if getattr(corrected, "stop_reason", None) == "provider_refusal":
                 corrected.quality_metadata = {**getattr(result, "quality_metadata", {}),
                                               **getattr(corrected, "quality_metadata", {})}

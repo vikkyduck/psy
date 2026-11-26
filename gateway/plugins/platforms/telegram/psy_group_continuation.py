@@ -63,7 +63,8 @@ def _complete(call, turns, instructions, *, initial=None, continuation_call=None
         metadata = {}
         for item in parts:
             metadata.update(getattr(item, "quality_metadata", {}))
-        metadata.update(continuation_parts=len(parts), continuation_context="full_output")
+        metadata.update(continuation_parts=len(parts), continuation_context="full_output",
+                        current_generation_complete=complete)
         return Result("".join(pieces) + note, [image for item in parts for image in item.images],
                       sum(item.searches for item in parts), complete,
                       tuple(dict.fromkeys(url for item in parts for url in item.source_urls)),

@@ -198,6 +198,8 @@ def result_audit(details):
             "source_check_attempts", "coverage_status",
             "completion_version", "completion_review", "completion_repairs",
             "post_source_completion_review", "stop_reason", "stop_stage") if key in metadata}
+    if type(metadata.get("current_generation_complete")) is bool:
+        safe["current_generation_complete"] = metadata["current_generation_complete"]
     return {"task_status": details.get("task_status", "unknown"),
             "generation_complete": details.get("generation_complete"),
             "missing_requirements_count": len(details.get("missing_requirements", [])),

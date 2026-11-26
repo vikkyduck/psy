@@ -47,7 +47,7 @@ class Duration(unittest.TestCase):
                 local = quality.contract_for(question)
                 text = contract_json(question, **{key: local[key] for key in
                                      ("kind", "minutes", "outline_only", "limited_scope", "local_only")})
-            elif json["instructions"] == quality._REVIEW:
+            elif json["instructions"].startswith(quality._REVIEW):
                 text = '{"complete":true,"missing":[]}'
             else:
                 text = None
@@ -91,7 +91,7 @@ class Duration(unittest.TestCase):
         def stage(payload):
             text, incomplete = next(outputs)
             if '"complete"' in text:
-                self.assertEqual(payload["instructions"], quality._REVIEW)
+                self.assertTrue(payload["instructions"].startswith(quality._REVIEW))
             return self.answer(text, incomplete=incomplete)
         result = self.compose("Напиши текст лекции", stage)
         self.assertTrue(result.complete)

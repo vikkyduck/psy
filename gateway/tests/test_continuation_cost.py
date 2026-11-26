@@ -62,7 +62,7 @@ class LectureEndpoint:
             text = encode(dict(task=QUESTION, audience=None, topics=[], examples=[], format=None,
                                deliverables=[], constraints=[], obligations=[QUESTION], continuation=False,
                                superseded_requirements=[], kind="lecture", minutes=30,
-                               outline_only=False, limited_scope=False, local_only=False))
+                               outline_only=False, limited_scope=False, local_only=False, file_output=None))
         elif "Сейчас нужен внутренний редакционный" in instruction:
             plan = {"title": PLAN_TITLE, "sections": [{"title": "Теория", "brief": "Тезис",
                     "minutes": 30, "activity_minutes": 0}]}
@@ -79,7 +79,7 @@ class LectureEndpoint:
         elif instruction == prompts.REVIEW:
             self.source_reviews.extend(prose_fragments(payload))
             text = '{"edits":[]}'
-        elif instruction == quality._REVIEW:
+        elif instruction.startswith(quality._REVIEW):
             self.task_reviews.extend(prose_fragments(payload))
             text = '{"complete":true,"missing":[]}'
         else:

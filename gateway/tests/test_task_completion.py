@@ -29,7 +29,7 @@ def contract_answer(question, **changes):
                  deliverables=[], constraints=[], obligations=[question], continuation=False,
                  superseded_requirements=[], kind=contract["kind"], minutes=contract["minutes"],
                  outline_only=contract["outline_only"], limited_scope=contract["limited_scope"],
-                 local_only=contract["local_only"])
+                 local_only=contract["local_only"], file_output=None)
     value.update(changes)
     return answer(json.dumps(value, ensure_ascii=False))
 
@@ -100,7 +100,7 @@ class TaskCompletion(unittest.TestCase):
         self.assertEqual(result.task_status, "complete")
         self.assertEqual(result.quality_metadata["completion_review"], "passed")
         self.assertEqual(call.calls[0][1], quality._EXTRACT)
-        self.assertEqual(call.calls[-1][1], quality._REVIEW)
+        self.assertTrue(call.calls[-1][1].startswith(quality._REVIEW))
 
     def test_missing_obligation_is_repaired_and_checked_again(self):
         contract = quality.contract_for("Напиши полный текст статьи с двумя примерами")
