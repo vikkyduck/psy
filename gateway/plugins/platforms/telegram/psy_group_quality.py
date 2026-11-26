@@ -13,7 +13,7 @@ else:
     from psy_group_client import ModelIssue, _json_value, _user
 
 
-VERSION = "task-completion-v3"
+VERSION = "task-completion-v4"
 DELIVERY_VERSION = "telegram-text-delivery-v1"
 
 
@@ -113,7 +113,7 @@ def contract_for(question, task=None):
             "limited_scope": limited,
             "local_only": bool(_LOCAL_ONLY.search(question)),
             "review_required": True,
-            "contract_status": "local_fallback", "file_output": None}
+            "contract_status": "local_fallback", "file_output": None, "literal_constraints": []}
 
 
 _EXTRACT = """До написания ответа составь внутреннюю карту текущего заказа участника.
@@ -134,7 +134,7 @@ _EXTRACT = """До написания ответа составь внутрен
 "deliverables":[],"constraints":[],"obligations":["что именно нужно выполнить"],
 "continuation":false,"superseded_requirements":[],"kind":"answer",
 "minutes":null,"outline_only":false,"limited_scope":false,"local_only":false,
-"file_output":null}.
+"file_output":null,"literal_constraints":[]}.
 file_output описывает только явный заказ готового файла как результата: {"format":"txt"},
 {"format":"pdf"}, {"format":"docx"} или иной названный формат. Для файла без заданного
 формата используй {"format":"txt"}. Для обычного сообщения используй null. Вопрос о формате,
@@ -142,6 +142,20 @@ file_output описывает только явный заказ готовог
 являются заказом файла. Явный отказ от вложения означает null. Для продолжения той же работы
 учитывай действующий формат результата, явная новая правка его заменяет. Не приписывай приложению
 возможности создавать файл: здесь извлекается только требование участника.
+literal_constraints - все явно заданные точные условия к символам и границам итогового материала.
+Каждая запись имеет ровно поля {"kind":"forbid_char","value":";","source":"без точек с запятой"}.
+kind: forbid_char (один символ, явно запрещенный во всем итоговом материале), prefix (дословное начало), first_line (точная первая
+строка), last_line (точная последняя строка). source - точная цитата самой инструкции участника,
+сохраненная без пересказа. Для prefix/first_line/last_line value должен дословно присутствовать
+в source. Например "Начни с пометки ..." означает prefix, а "Последняя отдельная строка ..."
+означает last_line. Не добавляй символы из общих пожеланий о стиле и не придумывай запрет для кода.
+Локальное правило, например запрет символа только в заголовках или пояснениях, оставь в constraints,
+не превращай его в запрет для всего результата. Отмененный запрет не включай в literal_constraints.
+Упоминание правила в вопросе, цитате, учебном примере, исходном документе или коде не задает
+ограничение ответа. Отмечай только инструкции к самому результату. Для новой задачи используй
+только текущий запрос. При продолжении допускаются действующие инструкции участника из той же
+работы, новая правка заменяет прежнюю, отмененное правило не возвращается. Если точных условий
+нет, верни []. Поле обязательно, даже когда список пуст.
 kind: answer, manuscript или lecture. lecture означает заказ готовой лекции, выступления или
 занятия, а не любой вопрос о лекциях. minutes - заданное время занятия целым числом минут,
 с учетом академических часов по 45 минут только при явном указании. outline_only означает
@@ -149,7 +163,100 @@ kind: answer, manuscript или lecture. lecture означает заказ г�
 явный запрет внешнего поиска. continuation относится только к той же незаконченной работе."""
 
 
-def _contract_data(value):
+def _plain_position(text, position):
+    """Reject instructions quoted as data or placed inside inline/fenced code."""
+    line_start = text.rfind("\n", 0, position) + 1
+    line_end = text.find("\n", position)
+    if text[line_start:line_end if line_end >= 0 else len(text)].lstrip().startswith(">"):
+        return False
+    quote = None
+    code = None
+    i = 0
+    pairs = {'"': '"', "'": "'", "«": "»", "“": "”"}
+    while i < position:
+        marker = next((x for x in ("```", "~~~") if text.startswith(x, i)), None)
+        if marker and quote is None:
+            if code is None:
+                code = marker
+            elif code == marker:
+                code = None
+            i += len(marker)
+            continue
+        char = text[i]
+        if code in ("```", "~~~"):
+            i += 1
+            continue
+        if char == "`" and quote is None:
+            code = None if code == "`" else "`"
+        elif code is None:
+            if char == "\\":
+                i += 2
+                continue
+            if quote is not None and char == quote:
+                quote = None
+            elif quote is None and char in pairs:
+                # An apostrophe inside a word is not the beginning of a citation.
+                if char != "'" or not (i > 0 and text[i-1].isalnum()
+                                        and i+1 < len(text) and text[i+1].isalnum()):
+                    quote = pairs[char]
+        i += 1
+    return quote is None and code is None
+
+
+def _instruction_texts(turns):
+    for turn in turns:
+        if turn.get("role") != "user":
+            continue
+        content = turn.get("content")
+        if isinstance(content, list):
+            # route.content puts the participant's request first. Later text
+            # blocks are uploaded materials, not new instructions.
+            content = content[0].get("text") if content and content[0].get("type") == "input_text" else None
+        if isinstance(content, str) and not content.startswith("Материал: "):
+            yield content.partition("\n\nЦитата из этого чата:\n")[0]
+
+
+def _literal_bound(item, texts):
+    kind, value, source = (item[key] for key in ("kind", "value", "source"))
+    if kind == "forbid_char":
+        denial = re.search(r"(?:^|\b)(?:без|запрет\w*|запрещ\w*|не\s+(?:использ\w*|став\w*|пиш\w*)|"
+                           r"without|avoid|do not use|don't use|never use)\b", source, re.I)
+        named = value in source or (value == ";" and re.search(r"точ\w*\s+с\s+запят\w*", source, re.I))
+        if not denial or not named or not _plain_position(source, denial.start()):
+            return False
+    else:
+        if value not in source:
+            return False
+    for text in texts:
+        offset = 0
+        while (offset := text.find(source, offset)) >= 0:
+            start = offset + len(source) - len(source.lstrip())
+            # A quoted source may include its own opening quote/fence. Check
+            # after the first character too, not only just before the wrapper.
+            if _plain_position(text, start) and _plain_position(text, start + 1):
+                return True
+            offset += 1
+    return False
+
+
+def literal_missing(text, contract):
+    """Check the whole assembled output, independently of the model's verdict."""
+    missing = []
+    lines = text.rstrip("\r\n").splitlines()
+    for item in contract.get("literal_constraints", []):
+        kind, value = item["kind"], item["value"]
+        if kind == "forbid_char" and value in text:
+            missing.append(f"Запрещенный символ U+{ord(value):04X} встречается в материале {text.count(value)} раз.")
+        elif kind == "prefix" and not text.startswith(value):
+            missing.append("Начало материала не совпадает с явно заданным началом.")
+        elif kind == "first_line" and (not lines or lines[0] != value):
+            missing.append("Первая строка материала не совпадает с явно заданной строкой.")
+        elif kind == "last_line" and (not lines or lines[-1] != value):
+            missing.append("Последняя строка материала не совпадает с явно заданной строкой.")
+    return list(dict.fromkeys(missing))
+
+
+def _contract_data(value, question="", source_turns=()):
     """Reject malformed extraction without clipping or silently dropping obligations."""
     if not isinstance(value, dict) or not isinstance(value.get("task"), str) or not value["task"].strip():
         return None
@@ -179,14 +286,28 @@ def _contract_data(value):
             or set(file_output) != {"format"} or not isinstance(file_output["format"], str)
             or not re.fullmatch(r"[a-zA-Z0-9_+-]{1,24}", file_output["format"])):
         return None
+    literal = value.get("literal_constraints")
+    if not isinstance(literal, list):
+        return None
+    texts = [question or "", *(_instruction_texts(source_turns) if value["continuation"] else [])]
+    for item in literal:
+        if (not isinstance(item, dict) or set(item) != {"kind", "value", "source"}
+                or item["kind"] not in ("forbid_char", "prefix", "first_line", "last_line")
+                or not isinstance(item["value"], str) or not item["value"]
+                or not isinstance(item["source"], str) or not item["source"].strip()
+                or (item["kind"] == "forbid_char" and len(item["value"]) != 1)
+                or (item["kind"] in ("first_line", "last_line") and re.search(r"[\r\n]", item["value"]))
+                or not _literal_bound(item, texts)):
+            return None
     keys = ("task", "audience", "format", "kind", "minutes", "continuation", "outline_only",
             "limited_scope", "local_only", *lists)
     result = {key: value[key] for key in keys}
     result["file_output"] = file_output
+    result["literal_constraints"] = literal
     return result
 
 
-def extract_contract(call, turns, question):
+def extract_contract(call, turns, question, *, source_turns=None):
     """Checkpointed model extraction precedes any public draft. Failure is never certified."""
     contract = contract_for(question)
     messages = [*turns, _user("Текущий запрос участника для карты обязательств:\n" + (question or ""))]
@@ -194,7 +315,8 @@ def extract_contract(call, turns, question):
         instructions = _EXTRACT + ("\nПовтори карту, соблюдая всю JSON-схему. Не пиши готовый ответ." if attempt else "")
         try:
             response = call(messages, instructions)
-            data = _contract_data(_json_value(response.text)) if response.complete else None
+            data = _contract_data(_json_value(response.text), question,
+                                  turns if source_turns is None else source_turns) if response.complete else None
         except ModelIssue as exc:
             if exc.retryable:
                 # An auth/quota/transport failure is a job interruption, not a bad
@@ -278,6 +400,7 @@ def _verdict(call, turns, contract, result):
         raise ModelIssue("unavailable", "task_completion_review")
     if declared_partial(result.text) and not contract["limited_scope"]:
         missing.append("В тексте осталось объявление первой части или обещание продолжения вместо полного результата.")
+    missing.extend(literal_missing(result.text, contract))
     return list(dict.fromkeys(missing))
 
 

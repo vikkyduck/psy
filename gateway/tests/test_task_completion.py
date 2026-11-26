@@ -29,7 +29,7 @@ def contract_answer(question, **changes):
                  deliverables=[], constraints=[], obligations=[question], continuation=False,
                  superseded_requirements=[], kind=contract["kind"], minutes=contract["minutes"],
                  outline_only=contract["outline_only"], limited_scope=contract["limited_scope"],
-                 local_only=contract["local_only"], file_output=None)
+                 local_only=contract["local_only"], file_output=None, literal_constraints=[])
     value.update(changes)
     return answer(json.dumps(value, ensure_ascii=False))
 

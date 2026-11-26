@@ -82,7 +82,8 @@ class TestEndpoints:
             text = json.dumps(dict(task="write lecture", audience=None, topics=[], examples=[], format=None,
                                    deliverables=[], constraints=[], obligations=["Complete lecture"], continuation=False,
                                    superseded_requirements=[], kind="lecture", minutes=60,
-                                   outline_only=False, limited_scope=False, local_only=False, file_output=None))
+                                   outline_only=False, limited_scope=False, local_only=False, file_output=None,
+                                   literal_constraints=[]))
         elif "Сейчас нужен внутренний редакционный" in instructions:
             plan = [{"title": f"Chapter {i}", "brief": "argument", "minutes": 15, "activity_minutes": 0}
                     for i in range(1, 5)]

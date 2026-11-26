@@ -62,7 +62,8 @@ class LectureEndpoint:
             text = encode(dict(task=QUESTION, audience=None, topics=[], examples=[], format=None,
                                deliverables=[], constraints=[], obligations=[QUESTION], continuation=False,
                                superseded_requirements=[], kind="lecture", minutes=30,
-                               outline_only=False, limited_scope=False, local_only=False, file_output=None))
+                               outline_only=False, limited_scope=False, local_only=False, file_output=None,
+                               literal_constraints=[]))
         elif "Сейчас нужен внутренний редакционный" in instruction:
             plan = {"title": PLAN_TITLE, "sections": [{"title": "Теория", "brief": "Тезис",
                     "minutes": 30, "activity_minutes": 0}]}
