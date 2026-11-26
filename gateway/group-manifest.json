@@ -23,13 +23,13 @@
   "plugins/platforms/telegram/psy_group_prompts.py": "3e89a7daab908edc0a4d59af6ac269f84c44616003d72eb7b37979f73d5c697b",
   "plugins/platforms/telegram/psy_group_quality.py": "2a696ab7bc9b8da774d79c8637312abe045bf2afa04819c385229f1695139184",
   "plugins/platforms/telegram/psy_group_queue.py": "cf190e129dcfd8f4617a1c3ef685696b3c4f0bf4f16e02d6a3cb0ce7a452fbc5",
-  "plugins/platforms/telegram/psy_group_route.py": "af264c8aa9fbaec238be2ff30e5b0cd21b7f5c299cc723206690726e6cf517fc",
+  "plugins/platforms/telegram/psy_group_route.py": "2c19f295fe388597a91651f9f4e2c3fadaa2d150ab5f1b01ea8673843cb7d9d1",
   "plugins/platforms/telegram/psy_group_sources.py": "364418f94546d8f05abff08081ae9f183d7d55b647bc6e6dc28ed5e974477cf2",
   "plugins/platforms/telegram/psy_group_store.py": "b3d0e8205c2ad1e318fc4a33c4bc660c6d6e34587cedd126d81e7d2767d818a4",
   "plugins/platforms/telegram/psy_instance.py": "0ee509a6d64accffea2192a9d53b157105effea342d50b4d10c3fd1873c44c10",
   "plugins/platforms/telegram/psy_owner_recovery.py": "637e1dee25d4eb2530342ece6ae134c5d2451586efb746fba675f7623255bd63",
   "plugins/platforms/telegram/psy_source_evidence.py": "f937e6b9f88d54ef3d5986d2dd50e34414e02b606e26a7d41ac03333d3fb1e97",
   "plugins/platforms/telegram/psy_upload_handoff.py": "191fa36f158b7527792d453f199922407b10faeacb640201f13836ec27a05392",
-  "plugins/platforms/telegram/update_admission.py": "4bfc788deb2a61869c2cff56ec519b51d05fd90e179688f8b7177b10e3cf4ec6",
+  "plugins/platforms/telegram/update_admission.py": "4607572c4b386c734ec2d98a49d0f8e6c33def89ae2dc4870ed05e5b4ef197a7",
   "tools/transcription_tools.py": "dcb54798d0b21be57e75e2060e919ac2b9e1f6ade1d63d907f2ef39ac0842139"
 }

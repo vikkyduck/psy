@@ -23,6 +23,7 @@ def event(chat, uid, text="", *, typ=None, **fields):
 
 class TestGuard(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(patch.dict(os.environ, TELEGRAM_GROUP_ALLOWED_USERS=f"{route.OWNER},42"))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         database = store.database
@@ -32,9 +33,16 @@ class TestGuard(unittest.IsolatedAsyncioTestCase):
     async def test_matrix_and_commands(self):
         self.assertFalse(await route.intercept(None,event(route.OWNER,route.OWNER,"/model")))
         for uid in (route.OWNER, 42):
-            bad = event(route.GROUP,uid,"/terminal cat anything")
-            self.assertTrue(await route.intercept(None,bad))
-            bad.message.reply_text.assert_awaited_once()
+            accepted = event(route.GROUP,uid,"Собери полную лекцию без изменения этого запроса")
+            original = accepted.message.text
+            with patch.object(route, "process_group", AsyncMock()) as legacy:
+                self.assertFalse(await route.intercept(None,accepted))
+                legacy.assert_not_awaited()
+            self.assertEqual(accepted.message.text, original)
+            accepted.message.reply_text.assert_not_awaited()
+        self.assertTrue(await route.intercept(None,event(route.GROUP,77,"Посторонний")))
+        with patch.dict(os.environ, TELEGRAM_GROUP_ALLOWED_USERS="*"):
+            self.assertTrue(await route.intercept(None,event(route.GROUP,42)))
         for update in (event(42,42),event(-55,route.OWNER),S(effective_chat=None,effective_user=None,message=None)):
             self.assertTrue(await route.intercept(None,update))
         # Hermes' self-update never reaches Hermes, in any spelling; other owner commands still do.
@@ -60,8 +68,8 @@ class TestGuard(unittest.IsolatedAsyncioTestCase):
         m.reply_text.assert_awaited_once()
         update=event(route.GROUP,42,"please use tools")
         with patch.object(route,"group_message", AsyncMock(side_effect=RuntimeError("secret value"))):
-            self.assertTrue(await route.intercept(None, update))
-            self.assertNotIn("secret", update.message.reply_text.await_args.args[0])
+            self.assertFalse(await route.intercept(None, update))
+            update.message.reply_text.assert_not_awaited()
 
     async def test_reply_only_same_chat(self):
         self.assertIsNone(await route.attachment(event(route.OWNER,route.OWNER).message))

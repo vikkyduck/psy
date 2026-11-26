@@ -1,8 +1,9 @@
-"""Trust boundary before Hermes handlers, hooks and plugins. Group data never enters the owner agent."""
+"""Telegram ID gate before the standard Hermes handlers. Legacy data helpers remain readable."""
 import asyncio
 import base64
 import io
 import logging
+import os
 import re
 import time
 
@@ -183,12 +184,21 @@ def scope(update):
     user = getattr(update, "effective_user", None)
     chatid = getattr(chat, "id", None)
     kind = getattr(chat, "type", "")
-    if kind in ("group", "supergroup") and chatid == GROUP:
-        return "group"
     if any(getattr(update, field, None) is not None for field in (
         "business_message", "edited_business_message", "deleted_business_messages", "business_connection"
     )):
         return "deny"
+    if kind in ("group", "supergroup") and chatid == GROUP:
+        # Both IDs are required. A group allowlist alone authorizes every member in
+        # upstream Hermes, so reject unlisted senders before any upstream handler.
+        allowed = set(filter(None, re.split(r"[\s,]+", os.environ.get("TELEGRAM_GROUP_ALLOWED_USERS", ""))))
+        message = getattr(update, "effective_message", None) or getattr(update, "message", None)
+        if (not allowed or not all(re.fullmatch(r"[1-9][0-9]*", value) for value in allowed)
+                or not user or user.is_bot or str(user.id) not in allowed
+                or message is None or getattr(message, "sender_chat", None)
+                or getattr(message, "business_connection_id", None)):
+            return "deny"
+        return "group"
     if kind == "private" and user and chatid == user.id and not user.is_bot:
         msg = getattr(update, "message", None)
         if msg and getattr(msg, "business_connection_id", None):
@@ -606,12 +616,13 @@ async def intercept(app, update):
     if route == "upload" and msg:
         from plugins.platforms.telegram.psy_upload_handoff import command
         await command(msg)
-    if route == "group" and msg:
-        if app is None:  # Also used by offline acceptance tests.
-            await process_group(msg)
-        else:
-            from .psy_group_queue import accept
-            await accept(app, update)
+    if route == "group":
+        if msg and SELF_UPDATE.fullmatch((getattr(msg, "text", None) or "").strip()):
+            await msg.reply_text(SELF_UPDATE_REPLY)
+            return True
+        # Preserve the original Update, text, attachments and reply chain. Native
+        # Hermes owns conversation, tools, persistence and delivery from here on.
+        return False
     return True
 
 

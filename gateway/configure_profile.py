@@ -80,7 +80,9 @@ def stage_config(config, home, owner):
     )
     config.setdefault("privacy", {})["redact_pii"] = True
     config.setdefault("telemetry", {}).setdefault("shared_metrics", {}).update(enabled=False, send=False)
-    config.setdefault("terminal", {})["cwd"] = str(home/"vault/projects")
+    # Hermes protects vault/ as credential storage. Outputs stay inside the
+    # same backed-up profile, in a location its native file tools can write.
+    config.setdefault("terminal", {})["cwd"] = str(home/"outputs")
     display = config.setdefault("display", {})
     display["background_process_notifications"] = "off"
     display.setdefault("platforms", {}).setdefault("telegram", {}).update(
@@ -143,7 +145,7 @@ def reconcile(home):
         for path in (env_file,config_file):path.chmod(0o600)
         if proposed and dotenv_values(env_file,interpolate=False).get('TELEGRAM_BOT_TOKEN')==proposed:
             pending.unlink()
-        (home/'vault/projects').mkdir(mode=0o700,parents=True,exist_ok=True)
+        (home/'outputs').mkdir(mode=0o700,parents=True,exist_ok=True)
         return bool(changed or rendered!=raw_config)
 
 
