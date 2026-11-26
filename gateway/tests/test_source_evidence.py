@@ -54,7 +54,7 @@ class Evidence(unittest.TestCase):
         def stream(client, headers, turns, web, model_id, *, instructions, **kw):
             if instructions.startswith(quality._EXTRACT):
                 return model.Result(contract_json(question), [], 0)
-            if instructions == quality._REVIEW:
+            if instructions.startswith(quality._REVIEW):
                 return model.Result('{"complete":true,"missing":[]}', [], 0)
             if prompts.DISPATCH in instructions:
                 return model.Result('PSY_TASK {"public_topic":"Условный Маркер Сосна, вытеснение"}', [], 0)

@@ -81,8 +81,9 @@ class Renewal(unittest.TestCase):
                 text = json.dumps(dict(task="Calculate 6 * 7", audience=None, topics=["arithmetic"],
                     examples=[], format=None, deliverables=[], constraints=[], obligations=["Return the product of 6 and 7"],
                     continuation=False, superseded_requirements=[], kind="answer", minutes=None,
-                    outline_only=False, limited_scope=False, local_only=False))
-            elif instructions == quality._REVIEW:
+                    outline_only=False, limited_scope=False, local_only=False, file_output=None,
+                    literal_constraints=[]))
+            elif instructions.startswith(quality._REVIEW):
                 # The real completion stage must receive both the original task and
                 # the whole generated answer, rather than being bypassed by this fixture.
                 self.assertIn("6 * 7?", json.dumps(body["input"]))

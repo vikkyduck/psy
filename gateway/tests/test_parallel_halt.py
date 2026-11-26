@@ -76,7 +76,7 @@ class ParallelHalt(unittest.TestCase):
             if "Проверь содержание раздела" in instructions:
                 calls["review"] += 1
                 return model.Result('{"missing":""}', [], 0)
-            if instructions == quality._REVIEW:
+            if instructions.startswith(quality._REVIEW):
                 calls["task-review"] += 1
                 return model.Result('{"complete":true,"missing":[]}', [], 0)
             self.fail("unexpected stage")

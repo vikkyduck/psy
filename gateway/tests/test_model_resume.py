@@ -95,7 +95,7 @@ def run_child(root, kind, interrupt):
         elif instructions == prompts.REVIEW:
             step = "review"
             text = json.dumps({"edits": [{"before": "draft assertion", "after": "verified assertion"}]})
-        elif instructions == quality._REVIEW:
+        elif instructions.startswith(quality._REVIEW):
             step, text = "task-review", '{"complete":true,"missing":[]}'
         else:
             assert kind == "analysis"
@@ -168,7 +168,7 @@ class ModelRestart(unittest.TestCase):
         def restored(*args, instructions, **kwargs):
             if instructions.startswith(quality._EXTRACT):
                 return model.Result(contract_json(question), [], 0)
-            if instructions == quality._REVIEW:
+            if instructions.startswith(quality._REVIEW):
                 return model.Result('{"complete":true,"missing":[]}', [], 0)
             inputs = args[2]
             self.assertEqual(inputs[-2], {"role": "assistant", "content": kept})
@@ -195,7 +195,7 @@ class ModelRestart(unittest.TestCase):
             def different(*args, instructions, **kwargs):
                 if instructions.startswith(quality._EXTRACT):
                     return model.Result(contract_json("Different question"), [], 0)
-                if instructions == quality._REVIEW:
+                if instructions.startswith(quality._REVIEW):
                     return model.Result('{"complete":true,"missing":[]}', [], 0)
                 return model.Result("different answer", [], 0)
             with patch.object(codex, "_stream", side_effect=different) as provider:

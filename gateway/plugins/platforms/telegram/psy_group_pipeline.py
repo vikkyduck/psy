@@ -7,7 +7,7 @@ if __package__:
     from .psy_group_continuation import _complete
     from .psy_group_lecture import _lecture
     from .psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
-    from .psy_group_quality import annotate, contract_message, extract_contract, finish_task, mark_partial_text, recheck_edited_task
+    from .psy_group_quality import annotate, contract_message, delivery_instructions, extract_contract, finish_task, mark_partial_text, recheck_edited_task
     from .psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from .psy_source_evidence import public_topic
 else:
@@ -15,7 +15,7 @@ else:
     from psy_group_continuation import _complete
     from psy_group_lecture import _lecture
     from psy_group_prompts import ATTRIBUTION, CUT_NOTE, DISPATCH, SYSTEM
-    from psy_group_quality import annotate, contract_message, extract_contract, finish_task, mark_partial_text, recheck_edited_task
+    from psy_group_quality import annotate, contract_message, delivery_instructions, extract_contract, finish_task, mark_partial_text, recheck_edited_task
     from psy_group_sources import _primary_sources, _recover_verified, _verify_draft
     from psy_source_evidence import public_topic
 
@@ -34,6 +34,7 @@ def _admit_long(checkpoints, call=None):
 def _compose(client, turns, research, model, question, *, checkpoints=None,
              context_scope=None, context_state=None, input_budget_tokens=None):
     call, continuation_call = _job_calls(client, model, checkpoints)
+    source_turns = turns
     prepared = None
     try:
         if context_scope is not None:
@@ -45,7 +46,8 @@ def _compose(client, turns, research, model, question, *, checkpoints=None,
                                        previous=context_state, input_budget_tokens=input_budget_tokens,
                                        model=model)
             turns = prepared.turns
-        result = _compose_task(call, continuation_call, turns, research, model, question, checkpoints)
+        result = _compose_task(call, continuation_call, turns, research, model, question, checkpoints,
+                               source_turns=source_turns)
     except ModelIssue as exc:
         if prepared is not None:
             exc.context_state = prepared.state
@@ -62,15 +64,20 @@ def _compose(client, turns, research, model, question, *, checkpoints=None,
     return mark_partial_text(result)
 
 
-def _compose_task(call, continuation_call, turns, research, model, question, checkpoints):
-    write_prose = partial(_complete, partial(call, prose=True), model=model,
-                          continuation_call=continuation_call if checkpoints is not None else None)
-    contract = extract_contract(call, turns, question)
+def _compose_task(call, continuation_call, turns, research, model, question, checkpoints, *, source_turns=None):
+    source_turns = turns if source_turns is None else source_turns
+    contract = extract_contract(call, turns, question, source_turns=source_turns)
+    def write_prose(messages, instructions, **options):
+        transport = delivery_instructions(contract)
+        return _complete(partial(call, prose=True), messages,
+                         instructions if instructions.endswith(transport) else instructions + transport, model=model,
+                         continuation_call=continuation_call if checkpoints is not None else None,
+                         **options)
     if contract.get("contract_failure") == "context":
         _admit_long(checkpoints, call)
         turns = _map_source(call, turns, question)
-        contract = extract_contract(call, turns, question)
-    dispatch = SYSTEM + DISPATCH
+        contract = extract_contract(call, turns, question, source_turns=source_turns)
+    dispatch = SYSTEM + delivery_instructions(contract) + DISPATCH
     if research:
         _admit_long(checkpoints, call)
         dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
@@ -82,7 +89,11 @@ def _compose_task(call, continuation_call, turns, research, model, question, che
             raise
         _admit_long(checkpoints, call)
         turns = _map_source(call, turns, question)
-        contract = extract_contract(call, turns, question)
+        contract = extract_contract(call, turns, question, source_turns=source_turns)
+        dispatch = SYSTEM + delivery_instructions(contract) + DISPATCH
+        if research:
+            dispatch += ("\nУчастник запустил /research. Выбери служебный PSY_TASK с обезличенной "
+                         "публичной темой. Если искать приватно нельзя, верни пустую public_topic.")
         initial = call([*turns, contract_message(contract)], dispatch, prose=not research)
 
     turns = [*turns, contract_message(contract)]
