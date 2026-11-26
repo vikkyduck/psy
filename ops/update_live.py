@@ -437,6 +437,8 @@ def plan(entries, now=None):
 def units_for(target):
     text = str(target)
     if text.startswith(str(CHECKOUT) + "/"):
+        if text.startswith(str(CHECKOUT / RELEASE.TELEGRAM) + "/"):
+            return {"hermes-gateway"}
         return {"hermes-gateway", *ACTIVATED.values()}
     if text.startswith(str(UPLOAD) + "/"):
         return {"psy-asr", "psy-upload-worker", "psy-upload"} | ({"hermes-gateway"} if target.name in GATEWAY_IMPORTS else set())

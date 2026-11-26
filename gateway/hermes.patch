@@ -1037,25 +1037,23 @@ diff --git a/plugins/platforms/telegram/update_admission.py b/plugins/platforms/
 index 7b3a161c3e..9e61753c36 100644
 --- a/plugins/platforms/telegram/update_admission.py
 +++ b/plugins/platforms/telegram/update_admission.py
-@@ -275,6 +275,13 @@ class TelegramApplication(Application):
+@@ -275,6 +275,11 @@ class TelegramApplication(Application):
          # PTB catches callback errors. Do not let a later observer accept a failed preparation.
          return stopped or (claim is not None and not claim.accepted)
  
 +    async def start(self):
 +        from .psy_instance import require_bot
-+        from .psy_group_queue import start as start_group_worker
 +        require_bot(self.bot.id)
 +        await super().start()
-+        await start_group_worker(self)
 +
      async def process_update(self, update):
          if not isinstance(update, Update):
              return await super().process_update(update)
-@@ -293,6 +300,13 @@ class TelegramApplication(Application):
+@@ -293,6 +298,13 @@ class TelegramApplication(Application):
          pending[key] = claim
          token = self._current_claim.set(claim)
          try:
-+            # Select the trusted PSY route BEFORE all PTB handlers, plugins and owner session state.
++            # Enforce PSY chat and sender IDs before the standard Hermes handlers.
 +            from .psy_instance import require_bot
 +            require_bot(self.bot.id)
 +            from .psy_group_route import intercept

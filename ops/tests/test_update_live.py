@@ -67,6 +67,9 @@ class ReleaseInventory(unittest.TestCase):
         self.assertIn("/etc/systemd/system/psy-platform-bridge.service", targets)
         self.assertNotIn("/etc/systemd/system/psy-platform-bridge.service.d/owner-alert.conf", targets)
 
+    def test_telegram_route_change_only_restarts_gateway(self):
+        self.assertEqual(live.units_for(live.CHECKOUT / live.RELEASE.TELEGRAM / "psy_group_route.py"), {"hermes-gateway"})
+
     def test_owner_alerts_use_one_instance_per_failing_unit(self):
         entries = {str(e.target): e.data for e in live.system_entries(997)}
         alerted = [n for n, u in live.INSTALLED.items() if u.get("alert")]
