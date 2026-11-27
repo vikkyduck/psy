@@ -13,6 +13,7 @@
 
 ### Безопасность: что считается достаточным и что нельзя трогать
 - Достаточный контур защиты: проверка доступа по числовым Telegram ID, работа от пользователя `hermes` без `sudo`, существующий `hermes-gateway.service.d/privacy.conf` и действующий бэкап.
+- В `/home/hermes/.hermes/config.yaml` добавлено постоянное разрешение `command_allowlist: [execute_code]`. Режим проверки команд остается `smart`, существующий `hermes-gateway.service.d/privacy.conf` сохраняется без изменений.
 - **Запрещено без отдельного явного подтверждения:**
   - изменять или удалять `/etc/systemd/system/hermes-gateway.service.d/privacy.conf`;
   - создавать профили AppArmor, устанавливать `bubblewrap` или любые дополнительные песочницы;
